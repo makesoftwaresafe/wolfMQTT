@@ -98,6 +98,7 @@ const char* SN_Packet_TypeDesc(SN_MsgType packet_type)
 int SN_Decode_Header(byte *rx_buf, int rx_buf_len,
     SN_MsgType* p_packet_type, word16* p_packet_id)
 {
+    int rc;
     SN_MsgType packet_type;
     word16 total_len;
 
@@ -109,7 +110,11 @@ int SN_Decode_Header(byte *rx_buf, int rx_buf_len,
     total_len = *rx_buf++;
     if (total_len == SN_PACKET_LEN_IND) {
         /* The length is stored in the next two bytes */
-        rx_buf += MqttDecode_Num(rx_buf, &total_len, rx_buf_len - 1);
+        rc = MqttDecode_Num(rx_buf, &total_len, rx_buf_len - 1);
+        if (rc < 0) {
+            return rc;
+        }
+        rx_buf += rc;
     }
 
     if (total_len > rx_buf_len) {
@@ -126,19 +131,37 @@ int SN_Decode_Header(byte *rx_buf, int rx_buf_len,
         switch(packet_type) {
             case SN_MSG_TYPE_REGACK:
             case SN_MSG_TYPE_PUBACK:
+                if (rx_buf_len < 3) {
+                    MQTT_TRACE_ERROR(MQTT_CODE_ERROR_BAD_ARG);
+                }
                 /* octet 4-5 */
-                MqttDecode_Num(rx_buf + 2, p_packet_id, (word32)(rx_buf_len - 3));
+                rc = MqttDecode_Num(rx_buf + 2, p_packet_id,
+                    (word32)(rx_buf_len - 3));
+                if (rc < 0) {
+                    return rc;
+                }
                 break;
             case SN_MSG_TYPE_PUBCOMP:
             case SN_MSG_TYPE_PUBREC:
             case SN_MSG_TYPE_PUBREL:
             case SN_MSG_TYPE_UNSUBACK:
                 /* octet 2-3 */
-                MqttDecode_Num(rx_buf, p_packet_id, (word32)(rx_buf_len - 1));
+                rc = MqttDecode_Num(rx_buf, p_packet_id,
+                    (word32)(rx_buf_len - 1));
+                if (rc < 0) {
+                    return rc;
+                }
                 break;
             case SN_MSG_TYPE_SUBACK:
+                if (rx_buf_len < 4) {
+                    MQTT_TRACE_ERROR(MQTT_CODE_ERROR_BAD_ARG);
+                }
                 /* octet 5-6 */
-                MqttDecode_Num(rx_buf + 3, p_packet_id, (word32)(rx_buf_len - 4));
+                rc = MqttDecode_Num(rx_buf + 3, p_packet_id,
+                    (word32)(rx_buf_len - 4));
+                if (rc < 0) {
+                    return rc;
+                }
                 break;
             case SN_MSG_TYPE_ADVERTISE:
             case SN_MSG_TYPE_SEARCHGW:
@@ -199,9 +222,15 @@ int SN_Decode_Advertise(byte *rx_buf, int rx_buf_len, SN_Advertise *gw_info)
 
     /* Decode gateway info */
     if (gw_info != NULL) {
+        int rc;
         gw_info->gwId = *rx_payload++;
 
-        rx_payload += MqttDecode_Num(rx_payload, &gw_info->duration, (word32)(rx_buf_len - (rx_payload - rx_buf)));
+        rc = MqttDecode_Num(rx_payload, &gw_info->duration,
+            (word32)(rx_buf_len - (rx_payload - rx_buf)));
+        if (rc < 0) {
+            return rc;
+        }
+        rx_payload += rc;
     }
     (void)rx_payload;
 
@@ -239,6 +268,7 @@ int SN_Encode_SearchGW(byte *tx_buf, int tx_buf_len, byte hops)
 int SN_Decode_GWInfo(byte *rx_buf, int rx_buf_len, SN_GwInfo *gw_info)
 {
     word16 total_len;
+    int rc;
     byte *rx_payload = rx_buf, type;
 
     /* Validate required arguments */
@@ -250,7 +280,12 @@ int SN_Decode_GWInfo(byte *rx_buf, int rx_buf_len, SN_GwInfo *gw_info)
     total_len = *rx_payload++;
     if (total_len == SN_PACKET_LEN_IND) {
         /* The length is stored in the next two bytes */
-        rx_payload += MqttDecode_Num(rx_payload, &total_len, (word32)(rx_buf_len - (rx_payload - rx_buf)));
+        rc = MqttDecode_Num(rx_payload, &total_len,
+            (word32)(rx_buf_len - (rx_payload - rx_buf)));
+        if (rc < 0) {
+            return rc;
+        }
+        rx_payload += rc;
     }
 
     if (total_len > rx_buf_len) {
@@ -790,6 +825,7 @@ int SN_Encode_Register(byte *tx_buf, int tx_buf_len, SN_Register *regist)
 int SN_Decode_Register(byte *rx_buf, int rx_buf_len, SN_Register *regist)
 {
     word16 total_len;
+    int rc;
     byte *rx_payload = rx_buf, type;
 
     /* Validate required arguments */
@@ -801,7 +837,12 @@ int SN_Decode_Register(byte *rx_buf, int rx_buf_len, SN_Register *regist)
     total_len = *rx_payload++;
     if (total_len == SN_PACKET_LEN_IND) {
         /* The length is stored in the next two bytes */
-        rx_payload += MqttDecode_Num(rx_payload, &total_len, (word32)(rx_buf_len - (rx_payload - rx_buf)));
+        rc = MqttDecode_Num(rx_payload, &total_len,
+            (word32)(rx_buf_len - (rx_payload - rx_buf)));
+        if (rc < 0) {
+            return rc;
+        }
+        rx_payload += rc;
     }
 
     if (total_len >= rx_buf_len) {
@@ -819,10 +860,20 @@ int SN_Decode_Register(byte *rx_buf, int rx_buf_len, SN_Register *regist)
 
     if (regist != NULL) {
         /* Decode Topic ID assigned by GW */
-        rx_payload += MqttDecode_Num(rx_payload, &regist->topicId, (word32)(rx_buf_len - (rx_payload - rx_buf)));
+        rc = MqttDecode_Num(rx_payload, &regist->topicId,
+            (word32)(rx_buf_len - (rx_payload - rx_buf)));
+        if (rc < 0) {
+            return rc;
+        }
+        rx_payload += rc;
 
         /* Decode packet ID */
-        rx_payload += MqttDecode_Num(rx_payload, &regist->packet_id, (word32)(rx_buf_len - (rx_payload - rx_buf)));
+        rc = MqttDecode_Num(rx_payload, &regist->packet_id,
+            (word32)(rx_buf_len - (rx_payload - rx_buf)));
+        if (rc < 0) {
+            return rc;
+        }
+        rx_payload += rc;
 
         /* Decode Topic Name */
         regist->topicName = (char*)rx_payload;
@@ -879,7 +930,7 @@ int SN_Encode_RegAck(byte *tx_buf, int tx_buf_len, SN_RegAck *regack)
 
 int SN_Decode_RegAck(byte *rx_buf, int rx_buf_len, SN_RegAck *regack)
 {
-    int total_len;
+    int rc, total_len;
     byte *rx_payload = rx_buf, type;
 
     /* Validate required arguments */
@@ -904,10 +955,20 @@ int SN_Decode_RegAck(byte *rx_buf, int rx_buf_len, SN_RegAck *regack)
 
     if (regack != NULL) {
         /* Decode Topic ID assigned by GW */
-        rx_payload += MqttDecode_Num(rx_payload, &regack->topicId, (word32)(rx_buf_len - (rx_payload - rx_buf)));
+        rc = MqttDecode_Num(rx_payload, &regack->topicId,
+            (word32)(rx_buf_len - (rx_payload - rx_buf)));
+        if (rc < 0) {
+            return rc;
+        }
+        rx_payload += rc;
 
         /* Decode packet ID */
-        rx_payload += MqttDecode_Num(rx_payload, &regack->packet_id, (word32)(rx_buf_len - (rx_payload - rx_buf)));
+        rc = MqttDecode_Num(rx_payload, &regack->packet_id,
+            (word32)(rx_buf_len - (rx_payload - rx_buf)));
+        if (rc < 0) {
+            return rc;
+        }
+        rx_payload += rc;
 
         /* Decode return code */
         regack->return_code = *rx_payload++;
@@ -994,6 +1055,7 @@ int SN_Encode_Subscribe(byte *tx_buf, int tx_buf_len, SN_Subscribe *subscribe)
 int SN_Decode_SubscribeAck(byte* rx_buf, int rx_buf_len,
         SN_SubAck *subscribe_ack)
 {
+    int rc;
     word16 total_len;
     byte* rx_payload = rx_buf, type;
 
@@ -1020,8 +1082,18 @@ int SN_Decode_SubscribeAck(byte* rx_buf, int rx_buf_len,
     /* Decode SubAck fields */
     if (subscribe_ack) {
         subscribe_ack->flags = *rx_payload++;
-        rx_payload += MqttDecode_Num(rx_payload, &subscribe_ack->topicId, (word32)(rx_buf_len - (rx_payload - rx_buf)));
-        rx_payload += MqttDecode_Num(rx_payload, &subscribe_ack->packet_id, (word32)(rx_buf_len - (rx_payload - rx_buf)));
+        rc = MqttDecode_Num(rx_payload, &subscribe_ack->topicId,
+            (word32)(rx_buf_len - (rx_payload - rx_buf)));
+        if (rc < 0) {
+            return rc;
+        }
+        rx_payload += rc;
+        rc = MqttDecode_Num(rx_payload, &subscribe_ack->packet_id,
+            (word32)(rx_buf_len - (rx_payload - rx_buf)));
+        if (rc < 0) {
+            return rc;
+        }
+        rx_payload += rc;
         subscribe_ack->return_code = *rx_payload++;
     }
     (void)rx_payload;
@@ -1112,6 +1184,7 @@ int SN_Encode_Publish(byte *tx_buf, int tx_buf_len, SN_Publish *publish)
 
 int SN_Decode_Publish(byte *rx_buf, int rx_buf_len, SN_Publish *publish)
 {
+    int rc;
     word16 total_len;
     byte *rx_payload = rx_buf;
     byte flags = 0, type;
@@ -1125,7 +1198,12 @@ int SN_Decode_Publish(byte *rx_buf, int rx_buf_len, SN_Publish *publish)
     total_len = *rx_payload++;
     if (total_len == SN_PACKET_LEN_IND) {
         /* The length is stored in the next two bytes */
-        rx_payload += MqttDecode_Num(rx_payload, &total_len, (word32)(rx_buf_len - (rx_payload - rx_buf)));
+        rc = MqttDecode_Num(rx_payload, &total_len,
+            (word32)(rx_buf_len - (rx_payload - rx_buf)));
+        if (rc < 0) {
+            return rc;
+        }
+        rx_payload += rc;
     }
 
     if (total_len > rx_buf_len) {
@@ -1148,7 +1226,12 @@ int SN_Decode_Publish(byte *rx_buf, int rx_buf_len, SN_Publish *publish)
     rx_payload += MQTT_DATA_LEN_SIZE;
     publish->topic_name_len = MQTT_DATA_LEN_SIZE;
 
-    rx_payload += MqttDecode_Num(rx_payload, &publish->packet_id, (word32)(rx_buf_len - (rx_payload - rx_buf)));
+    rc = MqttDecode_Num(rx_payload, &publish->packet_id,
+        (word32)(rx_buf_len - (rx_payload - rx_buf)));
+    if (rc < 0) {
+        return rc;
+    }
+    rx_payload += rc;
 
     /* Set flags */
     publish->duplicate = flags & SN_PACKET_FLAG_DUPLICATE;
@@ -1214,7 +1297,7 @@ int SN_Encode_PublishResp(byte* tx_buf, int tx_buf_len, byte type,
 int SN_Decode_PublishResp(byte* rx_buf, int rx_buf_len, byte type,
     SN_PublishResp *publish_resp)
 {
-    int total_len;
+    int rc, total_len;
     byte rec_type, *rx_payload = rx_buf;
 
     /* Validate required arguments */
@@ -1238,10 +1321,20 @@ int SN_Decode_PublishResp(byte* rx_buf, int rx_buf_len, byte type,
 
     if (publish_resp) {
         if (type == SN_MSG_TYPE_PUBACK) {
-            rx_payload += MqttDecode_Num(rx_payload, &publish_resp->topicId, (word32)(rx_buf_len - (rx_payload - rx_buf)));
+            rc = MqttDecode_Num(rx_payload, &publish_resp->topicId,
+                (word32)(rx_buf_len - (rx_payload - rx_buf)));
+            if (rc < 0) {
+                return rc;
+            }
+            rx_payload += rc;
         }
 
-        rx_payload += MqttDecode_Num(rx_payload, &publish_resp->packet_id, (word32)(rx_buf_len - (rx_payload - rx_buf)));
+        rc = MqttDecode_Num(rx_payload, &publish_resp->packet_id,
+            (word32)(rx_buf_len - (rx_payload - rx_buf)));
+        if (rc < 0) {
+            return rc;
+        }
+        rx_payload += rc;
 
         if (type == SN_MSG_TYPE_PUBACK) {
             publish_resp->return_code = *rx_payload++;
@@ -1330,6 +1423,7 @@ int SN_Encode_Unsubscribe(byte *tx_buf, int tx_buf_len,
 int SN_Decode_UnsubscribeAck(byte *rx_buf, int rx_buf_len,
         SN_UnsubscribeAck *unsubscribe_ack)
 {
+    int rc;
     word16 total_len;
     byte *rx_payload = rx_buf, type;
 
@@ -1355,7 +1449,12 @@ int SN_Decode_UnsubscribeAck(byte *rx_buf, int rx_buf_len,
 
     /* Decode SubAck fields */
     if (unsubscribe_ack) {
-        rx_payload += MqttDecode_Num(rx_payload, &unsubscribe_ack->packet_id, (word32)(rx_buf_len - (rx_payload - rx_buf)));
+        rc = MqttDecode_Num(rx_payload, &unsubscribe_ack->packet_id,
+            (word32)(rx_buf_len - (rx_payload - rx_buf)));
+        if (rc < 0) {
+            return rc;
+        }
+        rx_payload += rc;
     }
     (void)rx_payload;
 
@@ -1367,7 +1466,7 @@ int SN_Encode_Disconnect(byte *tx_buf, int tx_buf_len,
         SN_Disconnect* disconnect)
 {
     int total_len = 2; /* length and message type */
-    byte *tx_payload = tx_buf;;
+    byte *tx_payload = tx_buf;
 
     /* Validate required arguments */
     if (tx_buf == NULL) {
@@ -1542,7 +1641,10 @@ int SN_Packet_Read(MqttClient *client, byte* rx_buf, int rx_buf_len,
                     len = rc;
                 }
 
-                (void)MqttDecode_Num(&rx_buf[1], &total_len, (word32)(rx_buf_len - 1));
+                rc = MqttDecode_Num(&rx_buf[1], &total_len, (word32)(rx_buf_len - 1));
+                if (rc < 0) {
+                    return MqttPacket_HandleNetError(client, rc);
+                }
                 client->packet.header_len = len;
             }
             else {
