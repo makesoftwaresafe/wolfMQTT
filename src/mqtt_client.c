@@ -1719,6 +1719,10 @@ int MqttClient_Connect(MqttClient *client, MqttConnect *mc_connect)
         }
     #endif
         MqttWriteStop(client, &mc_connect->stat);
+
+        /* Clear tx_buf to remove any plaintext credentials from memory */
+        XMEMSET(client->tx_buf, 0, client->write.len);
+
         if (rc != xfer) {
             MqttClient_CancelMessage(client, (MqttObject*)mc_connect);
             return rc;
