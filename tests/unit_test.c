@@ -474,6 +474,45 @@ static void test_decode_suback(void)
           "SUBACK remain_len=1: returns MALFORMED_DATA");
 }
 
+/* -------------------------------------------------------------------------- */
+/* MqttDecode_PublishResp tests                                               */
+/* -------------------------------------------------------------------------- */
+static void test_decode_publish_resp(void)
+{
+    byte buf[8];
+    MqttPublishResp resp;
+    int rc;
+
+    PRINTF("--- MqttDecode_PublishResp ---");
+
+    /* Valid PUBACK: remain_len=2 (packet_id only) */
+    buf[0] = MQTT_PACKET_TYPE_SET(MQTT_PACKET_TYPE_PUBLISH_ACK); /* 0x40 */
+    buf[1] = 2;    /* remain_len */
+    buf[2] = 0;    /* packet_id MSB */
+    buf[3] = 1;    /* packet_id LSB */
+    XMEMSET(&resp, 0, sizeof(resp));
+    rc = MqttDecode_PublishResp(buf, 4, MQTT_PACKET_TYPE_PUBLISH_ACK, &resp);
+    CHECK(rc > 0, "PUBACK remain_len=2: succeeds");
+    CHECK(resp.packet_id == 1, "PUBACK remain_len=2: packet_id == 1");
+
+    /* Malformed PUBACK: remain_len=0 */
+    buf[0] = MQTT_PACKET_TYPE_SET(MQTT_PACKET_TYPE_PUBLISH_ACK);
+    buf[1] = 0;
+    XMEMSET(&resp, 0, sizeof(resp));
+    rc = MqttDecode_PublishResp(buf, 2, MQTT_PACKET_TYPE_PUBLISH_ACK, &resp);
+    CHECK(rc == MQTT_CODE_ERROR_MALFORMED_DATA,
+          "PUBACK remain_len=0: returns MALFORMED_DATA");
+
+    /* Malformed PUBACK: remain_len=1 */
+    buf[0] = MQTT_PACKET_TYPE_SET(MQTT_PACKET_TYPE_PUBLISH_ACK);
+    buf[1] = 1;
+    buf[2] = 0;
+    XMEMSET(&resp, 0, sizeof(resp));
+    rc = MqttDecode_PublishResp(buf, 3, MQTT_PACKET_TYPE_PUBLISH_ACK, &resp);
+    CHECK(rc == MQTT_CODE_ERROR_MALFORMED_DATA,
+          "PUBACK remain_len=1: returns MALFORMED_DATA");
+}
+
 int main(int argc, char** argv)
 {
     (void)argc;
@@ -489,6 +528,7 @@ int main(int argc, char** argv)
     test_encode_connect();
     test_qos2_ack_arithmetic();
     test_decode_suback();
+    test_decode_publish_resp();
 #ifdef WOLFMQTT_V5
     test_publish_resp_v5_roundtrip();
 #endif
