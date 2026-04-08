@@ -887,6 +887,7 @@ static int callback_broker_mqtt(struct lws *wsi,
                 WOLFMQTT_FREE(ws->tx_pending);
                 ws->tx_pending = NULL;
                 ws->tx_len = 0;
+                ws->status = -1;
                 return -1;
             }
             WOLFMQTT_FREE(ws->tx_pending);
@@ -1034,6 +1035,12 @@ static int BrokerWsNetWrite(void* context, const byte* buf, int buf_len,
         WOLFMQTT_FREE(ws->tx_pending);
         ws->tx_pending = NULL;
         ws->tx_len = 0;
+        return MQTT_CODE_ERROR_NETWORK;
+    }
+
+    /* Check if the write callback reported an error (it frees tx_pending
+     * and sets status to -1 before returning -1 to lws) */
+    if (ws->status <= 0) {
         return MQTT_CODE_ERROR_NETWORK;
     }
 
