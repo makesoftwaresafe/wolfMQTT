@@ -1698,6 +1698,11 @@ int MqttEncode_Subscribe(byte *tx_buf, int tx_buf_len,
         return MQTT_TRACE_ERROR(MQTT_CODE_ERROR_BAD_ARG);
     }
 
+    /* [MQTT-2.3.1-1] SUBSCRIBE packets require a non-zero packet identifier */
+    if (subscribe->packet_id == 0) {
+        return MQTT_TRACE_ERROR(MQTT_CODE_ERROR_PACKET_ID);
+    }
+
     /* Determine packet length */
     remain_len = MQTT_DATA_LEN_SIZE; /* For packet_id */
     for (i = 0; i < subscribe->topic_count; i++) {

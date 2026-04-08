@@ -217,6 +217,40 @@ static void test_decode_connack(void)
           "CONNACK remain_len=1: returns MALFORMED_DATA");
 }
 
+/* -------------------------------------------------------------------------- */
+/* MqttEncode_Subscribe tests                                                 */
+/* -------------------------------------------------------------------------- */
+static void test_encode_subscribe(void)
+{
+    byte tx_buf[256];
+    MqttSubscribe sub;
+    MqttTopic topic;
+    int rc;
+
+    PRINTF("--- MqttEncode_Subscribe ---");
+
+    /* packet_id == 0 must fail */
+    XMEMSET(&sub, 0, sizeof(sub));
+    XMEMSET(&topic, 0, sizeof(topic));
+    topic.topic_filter = "test/topic";
+    sub.topics = &topic;
+    sub.topic_count = 1;
+    sub.packet_id = 0;
+    rc = MqttEncode_Subscribe(tx_buf, (int)sizeof(tx_buf), &sub);
+    CHECK(rc == MQTT_CODE_ERROR_PACKET_ID,
+          "Subscribe packet_id=0: returns ERROR_PACKET_ID");
+
+    /* packet_id != 0 must succeed */
+    XMEMSET(&sub, 0, sizeof(sub));
+    XMEMSET(&topic, 0, sizeof(topic));
+    topic.topic_filter = "test/topic";
+    sub.topics = &topic;
+    sub.topic_count = 1;
+    sub.packet_id = 1;
+    rc = MqttEncode_Subscribe(tx_buf, (int)sizeof(tx_buf), &sub);
+    CHECK(rc > 0, "Subscribe packet_id=1: succeeds");
+}
+
 int main(int argc, char** argv)
 {
     (void)argc;
@@ -227,6 +261,7 @@ int main(int argc, char** argv)
     test_vbi();
     test_encode_publish();
     test_decode_connack();
+    test_encode_subscribe();
 
     PRINTF("=== Results: %d/%d passed ===",
            test_count - fail_count, test_count);
