@@ -434,6 +434,46 @@ static void test_qos2_ack_arithmetic(void)
     CHECK(MQTT_PACKET_TYPE_PUBLISH_COMP == 7, "PUBLISH_COMP == 7");
 }
 
+/* -------------------------------------------------------------------------- */
+/* MqttDecode_SubscribeAck tests                                              */
+/* -------------------------------------------------------------------------- */
+static void test_decode_suback(void)
+{
+    byte buf[8];
+    MqttSubscribeAck ack;
+    int rc;
+
+    PRINTF("--- MqttDecode_SubscribeAck ---");
+
+    /* Valid SUBACK: remain_len=3 (packet_id=2 bytes + 1 return code) */
+    buf[0] = MQTT_PACKET_TYPE_SET(MQTT_PACKET_TYPE_SUBSCRIBE_ACK); /* 0x90 */
+    buf[1] = 3;    /* remain_len */
+    buf[2] = 0;    /* packet_id MSB */
+    buf[3] = 1;    /* packet_id LSB */
+    buf[4] = 0;    /* return code: QoS 0 granted */
+    XMEMSET(&ack, 0, sizeof(ack));
+    rc = MqttDecode_SubscribeAck(buf, 5, &ack);
+    CHECK(rc > 0, "SUBACK remain_len=3: succeeds");
+    CHECK(ack.packet_id == 1, "SUBACK remain_len=3: packet_id == 1");
+
+    /* Malformed SUBACK: remain_len=0 */
+    buf[0] = MQTT_PACKET_TYPE_SET(MQTT_PACKET_TYPE_SUBSCRIBE_ACK);
+    buf[1] = 0;    /* remain_len = 0 */
+    XMEMSET(&ack, 0, sizeof(ack));
+    rc = MqttDecode_SubscribeAck(buf, 2, &ack);
+    CHECK(rc == MQTT_CODE_ERROR_MALFORMED_DATA,
+          "SUBACK remain_len=0: returns MALFORMED_DATA");
+
+    /* Malformed SUBACK: remain_len=1 */
+    buf[0] = MQTT_PACKET_TYPE_SET(MQTT_PACKET_TYPE_SUBSCRIBE_ACK);
+    buf[1] = 1;    /* remain_len = 1 */
+    buf[2] = 0;
+    XMEMSET(&ack, 0, sizeof(ack));
+    rc = MqttDecode_SubscribeAck(buf, 3, &ack);
+    CHECK(rc == MQTT_CODE_ERROR_MALFORMED_DATA,
+          "SUBACK remain_len=1: returns MALFORMED_DATA");
+}
+
 int main(int argc, char** argv)
 {
     (void)argc;
@@ -448,6 +488,7 @@ int main(int argc, char** argv)
     test_encode_unsubscribe();
     test_encode_connect();
     test_qos2_ack_arithmetic();
+    test_decode_suback();
 #ifdef WOLFMQTT_V5
     test_publish_resp_v5_roundtrip();
 #endif

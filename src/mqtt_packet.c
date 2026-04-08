@@ -1905,6 +1905,12 @@ int MqttDecode_SubscribeAck(byte* rx_buf, int rx_buf_len,
     if (header_len < 0) {
         return header_len;
     }
+
+    /* Validate remain_len (need at least packet_id) */
+    if (remain_len < MQTT_DATA_LEN_SIZE) {
+        return MQTT_TRACE_ERROR(MQTT_CODE_ERROR_MALFORMED_DATA);
+    }
+
     rx_payload = &rx_buf[header_len];
 
     /* Decode variable header */
