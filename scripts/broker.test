@@ -880,6 +880,47 @@ else
 fi
 fi
 
+# --- Test 23: $-prefix wildcard guard [MQTT-4.7.2] ---
+echo ""
+echo "--- Test 23: \$-prefix wildcard guard [MQTT-4.7.2] ---"
+if [ "$skip_plain" = "yes" ]; then
+    echo "SKIP: \$-prefix wildcard guard (plain listener disabled)"
+elif [ "$has_wildcards" = "no" ]; then
+    echo "SKIP: \$-prefix wildcard guard (wildcards not built)"
+else
+start_broker
+# Subscribe to '#' (should NOT receive $SYS messages per MQTT-4.7.2)
+rm -f "${TMP_DIR}/t23_wild.ready" "${TMP_DIR}/t23_exact.ready"
+timeout 10 ./$sub_bin -T -h 127.0.0.1 -p $port -n "#" -i "sub_wild_dollar" \
+    -R "${TMP_DIR}/t23_wild.ready" >"${TMP_DIR}/t23_wild.log" 2>&1 &
+T23_WILD_PID=$!
+# Subscribe to exact '$SYS/test' (SHOULD receive the message)
+timeout 10 ./$sub_bin -T -h 127.0.0.1 -p $port -n '$SYS/test' -i "sub_exact_dollar" \
+    -R "${TMP_DIR}/t23_exact.ready" >"${TMP_DIR}/t23_exact.log" 2>&1 &
+T23_EXACT_PID=$!
+TEST_PIDS+=($T23_WILD_PID $T23_EXACT_PID)
+wait_for_file "${TMP_DIR}/t23_wild.ready" 5
+wait_for_file "${TMP_DIR}/t23_exact.ready" 5
+# Publish to $SYS/test
+./$pub_bin -T -h 127.0.0.1 -p $port -n '$SYS/test' -m "dollar_sys_msg" \
+    >"${TMP_DIR}/t23_pub.log" 2>&1
+sleep 0.3
+kill $T23_WILD_PID $T23_EXACT_PID 2>/dev/null
+wait $T23_WILD_PID 2>/dev/null || true
+wait $T23_EXACT_PID 2>/dev/null || true
+TEST_PIDS=()
+T23_WILD_GOT=no
+T23_EXACT_GOT=no
+grep -q "dollar_sys_msg" "${TMP_DIR}/t23_wild.log" 2>/dev/null && T23_WILD_GOT=yes
+grep -q "dollar_sys_msg" "${TMP_DIR}/t23_exact.log" 2>/dev/null && T23_EXACT_GOT=yes
+if [ "$T23_WILD_GOT" = "no" ] && [ "$T23_EXACT_GOT" = "yes" ]; then
+    echo "PASS: \$-prefix wildcard guard (# blocked, exact matched)"
+else
+    echo "FAIL: \$-prefix wildcard guard (wild_got=$T23_WILD_GOT, exact_got=$T23_EXACT_GOT)"
+    FAIL=1
+fi
+fi
+
 # --- WebSocket Tests ---
 ws_client_bin="examples/websocket/websocket_client"
 has_websocket=no
