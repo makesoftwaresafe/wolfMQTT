@@ -921,6 +921,47 @@ else
 fi
 fi
 
+# --- Test 24: PUBLISH topic wildcard rejection [MQTT-3.3.2-2] ---
+echo ""
+echo "--- Test 24: PUBLISH topic wildcard rejection [MQTT-3.3.2-2] ---"
+if [ "$skip_plain" = "yes" ]; then
+    echo "SKIP: PUBLISH wildcard rejection (plain listener disabled)"
+elif [ "$has_wildcards" = "no" ]; then
+    echo "SKIP: PUBLISH wildcard rejection (wildcards not built)"
+else
+start_broker
+# Subscribe to a wildcard filter that would match if the broker allowed it
+rm -f "${TMP_DIR}/t24_sub.ready"
+timeout 10 ./$sub_bin -T -h 127.0.0.1 -p $port -n "test/wild/+" -i "sub_wild24" \
+    -R "${TMP_DIR}/t24_sub.ready" >"${TMP_DIR}/t24_sub.log" 2>&1 &
+T24_SUB_PID=$!
+TEST_PIDS+=($T24_SUB_PID)
+wait_for_file "${TMP_DIR}/t24_sub.ready" 5
+# Attempt to PUBLISH with '+' in the topic name (must be rejected by broker)
+./$pub_bin -T -h 127.0.0.1 -p $port -n "test/+/card" -m "bad_wildcard_plus" \
+    >"${TMP_DIR}/t24_pub_plus.log" 2>&1
+T24_PLUS_RC=$?
+# Attempt to PUBLISH with '#' in the topic name (must be rejected by broker)
+./$pub_bin -T -h 127.0.0.1 -p $port -n "test/#" -m "bad_wildcard_hash" \
+    >"${TMP_DIR}/t24_pub_hash.log" 2>&1
+T24_HASH_RC=$?
+sleep 0.3
+kill $T24_SUB_PID 2>/dev/null
+wait $T24_SUB_PID 2>/dev/null || true
+TEST_PIDS=()
+# Verify subscriber did NOT receive either message
+T24_GOT_PLUS=no
+T24_GOT_HASH=no
+grep -q "bad_wildcard_plus" "${TMP_DIR}/t24_sub.log" 2>/dev/null && T24_GOT_PLUS=yes
+grep -q "bad_wildcard_hash" "${TMP_DIR}/t24_sub.log" 2>/dev/null && T24_GOT_HASH=yes
+if [ "$T24_GOT_PLUS" = "no" ] && [ "$T24_GOT_HASH" = "no" ]; then
+    echo "PASS: PUBLISH topic wildcard rejection (+ and # blocked)"
+else
+    echo "FAIL: PUBLISH wildcard rejection (got_plus=$T24_GOT_PLUS, got_hash=$T24_GOT_HASH)"
+    FAIL=1
+fi
+fi
+
 # --- WebSocket Tests ---
 ws_client_bin="examples/websocket/websocket_client"
 has_websocket=no
