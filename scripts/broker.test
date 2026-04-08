@@ -962,6 +962,39 @@ else
 fi
 fi
 
+# --- Test 25: Multi-level wildcard matches parent [MQTT-4.7.1.2] ---
+echo ""
+echo "--- Test 25: Multi-level wildcard matches parent [MQTT-4.7.1.2] ---"
+if [ "$skip_plain" = "yes" ]; then
+    echo "SKIP: Multi-level wildcard parent match (plain listener disabled)"
+elif [ "$has_wildcards" = "no" ]; then
+    echo "SKIP: Multi-level wildcard parent match (wildcards not built)"
+else
+start_broker
+# Subscribe to 'sport/#' — per MQTT-4.7.1.2 this must also match 'sport'
+rm -f "${TMP_DIR}/t25_sub.ready"
+timeout 10 ./$sub_bin -T -h 127.0.0.1 -p $port -n "sport/#" -i "sub_parent25" \
+    -R "${TMP_DIR}/t25_sub.ready" >"${TMP_DIR}/t25_sub.log" 2>&1 &
+T25_SUB_PID=$!
+TEST_PIDS+=($T25_SUB_PID)
+wait_for_file "${TMP_DIR}/t25_sub.ready" 5
+# Publish to 'sport' (parent level, no trailing slash)
+./$pub_bin -T -h 127.0.0.1 -p $port -n "sport" -m "parent_match_msg" \
+    >"${TMP_DIR}/t25_pub.log" 2>&1
+sleep 0.3
+kill $T25_SUB_PID 2>/dev/null
+wait $T25_SUB_PID 2>/dev/null || true
+TEST_PIDS=()
+T25_GOT=no
+grep -q "parent_match_msg" "${TMP_DIR}/t25_sub.log" 2>/dev/null && T25_GOT=yes
+if [ "$T25_GOT" = "yes" ]; then
+    echo "PASS: Multi-level wildcard matches parent (sport/# matched sport)"
+else
+    echo "FAIL: Multi-level wildcard parent match (got=$T25_GOT)"
+    FAIL=1
+fi
+fi
+
 # --- WebSocket Tests ---
 ws_client_bin="examples/websocket/websocket_client"
 has_websocket=no

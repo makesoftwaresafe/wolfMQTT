@@ -2552,6 +2552,10 @@ static int BrokerTopicMatch(const char* filter, const char* topic)
             f++;
         }
         else if (*t == '/' || *f == '/') {
+            /* [MQTT-4.7.1.2] 'topic/#' must also match 'topic' itself */
+            if (*f == '/' && f[1] == '#' && f[2] == '\0' && *t == '\0') {
+                return 1;
+            }
             return 0;
         }
     }
