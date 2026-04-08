@@ -1530,10 +1530,6 @@ int MqttEncode_PublishResp(byte* tx_buf, int tx_buf_len, byte type,
 #ifdef WOLFMQTT_V5
     if (publish_resp->protocol_level >= MQTT_CONNECT_PROTOCOL_LEVEL_5)
     {
-        if (publish_resp->reason_code != MQTT_REASON_SUCCESS) {
-            /* Reason Code */
-            remain_len++;
-        }
         if (publish_resp->props != NULL) {
             /* Determine length of properties */
             props_len = MqttEncode_Props((MqttPacketType)type,
@@ -1549,6 +1545,11 @@ int MqttEncode_PublishResp(byte* tx_buf, int tx_buf_len, byte type,
             }
             else
                 return MQTT_TRACE_ERROR(MQTT_CODE_ERROR_PROPERTY);
+        }
+        if (publish_resp->reason_code != MQTT_REASON_SUCCESS ||
+            publish_resp->props != NULL) {
+            /* Reason Code */
+            remain_len++;
         }
     }
 #endif
@@ -1574,7 +1575,8 @@ int MqttEncode_PublishResp(byte* tx_buf, int tx_buf_len, byte type,
 #ifdef WOLFMQTT_V5
     if (publish_resp->protocol_level >= MQTT_CONNECT_PROTOCOL_LEVEL_5)
     {
-        if (publish_resp->reason_code != MQTT_REASON_SUCCESS) {
+        if (publish_resp->reason_code != MQTT_REASON_SUCCESS ||
+            publish_resp->props != NULL) {
             /* Encode the Reason Code */
             *tx_payload++ = publish_resp->reason_code;
         }

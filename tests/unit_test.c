@@ -285,6 +285,89 @@ static void test_encode_unsubscribe(void)
     CHECK(rc > 0, "Unsubscribe packet_id=1: succeeds");
 }
 
+/* -------------------------------------------------------------------------- */
+/* MqttEncode/Decode_PublishResp v5 roundtrip tests                           */
+/* -------------------------------------------------------------------------- */
+#ifdef WOLFMQTT_V5
+static void test_publish_resp_v5_roundtrip(void)
+{
+    byte buf[256];
+    MqttPublishResp enc, dec;
+    MqttProp prop;
+    int enc_len, dec_len;
+    char reason_str[] = "ok";
+
+    PRINTF("--- MqttEncode/Decode_PublishResp v5 roundtrip ---");
+
+    /* Case: reason_code=SUCCESS, props=non-NULL
+     * This is the bug case: encoder must include reason_code byte when
+     * properties are present, even if reason_code is SUCCESS. */
+    XMEMSET(&enc, 0, sizeof(enc));
+    XMEMSET(&prop, 0, sizeof(prop));
+    prop.type = MQTT_PROP_REASON_STR;
+    prop.data_str.str = reason_str;
+    prop.data_str.len = (word16)XSTRLEN(reason_str);
+    prop.next = NULL;
+    enc.packet_id = 1;
+    enc.protocol_level = MQTT_CONNECT_PROTOCOL_LEVEL_5;
+    enc.reason_code = MQTT_REASON_SUCCESS;
+    enc.props = &prop;
+
+    enc_len = MqttEncode_PublishResp(buf, (int)sizeof(buf),
+                  MQTT_PACKET_TYPE_PUBLISH_ACK, &enc);
+    CHECK(enc_len > 0, "v5 PUBACK SUCCESS+props: encode succeeds");
+
+    /* Decode and verify roundtrip */
+    XMEMSET(&dec, 0, sizeof(dec));
+    dec.protocol_level = MQTT_CONNECT_PROTOCOL_LEVEL_5;
+    dec_len = MqttDecode_PublishResp(buf, enc_len,
+                  MQTT_PACKET_TYPE_PUBLISH_ACK, &dec);
+    CHECK(dec_len > 0, "v5 PUBACK SUCCESS+props: decode succeeds");
+    CHECK(dec.packet_id == 1,
+          "v5 PUBACK SUCCESS+props: packet_id roundtrip");
+    CHECK(dec.reason_code == MQTT_REASON_SUCCESS,
+          "v5 PUBACK SUCCESS+props: reason_code roundtrip");
+
+    /* Case: reason_code=non-SUCCESS, props=NULL (baseline, should work) */
+    XMEMSET(&enc, 0, sizeof(enc));
+    enc.packet_id = 2;
+    enc.protocol_level = MQTT_CONNECT_PROTOCOL_LEVEL_5;
+    enc.reason_code = 0x80; /* Unspecified error */
+    enc.props = NULL;
+
+    enc_len = MqttEncode_PublishResp(buf, (int)sizeof(buf),
+                  MQTT_PACKET_TYPE_PUBLISH_ACK, &enc);
+    CHECK(enc_len > 0, "v5 PUBACK non-SUCCESS no-props: encode succeeds");
+
+    XMEMSET(&dec, 0, sizeof(dec));
+    dec.protocol_level = MQTT_CONNECT_PROTOCOL_LEVEL_5;
+    dec_len = MqttDecode_PublishResp(buf, enc_len,
+                  MQTT_PACKET_TYPE_PUBLISH_ACK, &dec);
+    CHECK(dec_len > 0, "v5 PUBACK non-SUCCESS no-props: decode succeeds");
+    CHECK(dec.reason_code == 0x80,
+          "v5 PUBACK non-SUCCESS no-props: reason_code roundtrip");
+
+    /* Case: reason_code=SUCCESS, props=NULL (minimal, no reason_code byte) */
+    XMEMSET(&enc, 0, sizeof(enc));
+    enc.packet_id = 3;
+    enc.protocol_level = MQTT_CONNECT_PROTOCOL_LEVEL_5;
+    enc.reason_code = MQTT_REASON_SUCCESS;
+    enc.props = NULL;
+
+    enc_len = MqttEncode_PublishResp(buf, (int)sizeof(buf),
+                  MQTT_PACKET_TYPE_PUBLISH_ACK, &enc);
+    CHECK(enc_len > 0, "v5 PUBACK SUCCESS no-props: encode succeeds");
+
+    XMEMSET(&dec, 0, sizeof(dec));
+    dec.protocol_level = MQTT_CONNECT_PROTOCOL_LEVEL_5;
+    dec_len = MqttDecode_PublishResp(buf, enc_len,
+                  MQTT_PACKET_TYPE_PUBLISH_ACK, &dec);
+    CHECK(dec_len > 0, "v5 PUBACK SUCCESS no-props: decode succeeds");
+    CHECK(dec.reason_code == MQTT_REASON_SUCCESS,
+          "v5 PUBACK SUCCESS no-props: reason_code roundtrip");
+}
+#endif /* WOLFMQTT_V5 */
+
 int main(int argc, char** argv)
 {
     (void)argc;
@@ -297,6 +380,9 @@ int main(int argc, char** argv)
     test_decode_connack();
     test_encode_subscribe();
     test_encode_unsubscribe();
+#ifdef WOLFMQTT_V5
+    test_publish_resp_v5_roundtrip();
+#endif
 
     PRINTF("=== Results: %d/%d passed ===",
            test_count - fail_count, test_count);
