@@ -180,6 +180,43 @@ static void test_encode_publish(void)
     CHECK(rc > 0, "QoS 1 packet_id=1: succeeds");
 }
 
+/* -------------------------------------------------------------------------- */
+/* MqttDecode_ConnectAck tests                                                */
+/* -------------------------------------------------------------------------- */
+static void test_decode_connack(void)
+{
+    byte buf[8];
+    MqttConnectAck ack;
+    int rc;
+
+    PRINTF("--- MqttDecode_ConnectAck ---");
+
+    /* Valid CONNACK: remain_len=2, flags=0, return_code=0 */
+    buf[0] = MQTT_PACKET_TYPE_SET(MQTT_PACKET_TYPE_CONNECT_ACK); /* 0x20 */
+    buf[1] = 2;    /* remain_len */
+    buf[2] = 0;    /* flags */
+    buf[3] = 0;    /* return_code (success) */
+    XMEMSET(&ack, 0, sizeof(ack));
+    rc = MqttDecode_ConnectAck(buf, 4, &ack);
+    CHECK(rc > 0, "CONNACK remain_len=2: succeeds");
+    CHECK(ack.return_code == 0, "CONNACK remain_len=2: return_code == 0");
+
+    /* Malformed CONNACK: remain_len=0 */
+    buf[0] = MQTT_PACKET_TYPE_SET(MQTT_PACKET_TYPE_CONNECT_ACK);
+    buf[1] = 0;    /* remain_len = 0 */
+    rc = MqttDecode_ConnectAck(buf, 2, NULL);
+    CHECK(rc == MQTT_CODE_ERROR_MALFORMED_DATA,
+          "CONNACK remain_len=0: returns MALFORMED_DATA");
+
+    /* Malformed CONNACK: remain_len=1 */
+    buf[0] = MQTT_PACKET_TYPE_SET(MQTT_PACKET_TYPE_CONNECT_ACK);
+    buf[1] = 1;    /* remain_len = 1 */
+    buf[2] = 0;    /* only flags, missing return_code */
+    rc = MqttDecode_ConnectAck(buf, 3, NULL);
+    CHECK(rc == MQTT_CODE_ERROR_MALFORMED_DATA,
+          "CONNACK remain_len=1: returns MALFORMED_DATA");
+}
+
 int main(int argc, char** argv)
 {
     (void)argc;
@@ -189,6 +226,7 @@ int main(int argc, char** argv)
 
     test_vbi();
     test_encode_publish();
+    test_decode_connack();
 
     PRINTF("=== Results: %d/%d passed ===",
            test_count - fail_count, test_count);
