@@ -368,6 +368,51 @@ static void test_publish_resp_v5_roundtrip(void)
 }
 #endif /* WOLFMQTT_V5 */
 
+/* -------------------------------------------------------------------------- */
+/* MqttEncode_Connect tests                                                   */
+/* -------------------------------------------------------------------------- */
+static void test_encode_connect(void)
+{
+    byte tx_buf[256];
+    MqttConnect conn;
+    int rc;
+
+    PRINTF("--- MqttEncode_Connect ---");
+
+    /* Password without username must fail [MQTT-3.1.2-22] */
+    XMEMSET(&conn, 0, sizeof(conn));
+    conn.client_id = "test_client";
+    conn.username = NULL;
+    conn.password = "secret";
+    rc = MqttEncode_Connect(tx_buf, (int)sizeof(tx_buf), &conn);
+    CHECK(rc == MQTT_CODE_ERROR_BAD_ARG,
+          "password without username: returns ERROR_BAD_ARG");
+
+    /* Both username and password must succeed */
+    XMEMSET(&conn, 0, sizeof(conn));
+    conn.client_id = "test_client";
+    conn.username = "user";
+    conn.password = "secret";
+    rc = MqttEncode_Connect(tx_buf, (int)sizeof(tx_buf), &conn);
+    CHECK(rc > 0, "username+password: succeeds");
+
+    /* Username only (no password) must succeed */
+    XMEMSET(&conn, 0, sizeof(conn));
+    conn.client_id = "test_client";
+    conn.username = "user";
+    conn.password = NULL;
+    rc = MqttEncode_Connect(tx_buf, (int)sizeof(tx_buf), &conn);
+    CHECK(rc > 0, "username only: succeeds");
+
+    /* Neither username nor password must succeed */
+    XMEMSET(&conn, 0, sizeof(conn));
+    conn.client_id = "test_client";
+    conn.username = NULL;
+    conn.password = NULL;
+    rc = MqttEncode_Connect(tx_buf, (int)sizeof(tx_buf), &conn);
+    CHECK(rc > 0, "no credentials: succeeds");
+}
+
 int main(int argc, char** argv)
 {
     (void)argc;
@@ -380,6 +425,7 @@ int main(int argc, char** argv)
     test_decode_connack();
     test_encode_subscribe();
     test_encode_unsubscribe();
+    test_encode_connect();
 #ifdef WOLFMQTT_V5
     test_publish_resp_v5_roundtrip();
 #endif
