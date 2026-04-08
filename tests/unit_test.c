@@ -413,6 +413,27 @@ static void test_encode_connect(void)
     CHECK(rc > 0, "no credentials: succeeds");
 }
 
+/* -------------------------------------------------------------------------- */
+/* QoS 2 next-ack packet_type+1 arithmetic                                    */
+/* -------------------------------------------------------------------------- */
+static void test_qos2_ack_arithmetic(void)
+{
+    PRINTF("--- QoS 2 next-ack arithmetic ---");
+
+    /* PUBLISH_REC + 1 must equal PUBLISH_REL */
+    CHECK(MQTT_PACKET_TYPE_PUBLISH_REC + 1 == MQTT_PACKET_TYPE_PUBLISH_REL,
+          "PUBLISH_REC + 1 == PUBLISH_REL");
+
+    /* PUBLISH_REL + 1 must equal PUBLISH_COMP */
+    CHECK(MQTT_PACKET_TYPE_PUBLISH_REL + 1 == MQTT_PACKET_TYPE_PUBLISH_COMP,
+          "PUBLISH_REL + 1 == PUBLISH_COMP");
+
+    /* Verify the actual enum values for safety */
+    CHECK(MQTT_PACKET_TYPE_PUBLISH_REC == 5, "PUBLISH_REC == 5");
+    CHECK(MQTT_PACKET_TYPE_PUBLISH_REL == 6, "PUBLISH_REL == 6");
+    CHECK(MQTT_PACKET_TYPE_PUBLISH_COMP == 7, "PUBLISH_COMP == 7");
+}
+
 int main(int argc, char** argv)
 {
     (void)argc;
@@ -426,6 +447,7 @@ int main(int argc, char** argv)
     test_encode_subscribe();
     test_encode_unsubscribe();
     test_encode_connect();
+    test_qos2_ack_arithmetic();
 #ifdef WOLFMQTT_V5
     test_publish_resp_v5_roundtrip();
 #endif
