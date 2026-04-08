@@ -251,6 +251,40 @@ static void test_encode_subscribe(void)
     CHECK(rc > 0, "Subscribe packet_id=1: succeeds");
 }
 
+/* -------------------------------------------------------------------------- */
+/* MqttEncode_Unsubscribe tests                                               */
+/* -------------------------------------------------------------------------- */
+static void test_encode_unsubscribe(void)
+{
+    byte tx_buf[256];
+    MqttUnsubscribe unsub;
+    MqttTopic topic;
+    int rc;
+
+    PRINTF("--- MqttEncode_Unsubscribe ---");
+
+    /* packet_id == 0 must fail */
+    XMEMSET(&unsub, 0, sizeof(unsub));
+    XMEMSET(&topic, 0, sizeof(topic));
+    topic.topic_filter = "test/topic";
+    unsub.topics = &topic;
+    unsub.topic_count = 1;
+    unsub.packet_id = 0;
+    rc = MqttEncode_Unsubscribe(tx_buf, (int)sizeof(tx_buf), &unsub);
+    CHECK(rc == MQTT_CODE_ERROR_PACKET_ID,
+          "Unsubscribe packet_id=0: returns ERROR_PACKET_ID");
+
+    /* packet_id != 0 must succeed */
+    XMEMSET(&unsub, 0, sizeof(unsub));
+    XMEMSET(&topic, 0, sizeof(topic));
+    topic.topic_filter = "test/topic";
+    unsub.topics = &topic;
+    unsub.topic_count = 1;
+    unsub.packet_id = 1;
+    rc = MqttEncode_Unsubscribe(tx_buf, (int)sizeof(tx_buf), &unsub);
+    CHECK(rc > 0, "Unsubscribe packet_id=1: succeeds");
+}
+
 int main(int argc, char** argv)
 {
     (void)argc;
@@ -262,6 +296,7 @@ int main(int argc, char** argv)
     test_encode_publish();
     test_decode_connack();
     test_encode_subscribe();
+    test_encode_unsubscribe();
 
     PRINTF("=== Results: %d/%d passed ===",
            test_count - fail_count, test_count);
