@@ -1664,6 +1664,14 @@ int MqttClient_Connect(MqttClient *client, MqttConnect *mc_connect)
     }
 
     if (mc_connect->stat.write == MQTT_MSG_BEGIN) {
+    #ifdef WOLFMQTT_DEBUG_CLIENT
+        /* Warn if credentials are being sent without TLS */
+        if ((mc_connect->username != NULL || mc_connect->password != NULL) &&
+            !(MqttClient_Flags(client, 0, 0) & MQTT_CLIENT_FLAG_IS_TLS)) {
+            PRINTF("Warning: MQTT credentials are being sent without TLS");
+        }
+    #endif
+
         /* Flag write active / lock mutex */
         if ((rc = MqttWriteStart(client, &mc_connect->stat)) != 0) {
             return rc;
