@@ -3876,6 +3876,17 @@ int MqttBroker_Start(MqttBroker* broker)
     if (broker->auth_user || broker->auth_pass) {
         WBLOG_INFO(broker, "broker: auth enabled user=%s",
             broker->auth_user ? broker->auth_user : "(null)");
+    #ifdef ENABLE_MQTT_TLS
+    #ifndef WOLFMQTT_BROKER_NO_INSECURE
+        if (broker->use_tls &&
+            broker->port != broker->port_tls) {
+            WBLOG_ERR(broker,
+                "broker: WARNING: auth credentials exposed on plaintext "
+                "port %d. Use --disable-broker-insecure for TLS-only",
+                broker->port);
+        }
+    #endif
+    #endif
     }
 #endif
 
