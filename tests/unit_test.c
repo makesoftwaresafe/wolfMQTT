@@ -132,6 +132,31 @@ static void test_vbi(void)
     rc = MqttDecode_Vbi(buf, &value, sizeof(buf));
     CHECK(rc == 4, "Decode VBI 2097152 roundtrip: rc == 4");
     CHECK(value == 2097152, "Decode VBI 2097152 roundtrip: value correct");
+
+    /* [MQTT-1.5.5-1] Overlong encodings must be rejected */
+    /* Overlong 2-byte encoding of 0: [0x80, 0x00] */
+    buf[0] = 0x80; buf[1] = 0x00;
+    rc = MqttDecode_Vbi(buf, &value, sizeof(buf));
+    CHECK(rc == MQTT_CODE_ERROR_MALFORMED_DATA,
+          "Overlong 2-byte VBI (0): returns MALFORMED_DATA");
+
+    /* Overlong 3-byte encoding of 0: [0x80, 0x80, 0x00] */
+    buf[0] = 0x80; buf[1] = 0x80; buf[2] = 0x00;
+    rc = MqttDecode_Vbi(buf, &value, sizeof(buf));
+    CHECK(rc == MQTT_CODE_ERROR_MALFORMED_DATA,
+          "Overlong 3-byte VBI (0): returns MALFORMED_DATA");
+
+    /* Overlong 4-byte encoding of 0: [0x80, 0x80, 0x80, 0x00] */
+    buf[0] = 0x80; buf[1] = 0x80; buf[2] = 0x80; buf[3] = 0x00;
+    rc = MqttDecode_Vbi(buf, &value, sizeof(buf));
+    CHECK(rc == MQTT_CODE_ERROR_MALFORMED_DATA,
+          "Overlong 4-byte VBI (0): returns MALFORMED_DATA");
+
+    /* Overlong 2-byte encoding of 127: [0xFF, 0x00] */
+    buf[0] = 0xFF; buf[1] = 0x00;
+    rc = MqttDecode_Vbi(buf, &value, sizeof(buf));
+    CHECK(rc == MQTT_CODE_ERROR_MALFORMED_DATA,
+          "Overlong 2-byte VBI (127): returns MALFORMED_DATA");
 }
 
 /* -------------------------------------------------------------------------- */

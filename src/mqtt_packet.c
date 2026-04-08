@@ -244,6 +244,11 @@ int MqttDecode_Vbi(byte *buf, word32 *value, word32 buf_len)
         rc++;
     } while ((encodedByte & MQTT_PACKET_LEN_ENCODE_MASK) != 0);
 
+    /* [MQTT-1.5.5-1] Reject non-canonical overlong encodings */
+    if (rc > 1 && encodedByte == 0) {
+        return MQTT_TRACE_ERROR(MQTT_CODE_ERROR_MALFORMED_DATA);
+    }
+
     return (int)rc;
 }
 
