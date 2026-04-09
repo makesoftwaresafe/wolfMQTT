@@ -940,11 +940,9 @@ wait_for_file "${TMP_DIR}/t24_sub.ready" 5
 # Attempt to PUBLISH with '+' in the topic name (must be rejected by broker)
 ./$pub_bin -T -h 127.0.0.1 -p $port -n "test/+/card" -m "bad_wildcard_plus" \
     >"${TMP_DIR}/t24_pub_plus.log" 2>&1
-T24_PLUS_RC=$?
 # Attempt to PUBLISH with '#' in the topic name (must be rejected by broker)
 ./$pub_bin -T -h 127.0.0.1 -p $port -n "test/#" -m "bad_wildcard_hash" \
     >"${TMP_DIR}/t24_pub_hash.log" 2>&1
-T24_HASH_RC=$?
 sleep 0.3
 kill $T24_SUB_PID 2>/dev/null
 wait $T24_SUB_PID 2>/dev/null || true

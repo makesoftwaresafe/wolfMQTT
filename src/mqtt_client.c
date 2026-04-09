@@ -1664,7 +1664,7 @@ int MqttClient_Connect(MqttClient *client, MqttConnect *mc_connect)
     }
 
     if (mc_connect->stat.write == MQTT_MSG_BEGIN) {
-    #ifdef WOLFMQTT_DEBUG_CLIENT
+    #ifdef DEBUG_WOLFMQTT
         /* Warn if credentials are being sent without TLS */
         if ((mc_connect->username != NULL || mc_connect->password != NULL) &&
             !(MqttClient_Flags(client, 0, 0) & MQTT_CLIENT_FLAG_IS_TLS)) {
@@ -1728,8 +1728,9 @@ int MqttClient_Connect(MqttClient *client, MqttConnect *mc_connect)
     #endif
         MqttWriteStop(client, &mc_connect->stat);
 
-        /* Clear tx_buf to remove any plaintext credentials from memory */
-        XMEMSET(client->tx_buf, 0, client->write.len);
+        /* Clear tx_buf to remove any plaintext credentials from memory.
+         * Use xfer (saved before MqttWriteStop zeroes client->write) */
+        XMEMSET(client->tx_buf, 0, xfer);
 
         if (rc != xfer) {
             MqttClient_CancelMessage(client, (MqttObject*)mc_connect);

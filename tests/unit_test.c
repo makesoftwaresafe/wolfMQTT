@@ -352,6 +352,10 @@ static void test_publish_resp_v5_roundtrip(void)
           "v5 PUBACK SUCCESS+props: packet_id roundtrip");
     CHECK(dec.reason_code == MQTT_REASON_SUCCESS,
           "v5 PUBACK SUCCESS+props: reason_code roundtrip");
+    if (dec.props) {
+        MqttProps_Free(dec.props);
+        dec.props = NULL;
+    }
 
     /* Case: reason_code=non-SUCCESS, props=NULL (baseline, should work) */
     XMEMSET(&enc, 0, sizeof(enc));
@@ -584,6 +588,10 @@ int main(int argc, char** argv)
 
     PRINTF("wolfMQTT Unit Tests");
 
+#ifdef WOLFMQTT_V5
+    MqttProps_Init();
+#endif
+
     test_vbi();
     test_encode_publish();
     test_decode_connack();
@@ -596,6 +604,7 @@ int main(int argc, char** argv)
     test_decode_unsuback();
 #ifdef WOLFMQTT_V5
     test_publish_resp_v5_roundtrip();
+    MqttProps_ShutDown();
 #endif
 
     PRINTF("=== Results: %d/%d passed ===",
