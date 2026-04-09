@@ -229,7 +229,8 @@ static void test_decode_connack(void)
     /* Malformed CONNACK: remain_len=0 */
     buf[0] = MQTT_PACKET_TYPE_SET(MQTT_PACKET_TYPE_CONNECT_ACK);
     buf[1] = 0;    /* remain_len = 0 */
-    rc = MqttDecode_ConnectAck(buf, 2, NULL);
+    XMEMSET(&ack, 0, sizeof(ack));
+    rc = MqttDecode_ConnectAck(buf, 2, &ack);
     CHECK(rc == MQTT_CODE_ERROR_MALFORMED_DATA,
           "CONNACK remain_len=0: returns MALFORMED_DATA");
 
@@ -237,7 +238,8 @@ static void test_decode_connack(void)
     buf[0] = MQTT_PACKET_TYPE_SET(MQTT_PACKET_TYPE_CONNECT_ACK);
     buf[1] = 1;    /* remain_len = 1 */
     buf[2] = 0;    /* only flags, missing return_code */
-    rc = MqttDecode_ConnectAck(buf, 3, NULL);
+    XMEMSET(&ack, 0, sizeof(ack));
+    rc = MqttDecode_ConnectAck(buf, 3, &ack);
     CHECK(rc == MQTT_CODE_ERROR_MALFORMED_DATA,
           "CONNACK remain_len=1: returns MALFORMED_DATA");
 }

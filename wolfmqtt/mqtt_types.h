@@ -358,6 +358,25 @@ enum MqttPacketResponseCodes {
     #define WOLFMQTT_NORETURN
 #endif
 
+/* Secure memory zeroing - prevents compiler dead-store elimination */
+#ifndef WOLFMQTT_FORCE_ZERO
+    #ifdef ENABLE_MQTT_TLS
+        #include <wolfssl/wolfcrypt/memory.h>
+        #define WOLFMQTT_FORCE_ZERO(mem, len) wc_ForceZero(mem, (word32)(len))
+    #else
+        static INLINE void wolfmqtt_force_zero(void* mem, word32 len)
+        {
+            volatile byte* p = (volatile byte*)mem;
+            word32 i;
+            for (i = 0; i < len; i++) {
+                p[i] = 0;
+            }
+        }
+        #define WOLFMQTT_FORCE_ZERO(mem, len) \
+            wolfmqtt_force_zero(mem, (word32)(len))
+    #endif
+#endif
+
 /* Logging / Tracing */
 #ifdef WOLFMQTT_NO_STDIO
     #undef WOLFMQTT_DEBUG_CLIENT

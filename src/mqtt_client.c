@@ -1722,7 +1722,8 @@ int MqttClient_Connect(MqttClient *client, MqttConnect *mc_connect)
             && client->write.total > 0
         #endif
         ) {
-            /* keep send locked and return early */
+            /* keep send locked and return early.
+             * Note: tx_buf still contains credentials until write completes */
             return rc;
         }
     #endif
@@ -1730,7 +1731,7 @@ int MqttClient_Connect(MqttClient *client, MqttConnect *mc_connect)
 
         /* Clear tx_buf to remove any plaintext credentials from memory.
          * Use xfer (saved before MqttWriteStop zeroes client->write) */
-        XMEMSET(client->tx_buf, 0, xfer);
+        WOLFMQTT_FORCE_ZERO(client->tx_buf, xfer);
 
         if (rc != xfer) {
             MqttClient_CancelMessage(client, (MqttObject*)mc_connect);
