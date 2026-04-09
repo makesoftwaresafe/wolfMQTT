@@ -26,6 +26,8 @@
 
 #include "wolfmqtt/mqtt_client.h"
 
+#define CLIENT_FORCE_ZERO(mem, len) Mqtt_ForceZero(mem, (word32)(len))
+
 /* DOCUMENTED BUILD OPTIONS:
  *
  * WOLFMQTT_MULTITHREAD: Enables multi-thread support with mutex protection on
@@ -1731,7 +1733,7 @@ int MqttClient_Connect(MqttClient *client, MqttConnect *mc_connect)
 
         /* Clear tx_buf to remove any plaintext credentials from memory.
          * Use xfer (saved before MqttWriteStop zeroes client->write) */
-        WOLFMQTT_FORCE_ZERO(client->tx_buf, xfer);
+        CLIENT_FORCE_ZERO(client->tx_buf, xfer);
 
         if (rc != xfer) {
             MqttClient_CancelMessage(client, (MqttObject*)mc_connect);
