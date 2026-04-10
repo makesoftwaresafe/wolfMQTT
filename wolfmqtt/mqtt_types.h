@@ -362,8 +362,11 @@ enum MqttPacketResponseCodes {
  * from optimizing away the stores (dead-store elimination). */
 static INLINE void Mqtt_ForceZero(void* mem, word32 len)
 {
-    volatile byte* z = (volatile byte*)mem;
-    while (len--) *z++ = 0;
+    volatile byte* p = (volatile byte*)mem;
+    word32 i;
+    for (i = 0; i < len; i++) {
+        p[i] = 0;
+    }
 }
 
 /* Logging / Tracing */

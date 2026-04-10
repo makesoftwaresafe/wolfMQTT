@@ -1025,7 +1025,7 @@ static int BrokerWsNetWrite(void* context, const byte* buf, int buf_len,
 
     /* Check if the write callback reported an error (it frees tx_pending
      * and sets status to -1 before returning -1 to lws) */
-    if (ws->status <= 0) {
+    if (ws->status < 0) {
         return MQTT_CODE_ERROR_NETWORK;
     }
 
@@ -3867,7 +3867,8 @@ int MqttBroker_Start(MqttBroker* broker)
             broker->port != broker->port_tls) {
             WBLOG_ERR(broker,
                 "broker: WARNING: auth credentials exposed on plaintext "
-                "port %d. Use --disable-broker-insecure for TLS-only",
+                "port %d. Rebuild with ./configure --disable-broker-insecure "
+                "for TLS-only",
                 broker->port);
         }
     #endif
