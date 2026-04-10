@@ -35,22 +35,7 @@
 
 #ifdef WOLFMQTT_BROKER
 
-/* Secure memory zeroing - prevents compiler dead-store elimination */
-#ifdef ENABLE_MQTT_TLS
-    #include <wolfssl/wolfcrypt/memory.h>
-    #define BROKER_FORCE_ZERO(mem, len) wc_ForceZero(mem, (word32)(len))
-#else
-    /* Local implementation matching wolfCrypt's ForceZero */
-    static void BrokerForceZero(void* mem, word32 len)
-    {
-        volatile byte* p = (volatile byte*)mem;
-        word32 i;
-        for (i = 0; i < len; i++) {
-            p[i] = 0;
-        }
-    }
-    #define BROKER_FORCE_ZERO(mem, len) BrokerForceZero(mem, (word32)(len))
-#endif
+#define BROKER_FORCE_ZERO(mem, len) Mqtt_ForceZero(mem, (word32)(len))
 
 /* -------------------------------------------------------------------------- */
 /* Platform includes                                                           */
@@ -887,6 +872,7 @@ static int callback_broker_mqtt(struct lws *wsi,
                 WOLFMQTT_FREE(ws->tx_pending);
                 ws->tx_pending = NULL;
                 ws->tx_len = 0;
+                ws->status = -1;
                 return -1;
             }
             WOLFMQTT_FREE(ws->tx_pending);
@@ -1034,6 +1020,12 @@ static int BrokerWsNetWrite(void* context, const byte* buf, int buf_len,
         WOLFMQTT_FREE(ws->tx_pending);
         ws->tx_pending = NULL;
         ws->tx_len = 0;
+        return MQTT_CODE_ERROR_NETWORK;
+    }
+
+    /* Check if the write callback reported an error (it frees tx_pending
+     * and sets status to -1 before returning -1 to lws) */
+    if (ws->status < 0) {
         return MQTT_CODE_ERROR_NETWORK;
     }
 
@@ -2552,6 +2544,10 @@ static int BrokerTopicMatch(const char* filter, const char* topic)
             f++;
         }
         else if (*t == '/' || *f == '/') {
+            /* [MQTT-4.7.1.2] 'topic/#' must also match 'topic' itself */
+            if (*f == '/' && f[1] == '#' && f[2] == '\0' && *t == '\0') {
+                return 1;
+            }
             return 0;
         }
     }
@@ -3865,6 +3861,18 @@ int MqttBroker_Start(MqttBroker* broker)
     if (broker->auth_user || broker->auth_pass) {
         WBLOG_INFO(broker, "broker: auth enabled user=%s",
             broker->auth_user ? broker->auth_user : "(null)");
+    #ifdef ENABLE_MQTT_TLS
+    #ifndef WOLFMQTT_BROKER_NO_INSECURE
+        if (broker->use_tls &&
+            broker->port != broker->port_tls) {
+            WBLOG_ERR(broker,
+                "broker: WARNING: auth credentials exposed on plaintext "
+                "port %d. Rebuild with ./configure --disable-broker-insecure "
+                "for TLS-only",
+                broker->port);
+        }
+    #endif
+    #endif
     }
 #endif
 

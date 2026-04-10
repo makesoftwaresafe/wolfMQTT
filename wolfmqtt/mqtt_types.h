@@ -358,6 +358,17 @@ enum MqttPacketResponseCodes {
     #define WOLFMQTT_NORETURN
 #endif
 
+/* Secure memory zeroing - uses volatile pointer to prevent compiler
+ * from optimizing away the stores (dead-store elimination). */
+static INLINE void Mqtt_ForceZero(void* mem, word32 len)
+{
+    volatile byte* p = (volatile byte*)mem;
+    word32 i;
+    for (i = 0; i < len; i++) {
+        p[i] = 0;
+    }
+}
+
 /* Logging / Tracing */
 #ifdef WOLFMQTT_NO_STDIO
     #undef WOLFMQTT_DEBUG_CLIENT

@@ -26,6 +26,8 @@
 
 #include "wolfmqtt/mqtt_client.h"
 
+#define CLIENT_FORCE_ZERO(mem, len) Mqtt_ForceZero(mem, (word32)(len))
+
 /* DOCUMENTED BUILD OPTIONS:
  *
  * WOLFMQTT_MULTITHREAD: Enables multi-thread support with mutex protection on
@@ -1664,6 +1666,14 @@ int MqttClient_Connect(MqttClient *client, MqttConnect *mc_connect)
     }
 
     if (mc_connect->stat.write == MQTT_MSG_BEGIN) {
+    #ifdef DEBUG_WOLFMQTT
+        /* Warn if credentials are being sent without TLS */
+        if ((mc_connect->username != NULL || mc_connect->password != NULL) &&
+            !(MqttClient_Flags(client, 0, 0) & MQTT_CLIENT_FLAG_IS_TLS)) {
+            PRINTF("Warning: MQTT credentials are being sent without TLS");
+        }
+    #endif
+
         /* Flag write active / lock mutex */
         if ((rc = MqttWriteStart(client, &mc_connect->stat)) != 0) {
             return rc;
@@ -1714,11 +1724,17 @@ int MqttClient_Connect(MqttClient *client, MqttConnect *mc_connect)
             && client->write.total > 0
         #endif
         ) {
-            /* keep send locked and return early */
+            /* keep send locked and return early.
+             * Note: tx_buf still contains credentials until write completes */
             return rc;
         }
     #endif
         MqttWriteStop(client, &mc_connect->stat);
+
+        /* Clear tx_buf to remove any plaintext credentials from memory.
+         * Use xfer (saved before MqttWriteStop zeroes client->write) */
+        CLIENT_FORCE_ZERO(client->tx_buf, xfer);
+
         if (rc != xfer) {
             MqttClient_CancelMessage(client, (MqttObject*)mc_connect);
             return rc;

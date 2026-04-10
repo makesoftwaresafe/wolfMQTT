@@ -880,6 +880,119 @@ else
 fi
 fi
 
+# --- Test 23: $-prefix wildcard guard [MQTT-4.7.2] ---
+echo ""
+echo "--- Test 23: \$-prefix wildcard guard [MQTT-4.7.2] ---"
+if [ "$skip_plain" = "yes" ]; then
+    echo "SKIP: \$-prefix wildcard guard (plain listener disabled)"
+elif [ "$has_wildcards" = "no" ]; then
+    echo "SKIP: \$-prefix wildcard guard (wildcards not built)"
+else
+start_broker
+# Subscribe to '#' (should NOT receive $SYS messages per MQTT-4.7.2)
+rm -f "${TMP_DIR}/t23_wild.ready" "${TMP_DIR}/t23_exact.ready"
+timeout 10 ./$sub_bin -T -h 127.0.0.1 -p $port -n "#" -i "sub_wild_dollar" \
+    -R "${TMP_DIR}/t23_wild.ready" >"${TMP_DIR}/t23_wild.log" 2>&1 &
+T23_WILD_PID=$!
+# Subscribe to exact '$SYS/test' (SHOULD receive the message)
+timeout 10 ./$sub_bin -T -h 127.0.0.1 -p $port -n '$SYS/test' -i "sub_exact_dollar" \
+    -R "${TMP_DIR}/t23_exact.ready" >"${TMP_DIR}/t23_exact.log" 2>&1 &
+T23_EXACT_PID=$!
+TEST_PIDS+=($T23_WILD_PID $T23_EXACT_PID)
+wait_for_file "${TMP_DIR}/t23_wild.ready" 5
+wait_for_file "${TMP_DIR}/t23_exact.ready" 5
+# Publish to $SYS/test
+./$pub_bin -T -h 127.0.0.1 -p $port -n '$SYS/test' -m "dollar_sys_msg" \
+    >"${TMP_DIR}/t23_pub.log" 2>&1
+sleep 0.3
+kill $T23_WILD_PID $T23_EXACT_PID 2>/dev/null
+wait $T23_WILD_PID 2>/dev/null || true
+wait $T23_EXACT_PID 2>/dev/null || true
+TEST_PIDS=()
+T23_WILD_GOT=no
+T23_EXACT_GOT=no
+grep -q "dollar_sys_msg" "${TMP_DIR}/t23_wild.log" 2>/dev/null && T23_WILD_GOT=yes
+grep -q "dollar_sys_msg" "${TMP_DIR}/t23_exact.log" 2>/dev/null && T23_EXACT_GOT=yes
+if [ "$T23_WILD_GOT" = "no" ] && [ "$T23_EXACT_GOT" = "yes" ]; then
+    echo "PASS: \$-prefix wildcard guard (# blocked, exact matched)"
+else
+    echo "FAIL: \$-prefix wildcard guard (wild_got=$T23_WILD_GOT, exact_got=$T23_EXACT_GOT)"
+    FAIL=1
+fi
+fi
+
+# --- Test 24: PUBLISH topic wildcard rejection [MQTT-3.3.2-2] ---
+echo ""
+echo "--- Test 24: PUBLISH topic wildcard rejection [MQTT-3.3.2-2] ---"
+if [ "$skip_plain" = "yes" ]; then
+    echo "SKIP: PUBLISH wildcard rejection (plain listener disabled)"
+elif [ "$has_wildcards" = "no" ]; then
+    echo "SKIP: PUBLISH wildcard rejection (wildcards not built)"
+else
+start_broker
+# Subscribe to a wildcard filter that would match if the broker allowed it
+rm -f "${TMP_DIR}/t24_sub.ready"
+timeout 10 ./$sub_bin -T -h 127.0.0.1 -p $port -n "test/wild/+" -i "sub_wild24" \
+    -R "${TMP_DIR}/t24_sub.ready" >"${TMP_DIR}/t24_sub.log" 2>&1 &
+T24_SUB_PID=$!
+TEST_PIDS+=($T24_SUB_PID)
+wait_for_file "${TMP_DIR}/t24_sub.ready" 5
+# Attempt to PUBLISH with '+' in the topic name (must be rejected by broker)
+./$pub_bin -T -h 127.0.0.1 -p $port -n "test/+/card" -m "bad_wildcard_plus" \
+    >"${TMP_DIR}/t24_pub_plus.log" 2>&1
+# Attempt to PUBLISH with '#' in the topic name (must be rejected by broker)
+./$pub_bin -T -h 127.0.0.1 -p $port -n "test/#" -m "bad_wildcard_hash" \
+    >"${TMP_DIR}/t24_pub_hash.log" 2>&1
+sleep 0.3
+kill $T24_SUB_PID 2>/dev/null
+wait $T24_SUB_PID 2>/dev/null || true
+TEST_PIDS=()
+# Verify subscriber did NOT receive either message
+T24_GOT_PLUS=no
+T24_GOT_HASH=no
+grep -q "bad_wildcard_plus" "${TMP_DIR}/t24_sub.log" 2>/dev/null && T24_GOT_PLUS=yes
+grep -q "bad_wildcard_hash" "${TMP_DIR}/t24_sub.log" 2>/dev/null && T24_GOT_HASH=yes
+if [ "$T24_GOT_PLUS" = "no" ] && [ "$T24_GOT_HASH" = "no" ]; then
+    echo "PASS: PUBLISH topic wildcard rejection (+ and # blocked)"
+else
+    echo "FAIL: PUBLISH wildcard rejection (got_plus=$T24_GOT_PLUS, got_hash=$T24_GOT_HASH)"
+    FAIL=1
+fi
+fi
+
+# --- Test 25: Multi-level wildcard matches parent [MQTT-4.7.1.2] ---
+echo ""
+echo "--- Test 25: Multi-level wildcard matches parent [MQTT-4.7.1.2] ---"
+if [ "$skip_plain" = "yes" ]; then
+    echo "SKIP: Multi-level wildcard parent match (plain listener disabled)"
+elif [ "$has_wildcards" = "no" ]; then
+    echo "SKIP: Multi-level wildcard parent match (wildcards not built)"
+else
+start_broker
+# Subscribe to 'sport/#' — per MQTT-4.7.1.2 this must also match 'sport'
+rm -f "${TMP_DIR}/t25_sub.ready"
+timeout 10 ./$sub_bin -T -h 127.0.0.1 -p $port -n "sport/#" -i "sub_parent25" \
+    -R "${TMP_DIR}/t25_sub.ready" >"${TMP_DIR}/t25_sub.log" 2>&1 &
+T25_SUB_PID=$!
+TEST_PIDS+=($T25_SUB_PID)
+wait_for_file "${TMP_DIR}/t25_sub.ready" 5
+# Publish to 'sport' (parent level, no trailing slash)
+./$pub_bin -T -h 127.0.0.1 -p $port -n "sport" -m "parent_match_msg" \
+    >"${TMP_DIR}/t25_pub.log" 2>&1
+sleep 0.3
+kill $T25_SUB_PID 2>/dev/null
+wait $T25_SUB_PID 2>/dev/null || true
+TEST_PIDS=()
+T25_GOT=no
+grep -q "parent_match_msg" "${TMP_DIR}/t25_sub.log" 2>/dev/null && T25_GOT=yes
+if [ "$T25_GOT" = "yes" ]; then
+    echo "PASS: Multi-level wildcard matches parent (sport/# matched sport)"
+else
+    echo "FAIL: Multi-level wildcard parent match (got=$T25_GOT)"
+    FAIL=1
+fi
+fi
+
 # --- WebSocket Tests ---
 ws_client_bin="examples/websocket/websocket_client"
 has_websocket=no
