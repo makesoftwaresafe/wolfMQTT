@@ -11,6 +11,14 @@ jobs:
 
     runs-on: ubuntu-22.04
     timeout-minutes: 5
+    # Serialize across all workflows that exercise the hard-coded
+    # "demoDevice" MQTT client ID against AWS IoT. Parallel runs from
+    # different workflows (ubuntu-check, ubuntu-check-curl, this file's
+    # aws-ca-regression) otherwise collide on the AWS side and produce
+    # spurious "MQTT Connect/Subscribe: Error (Network) (-8)" failures.
+    concurrency:
+      group: wolfmqtt-awsiot-external
+      cancel-in-progress: false
 
     steps:
     - name: Install dependencies
@@ -130,13 +138,16 @@ jobs:
     # the demo, so this job needs external network access (same as the
     # `build` job's `make check`).
     #
-    # `needs: build` serializes AWS IoT access: the `build` job already
-    # invokes scripts/awsiot.test via `make check`, and both jobs share
-    # the same hard-coded MQTT client ID "demoDevice". Running them in
-    # parallel causes AWS IoT to drop connections ("MQTT Connect: Error
-    # (Network) (-8)") from client-id collisions, which looks like a
-    # test failure but is unrelated to the CA changes this job checks.
+    # `needs: build` serializes AWS IoT access within this workflow.
+    # The repo-wide `concurrency:` group below serializes against other
+    # workflows (e.g. ubuntu-check-curl) that also run awsiot.test
+    # against the same hard-coded "demoDevice" client ID. Without both,
+    # parallel jobs cause AWS IoT to drop connections with "MQTT
+    # Connect/Subscribe: Error (Network) (-8)".
     needs: build
+    concurrency:
+      group: wolfmqtt-awsiot-external
+      cancel-in-progress: false
     #
     #   case 1: default bundle (Amazon Root CA 1 + Starfield G2), wolfSSL
     #           built WITHOUT WOLFSSL_NO_ASN_STRICT. Strict ASN parsing
