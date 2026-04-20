@@ -11,6 +11,14 @@ jobs:
 
     runs-on: ubuntu-22.04
     timeout-minutes: 5
+    # Serialize across all workflows that exercise the hard-coded
+    # "demoDevice" MQTT client ID against AWS IoT. Parallel runs from
+    # different workflows (ubuntu-check, ubuntu-check-curl, this file's
+    # aws-ca-regression) otherwise collide on the AWS side and produce
+    # spurious "MQTT Connect/Subscribe: Error (Network) (-8)" failures.
+    concurrency:
+      group: wolfmqtt-awsiot-external
+      cancel-in-progress: false
 
     steps:
     - name: Install dependencies
@@ -123,3 +131,126 @@ jobs:
       run: |
         cat test-suite.log
         cat scripts/*.log
+
+  aws-ca-regression:
+    # Exercises examples/aws/awsiot.c trust-anchor handling in three
+    # configurations. Uses the real AWS IoT ATS endpoint hard-coded in
+    # the demo, so this job needs external network access (same as the
+    # `build` job's `make check`).
+    #
+    # `needs: build` serializes AWS IoT access within this workflow.
+    # The repo-wide `concurrency:` group below serializes against other
+    # workflows (e.g. ubuntu-check-curl) that also run awsiot.test
+    # against the same hard-coded "demoDevice" client ID. Without both,
+    # parallel jobs cause AWS IoT to drop connections with "MQTT
+    # Connect/Subscribe: Error (Network) (-8)".
+    needs: build
+    concurrency:
+      group: wolfmqtt-awsiot-external
+      cancel-in-progress: false
+    #
+    #   case 1: default bundle (Amazon Root CA 1 + Starfield G2), wolfSSL
+    #           built WITHOUT WOLFSSL_NO_ASN_STRICT. Strict ASN parsing
+    #           drops Starfield G2 (serial=0); the verify callback's
+    #           accept-anyway branch keeps the test passing.  Expect PASS.
+    #
+    #   case 2: default bundle, wolfSSL built WITH WOLFSSL_NO_ASN_STRICT.
+    #           Full bundle loads, chain verifies cleanly, callback
+    #           never has to mask an error.  Expect PASS.
+    #
+    #   case 3: legacy VeriSign G5 bundle (via
+    #           -DWOLFMQTT_AWSIOT_LEGACY_VERISIGN_CA), wolfSSL built WITH
+    #           WOLFSSL_NO_ASN_STRICT. The strict callback rejects the
+    #           unanchored chain.  Expect FAIL.
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    steps:
+      - name: Install dependencies
+        run: |
+          export DEBIAN_FRONTEND=noninteractive
+          sudo apt-get update
+          sudo apt-get install -y mosquitto bubblewrap
+      - name: Setup mosquitto broker
+        run: |
+          sudo service mosquitto stop
+          sleep 1
+
+      # --- case 1: wolfSSL built with DEFAULT strict ASN parsing ---
+      - uses: actions/checkout@master
+        with:
+          repository: wolfssl/wolfssl
+          path: wolfssl
+      - name: wolfssl autogen (strict ASN default)
+        working-directory: ./wolfssl
+        run: ./autogen.sh
+      - name: wolfssl configure (strict ASN default)
+        working-directory: ./wolfssl
+        run: ./configure --enable-enckeys
+      - name: wolfssl make
+        working-directory: ./wolfssl
+        run: make
+      - name: wolfssl make install
+        working-directory: ./wolfssl
+        run: sudo make install
+
+      - uses: actions/checkout@master
+      - name: wolfmqtt autogen
+        run: ./autogen.sh
+      - name: case 1 - wolfmqtt configure (default bundle, strict ASN)
+        run: ./configure --enable-tls --enable-examples
+      - name: case 1 - wolfmqtt make
+        run: make
+      - name: case 1 - awsiot.test expect PASS
+        run: ./scripts/awsiot.test
+
+      # --- cases 2 + 3: wolfSSL rebuilt with WOLFSSL_NO_ASN_STRICT ---
+      # The wolfmqtt checkout above wiped the workspace, so the wolfssl
+      # source tree is gone even though /usr/local/lib/libwolfssl.* is
+      # still installed. Re-checkout to get a fresh source tree for the
+      # NO_ASN_STRICT rebuild.
+      - uses: actions/checkout@master
+        with:
+          repository: wolfssl/wolfssl
+          path: wolfssl
+      - name: wolfssl autogen (NO_ASN_STRICT build)
+        working-directory: ./wolfssl
+        run: ./autogen.sh
+      - name: wolfssl configure with -DWOLFSSL_NO_ASN_STRICT
+        working-directory: ./wolfssl
+        run: ./configure --enable-enckeys CFLAGS=-DWOLFSSL_NO_ASN_STRICT
+      - name: wolfssl rebuild
+        working-directory: ./wolfssl
+        run: make
+      - name: wolfssl reinstall
+        working-directory: ./wolfssl
+        run: sudo make install
+
+      - name: case 2 - wolfmqtt configure (default bundle, WOLFSSL_NO_ASN_STRICT)
+        run: |
+          make clean
+          ./configure --enable-tls --enable-examples
+      - name: case 2 - wolfmqtt make
+        run: make
+      - name: case 2 - awsiot.test expect PASS
+        run: ./scripts/awsiot.test
+
+      - name: case 3 - wolfmqtt configure (legacy VeriSign, WOLFSSL_NO_ASN_STRICT)
+        run: |
+          make clean
+          ./configure --enable-tls --enable-examples \
+            CPPFLAGS=-DWOLFMQTT_AWSIOT_LEGACY_VERISIGN_CA
+      - name: case 3 - wolfmqtt make
+        run: make
+      - name: case 3 - awsiot.test expect FAIL
+        run: |
+          if ./scripts/awsiot.test; then
+            echo "case 3 unexpectedly PASSED - legacy VeriSign should not verify AWS IoT chain"
+            exit 1
+          fi
+          echo "case 3 FAILED as expected (legacy VeriSign trust anchor rejected)"
+
+      - name: Show logs on failure
+        if: failure() || cancelled()
+        run: |
+          cat test-suite.log || true
+          cat scripts/*.log || true

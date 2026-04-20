@@ -11,6 +11,13 @@ jobs:
 
     runs-on: ubuntu-22.04
     timeout-minutes: 5
+    # Serialize with every other workflow that runs awsiot.test against
+    # AWS IoT under the hard-coded "demoDevice" client ID. Without this,
+    # parallel runs from sibling workflows clobber each other's MQTT
+    # connections.
+    concurrency:
+      group: wolfmqtt-awsiot-external
+      cancel-in-progress: false
 
     steps:
     - name: Install dependencies

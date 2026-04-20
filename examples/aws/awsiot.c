@@ -76,8 +76,27 @@ static int mTestDone = 0;
 
 #define AWSIOT_PUBLISH_MSG_SZ   400
 
-/* Demo Certificates */
+/* Demo Certificates
+ *
+ * Default: Amazon Root CA 1 + Starfield Services Root CA G2, the trust
+ * anchors AWS IoT documents for ATS endpoints. Sources:
+ *   https://www.amazontrust.com/repository/AmazonRootCA1.pem
+ *   https://www.amazontrust.com/repository/SFSRootCAG2.pem
+ *
+ * Note: Starfield Services Root CA G2 has serialNumber=0, so wolfSSL's
+ * default strict ASN parser drops it. Builds that need real chain
+ * verification against AWS IoT must define WOLFSSL_NO_ASN_STRICT.
+ *
+ * Regression toggle: define WOLFMQTT_AWSIOT_LEGACY_VERISIGN_CA at build
+ * time to restore the pre-fix VeriSign Class 3 G5 root. That CA was
+ * deprecated by AWS IoT Core (see AWS server-authentication docs) and
+ * no longer verifies any AWS IoT chain; the toggle exists so the test
+ * can assert that strict verification rejects the old anchor.
+ */
+#ifdef WOLFMQTT_AWSIOT_LEGACY_VERISIGN_CA
 WOLFMQTT_EXAMPLE_CERT const char* root_ca =
+/* VeriSign Class 3 Public Primary Certification Authority - G5
+ * (deprecated by AWS IoT Core; preserved only for regression testing). */
 "-----BEGIN CERTIFICATE-----\n"
 "MIIE0zCCA7ugAwIBAgIQGNrRniZ96LtKIVjNzGs7SjANBgkqhkiG9w0BAQUFADCB\n"
 "yjELMAkGA1UEBhMCVVMxFzAVBgNVBAoTDlZlcmlTaWduLCBJbmMuMR8wHQYDVQQL\n"
@@ -106,6 +125,55 @@ WOLFMQTT_EXAMPLE_CERT const char* root_ca =
 "4fQRbxC1lfznQgUy286dUV4otp6F01vvpX1FQHKOtw5rDgb7MzVIcbidJ4vEZV8N\n"
 "hnacRHr2lVz2XTIIM6RUthg/aFzyQkqFOFSDX9HoLPKsEdao7WNq\n"
 "-----END CERTIFICATE-----";
+#else
+WOLFMQTT_EXAMPLE_CERT const char* root_ca =
+/* Amazon Root CA 1 */
+"-----BEGIN CERTIFICATE-----\n"
+"MIIDQTCCAimgAwIBAgITBmyfz5m/jAo54vB4ikPmljZbyjANBgkqhkiG9w0BAQsF\n"
+"ADA5MQswCQYDVQQGEwJVUzEPMA0GA1UEChMGQW1hem9uMRkwFwYDVQQDExBBbWF6\n"
+"b24gUm9vdCBDQSAxMB4XDTE1MDUyNjAwMDAwMFoXDTM4MDExNzAwMDAwMFowOTEL\n"
+"MAkGA1UEBhMCVVMxDzANBgNVBAoTBkFtYXpvbjEZMBcGA1UEAxMQQW1hem9uIFJv\n"
+"b3QgQ0EgMTCCASIwDQYJKoZIhvcNAQEBBQADggEPADCCAQoCggEBALJ4gHHKeNXj\n"
+"ca9HgFB0fW7Y14h29Jlo91ghYPl0hAEvrAIthtOgQ3pOsqTQNroBvo3bSMgHFzZM\n"
+"9O6II8c+6zf1tRn4SWiw3te5djgdYZ6k/oI2peVKVuRF4fn9tBb6dNqcmzU5L/qw\n"
+"IFAGbHrQgLKm+a/sRxmPUDgH3KKHOVj4utWp+UhnMJbulHheb4mjUcAwhmahRWa6\n"
+"VOujw5H5SNz/0egwLX0tdHA114gk957EWW67c4cX8jJGKLhD+rcdqsq08p8kDi1L\n"
+"93FcXmn/6pUCyziKrlA4b9v7LWIbxcceVOF34GfID5yHI9Y/QCB/IIDEgEw+OyQm\n"
+"jgSubJrIqg0CAwEAAaNCMEAwDwYDVR0TAQH/BAUwAwEB/zAOBgNVHQ8BAf8EBAMC\n"
+"AYYwHQYDVR0OBBYEFIQYzIU07LwMlJQuCFmcx7IQTgoIMA0GCSqGSIb3DQEBCwUA\n"
+"A4IBAQCY8jdaQZChGsV2USggNiMOruYou6r4lK5IpDB/G/wkjUu0yKGX9rbxenDI\n"
+"U5PMCCjjmCXPI6T53iHTfIUJrU6adTrCC2qJeHZERxhlbI1Bjjt/msv0tadQ1wUs\n"
+"N+gDS63pYaACbvXy8MWy7Vu33PqUXHeeE6V/Uq2V8viTO96LXFvKWlJbYK8U90vv\n"
+"o/ufQJVtMVT8QtPHRh8jrdkPSHCa2XV4cdFyQzR1bldZwgJcJmApzyMZFo6IQ6XU\n"
+"5MsI+yMRQ+hDKXJioaldXgjUkK642M4UwtBV8ob2xJNDd2ZhwLnoQdeXeGADbkpy\n"
+"rqXRfboQnoZsG4q5WTP468SQvvG5\n"
+"-----END CERTIFICATE-----\n"
+/* Starfield Services Root Certificate Authority - G2 */
+"-----BEGIN CERTIFICATE-----\n"
+"MIID7zCCAtegAwIBAgIBADANBgkqhkiG9w0BAQsFADCBmDELMAkGA1UEBhMCVVMx\n"
+"EDAOBgNVBAgTB0FyaXpvbmExEzARBgNVBAcTClNjb3R0c2RhbGUxJTAjBgNVBAoT\n"
+"HFN0YXJmaWVsZCBUZWNobm9sb2dpZXMsIEluYy4xOzA5BgNVBAMTMlN0YXJmaWVs\n"
+"ZCBTZXJ2aWNlcyBSb290IENlcnRpZmljYXRlIEF1dGhvcml0eSAtIEcyMB4XDTA5\n"
+"MDkwMTAwMDAwMFoXDTM3MTIzMTIzNTk1OVowgZgxCzAJBgNVBAYTAlVTMRAwDgYD\n"
+"VQQIEwdBcml6b25hMRMwEQYDVQQHEwpTY290dHNkYWxlMSUwIwYDVQQKExxTdGFy\n"
+"ZmllbGQgVGVjaG5vbG9naWVzLCBJbmMuMTswOQYDVQQDEzJTdGFyZmllbGQgU2Vy\n"
+"dmljZXMgUm9vdCBDZXJ0aWZpY2F0ZSBBdXRob3JpdHkgLSBHMjCCASIwDQYJKoZI\n"
+"hvcNAQEBBQADggEPADCCAQoCggEBANUMOsQq+U7i9b4Zl1+OiFOxHz/Lz58gE20p\n"
+"OsgPfTz3a3Y4Y9k2YKibXlwAgLIvWX/2h/klQ4bnaRtSmpDhcePYLQ1Ob/bISdm2\n"
+"8xpWriu2dBTrz/sm4xq6HZYuajtYlIlHVv8loJNwU4PahHQUw2eeBGg6345AWh1K\n"
+"Ts9DkTvnVtYAcMtS7nt9rjrnvDH5RfbCYM8TWQIrgMw0R9+53pBlbQLPLJGmpufe\n"
+"hRhJfGZOozptqbXuNC66DQO4M99H67FrjSXZm86B0UVGMpZwh94CDklDhbZsc7tk\n"
+"6mFBrMnUVN+HL8cisibMn1lUaJ/8viovxFUcdUBgF4UCVTmLfwUCAwEAAaNCMEAw\n"
+"DwYDVR0TAQH/BAUwAwEB/zAOBgNVHQ8BAf8EBAMCAQYwHQYDVR0OBBYEFJxfAN+q\n"
+"AdcwKziIorhtSpzyEZGDMA0GCSqGSIb3DQEBCwUAA4IBAQBLNqaEd2ndOxmfZyMI\n"
+"bw5hyf2E3F/YNoHN2BtBLZ9g3ccaaNnRbobhiCPPE95Dz+I0swSdHynVv/heyNXB\n"
+"ve6SbzJ08pGCL72CQnqtKrcgfU28elUSwhXqvfdqlS5sdJ/PHLTyxQGjhdByPq1z\n"
+"qwubdQxtRbeOlKyWN7Wg0I8VRw7j6IPdj/3vQQF3zCepYoUz8jcI73HPdwbeyBkd\n"
+"iEDPfUYd/x7H4c7/I9vG+o1VTqkC50cRRj70/b17KSa7qWFiNyi2LSr2EIZkyXCn\n"
+"0q23KXB56jzaYyWf/Wi3MOxw+3WKt21gZ7IeyLnp2KhvAotnDU0mV3HaIPzBSlCN\n"
+"sSi6\n"
+"-----END CERTIFICATE-----";
+#endif /* WOLFMQTT_AWSIOT_LEGACY_VERISIGN_CA */
 
 #if 0
 static const char* device_pub_key =
@@ -214,9 +282,21 @@ static int mqtt_aws_tls_verify_cb(int preverify, WOLFSSL_X509_STORE_CTX* store)
     PRINTF("  Subject's domain name is %s", store->domain);
 
     if (store->error != 0) {
-        /* Allowing to continue */
-        /* Should check certificate and return 0 if not okay */
+#ifdef WOLFSSL_NO_ASN_STRICT
+        /* With WOLFSSL_NO_ASN_STRICT the full AWS IoT trust bundle
+         * (Amazon Root CA 1 + Starfield Services Root CA G2) loads and
+         * a real chain must verify. Treat any error as a hard failure
+         * so regressions in the trust bundle or the server chain are
+         * caught by scripts/awsiot.test instead of being masked. */
+        PRINTF("  Rejecting cert: verification must succeed under"
+               " WOLFSSL_NO_ASN_STRICT");
+        return 0;
+#else
+        /* Strict ASN parsing drops Starfield Services Root CA G2
+         * (serialNumber=0), so chain verification can legitimately
+         * fail here. Keep the demo running. */
         PRINTF("  Allowing cert anyways");
+#endif
     }
 
     return 1;
@@ -226,6 +306,10 @@ static int mqtt_aws_tls_verify_cb(int preverify, WOLFSSL_X509_STORE_CTX* store)
 static int mqtt_aws_tls_cb(MqttClient* client)
 {
     int rc = WOLFSSL_FAILURE;
+
+#ifdef DEBUG_WOLFSSL
+    wolfSSL_Debugging_ON();
+#endif
 
     /* Use highest available and allow downgrade. If wolfSSL is built with
      * old TLS support, it is possible for a server to force a downgrade to
