@@ -290,7 +290,11 @@ WOLFMQTT_API int MqttClient_SetPropertyCallback(
  *  \param      client      Pointer to MqttClient structure
  *  \param      connect     Pointer to MqttConnect structure initialized
                             with connect parameters
- *  \return     MQTT_CODE_SUCCESS or MQTT_CODE_ERROR_*
+ *  \return     MQTT_CODE_SUCCESS if the broker accepted the connection,
+                MQTT_CODE_ERROR_CONNECT_REFUSED if the broker returned a
+                non-zero CONNACK return_code (check
+                connect->ack.return_code for the specific reason), or
+                another MQTT_CODE_ERROR_* for transport/protocol failures
                 (see enum MqttPacketResponseCodes)
  */
 WOLFMQTT_API int MqttClient_Connect(

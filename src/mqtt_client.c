@@ -1867,6 +1867,14 @@ int MqttClient_Connect(MqttClient *client, MqttConnect *mc_connect)
     /* reset state */
     mc_connect->stat.write = MQTT_MSG_BEGIN;
 
+    /* CONNACK was received and decoded, but the broker refused the
+     * connection. The specific reason is in mc_connect->ack.return_code
+     * (MqttConnectAckReturnCodes for v3.1.1, MqttReasonCodes for v5). */
+    if (rc == MQTT_CODE_SUCCESS &&
+            mc_connect->ack.return_code != MQTT_CONNECT_ACK_CODE_ACCEPTED) {
+        rc = MQTT_TRACE_ERROR(MQTT_CODE_ERROR_CONNECT_REFUSED);
+    }
+
     return rc;
 }
 
@@ -3055,6 +3063,8 @@ const char* MqttClient_ReturnCodeToString(int return_code)
             return "Error (System resource failed)";
         case MQTT_CODE_ERROR_NOT_FOUND:
             return "Error (Not found)";
+        case MQTT_CODE_ERROR_CONNECT_REFUSED:
+            return "Error (Broker refused connection)";
 #if defined(ENABLE_MQTT_CURL)
         case MQTT_CODE_ERROR_CURL:
             return "Error (libcurl)";
