@@ -2783,6 +2783,11 @@ int MqttClient_Auth(MqttClient *client, MqttAuth* auth)
         }
     #endif
         MqttWriteStop(client, &auth->stat);
+
+        /* Clear tx_buf to remove any SASL auth data from memory.
+         * Use xfer (saved before MqttWriteStop zeroes client->write) */
+        CLIENT_FORCE_ZERO(client->tx_buf, xfer);
+
         if (rc != xfer) {
             MqttClient_CancelMessage(client, (MqttObject*)auth);
             return rc;
