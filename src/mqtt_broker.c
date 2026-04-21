@@ -1847,6 +1847,7 @@ static int BrokerRetained_Store(MqttBroker* broker, const char* topic,
 #else
     {
         byte is_new = 0;
+        byte* new_payload = NULL;
         BrokerRetainedMsg* cur = broker->retained;
         while (cur) {
             if (cur->topic != NULL && XSTRCMP(cur->topic, topic) == 0) {
@@ -1855,16 +1856,8 @@ static int BrokerRetained_Store(MqttBroker* broker, const char* topic,
             }
             cur = cur->next;
         }
-        if (msg != NULL) {
-            /* Replace existing: free old payload */
-            if (msg->payload) {
-                WOLFMQTT_FREE(msg->payload);
-                msg->payload = NULL;
-            }
-            msg->payload_len = 0;
-        }
-        else {
-            /* Allocate new */
+        if (msg == NULL) {
+            /* Allocate new node + topic */
             int tlen = (int)XSTRLEN(topic);
             msg = (BrokerRetainedMsg*)WOLFMQTT_MALLOC(
                 sizeof(BrokerRetainedMsg));
@@ -1886,16 +1879,22 @@ static int BrokerRetained_Store(MqttBroker* broker, const char* topic,
                 is_new = 1;
             }
         }
+        /* Stage new payload in a temp; only touch the stored message after
+         * all allocations succeed, so an OOM cannot destroy the prior one. */
         if (rc == MQTT_CODE_SUCCESS && payload_len > 0 && payload != NULL) {
-            msg->payload = (byte*)WOLFMQTT_MALLOC(payload_len);
-            if (msg->payload == NULL) {
+            new_payload = (byte*)WOLFMQTT_MALLOC(payload_len);
+            if (new_payload == NULL) {
                 rc = MQTT_CODE_ERROR_MEMORY;
             }
             else {
-                XMEMCPY(msg->payload, payload, payload_len);
+                XMEMCPY(new_payload, payload, payload_len);
             }
         }
         if (rc == MQTT_CODE_SUCCESS) {
+            if (!is_new && msg->payload != NULL) {
+                WOLFMQTT_FREE(msg->payload);
+            }
+            msg->payload = new_payload;
             msg->payload_len = payload_len;
             if (is_new) {
                 msg->next = broker->retained;
