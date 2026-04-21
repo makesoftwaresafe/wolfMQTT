@@ -344,6 +344,19 @@ if (WOLFMQTT_BROKER)
         $<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}>)
 endif()
 
+option(WOLFMQTT_UNIT_TESTS "Build unit tests" ON)
+if(WOLFMQTT_UNIT_TESTS)
+    enable_testing()
+    add_executable(unit_tests
+        tests/unit_test.c
+        tests/test_mqtt_packet.c
+        tests/test_mqtt_client.c
+    )
+    target_include_directories(unit_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(unit_tests wolfmqtt)
+    add_test(NAME unit_tests COMMAND unit_tests)
+endif()
+
 ####################################################
 # Installation
 ####################################################

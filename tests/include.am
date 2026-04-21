@@ -2,12 +2,17 @@
 # included from Top Level Makefile.am
 # All paths should be given relative to the root
 
-# Unit tests for packet encode/decode
-check_PROGRAMS += tests/unit_test
-tests_unit_test_SOURCES      = tests/unit_test.c
-tests_unit_test_LDADD        = src/libwolfmqtt.la
-tests_unit_test_DEPENDENCIES = src/libwolfmqtt.la
-tests_unit_test_CPPFLAGS     = $(AM_CPPFLAGS)
+# Unit tests
+check_PROGRAMS += tests/unit_tests
+tests_unit_tests_SOURCES      = tests/unit_test.c \
+                                tests/test_mqtt_packet.c \
+                                tests/test_mqtt_client.c
+tests_unit_tests_CPPFLAGS     = -I$(top_srcdir) $(AM_CPPFLAGS)
+tests_unit_tests_LDADD        = src/libwolfmqtt.la
+tests_unit_tests_DEPENDENCIES = src/libwolfmqtt.la
+
+# Test framework header
+noinst_HEADERS += tests/unit_test.h
 
 if BUILD_FUZZ
 if BUILD_BROKER
