@@ -66,8 +66,15 @@ WOLFMQTT_API int SN_Client_SearchGW(
  *  \param      client      Pointer to MqttClient structure
  *  \param      connect     Pointer to SN_Connect structure initialized
                             with connect parameters
- *  \return     MQTT_CODE_SUCCESS or MQTT_CODE_ERROR_*
-                (see enum MqttPacketResponseCodes)
+ *  \return     MQTT_CODE_SUCCESS if the gateway accepted the connection,
+                MQTT_CODE_ERROR_CONNECT_REFUSED if the gateway returned a
+                non-zero CONNACK return_code (check
+                connect->ack.return_code for the specific SN_ReturnCodes
+                value), or another MQTT_CODE_ERROR_* for transport/protocol
+                failures (see enum MqttPacketResponseCodes). Callers must not
+                proceed to SN_Client_Subscribe, SN_Client_Publish, or other
+                session operations when this function does not return
+                MQTT_CODE_SUCCESS.
  */
 WOLFMQTT_API int SN_Client_Connect(
     MqttClient *client,
