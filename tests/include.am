@@ -5,6 +5,7 @@
 # Unit tests
 check_PROGRAMS += tests/unit_tests
 tests_unit_tests_SOURCES      = tests/unit_test.c \
+                                tests/test_framework.c \
                                 tests/test_mqtt_packet.c \
                                 tests/test_mqtt_client.c
 tests_unit_tests_CPPFLAGS     = -I$(top_srcdir) $(AM_CPPFLAGS)
