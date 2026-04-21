@@ -69,12 +69,15 @@ static int mock_net_disconnect(void *context)
     return MQTT_CODE_SUCCESS;
 }
 
+static int test_client_inited;
+
 static void setup(void)
 {
     XMEMSET(&test_client, 0, sizeof(test_client));
     XMEMSET(&test_net, 0, sizeof(test_net));
     XMEMSET(test_tx_buf, 0, sizeof(test_tx_buf));
     XMEMSET(test_rx_buf, 0, sizeof(test_rx_buf));
+    test_client_inited = 0;
 
     /* Setup mock network callbacks */
     test_net.connect = mock_net_connect;
@@ -85,7 +88,23 @@ static void setup(void)
 
 static void teardown(void)
 {
-    MqttClient_DeInit(&test_client);
+    /* Only DeInit if Init succeeded — DeInit calls MqttProps_ShutDown
+     * which decrements a ref counter that must be balanced with Init. */
+    if (test_client_inited) {
+        MqttClient_DeInit(&test_client);
+    }
+}
+
+static int test_init_client(void)
+{
+    int rc = MqttClient_Init(&test_client, &test_net, NULL,
+                             test_tx_buf, TEST_TX_BUF_SIZE,
+                             test_rx_buf, TEST_RX_BUF_SIZE,
+                             TEST_CMD_TIMEOUT_MS);
+    if (rc == MQTT_CODE_SUCCESS) {
+        test_client_inited = 1;
+    }
+    return rc;
 }
 
 /* ============================================================================
@@ -151,16 +170,13 @@ TEST(init_success)
 {
     int rc;
 
-    rc = MqttClient_Init(&test_client, &test_net, NULL,
-                         test_tx_buf, TEST_TX_BUF_SIZE,
-                         test_rx_buf, TEST_RX_BUF_SIZE,
-                         TEST_CMD_TIMEOUT_MS);
+    rc = test_init_client();
     ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
 
     /* Verify client structure is set up correctly */
-    ASSERT_EQ(test_tx_buf, test_client.tx_buf);
+    ASSERT_TRUE(test_client.tx_buf == test_tx_buf);
     ASSERT_EQ(TEST_TX_BUF_SIZE, test_client.tx_buf_len);
-    ASSERT_EQ(test_rx_buf, test_client.rx_buf);
+    ASSERT_TRUE(test_client.rx_buf == test_rx_buf);
     ASSERT_EQ(TEST_RX_BUF_SIZE, test_client.rx_buf_len);
     ASSERT_EQ(TEST_CMD_TIMEOUT_MS, test_client.cmd_timeout_ms);
 }
@@ -192,14 +208,12 @@ TEST(deinit_after_init)
 {
     int rc;
 
-    rc = MqttClient_Init(&test_client, &test_net, NULL,
-                         test_tx_buf, TEST_TX_BUF_SIZE,
-                         test_rx_buf, TEST_RX_BUF_SIZE,
-                         TEST_CMD_TIMEOUT_MS);
+    rc = test_init_client();
     ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
 
     /* DeInit should not crash */
     MqttClient_DeInit(&test_client);
+    test_client_inited = 0;
     ASSERT_TRUE(1);
 }
 
@@ -222,10 +236,7 @@ TEST(connect_null_connect)
 {
     int rc;
 
-    rc = MqttClient_Init(&test_client, &test_net, NULL,
-                         test_tx_buf, TEST_TX_BUF_SIZE,
-                         test_rx_buf, TEST_RX_BUF_SIZE,
-                         TEST_CMD_TIMEOUT_MS);
+    rc = test_init_client();
     ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
 
     rc = MqttClient_Connect(&test_client, NULL);
@@ -245,10 +256,7 @@ TEST(connect_with_mock_network)
     int rc;
     MqttConnect connect;
 
-    rc = MqttClient_Init(&test_client, &test_net, NULL,
-                         test_tx_buf, TEST_TX_BUF_SIZE,
-                         test_rx_buf, TEST_RX_BUF_SIZE,
-                         TEST_CMD_TIMEOUT_MS);
+    rc = test_init_client();
     ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
 
     XMEMSET(&connect, 0, sizeof(connect));
@@ -283,10 +291,7 @@ TEST(get_protocol_version_default)
     int rc;
     int version;
 
-    rc = MqttClient_Init(&test_client, &test_net, NULL,
-                         test_tx_buf, TEST_TX_BUF_SIZE,
-                         test_rx_buf, TEST_RX_BUF_SIZE,
-                         TEST_CMD_TIMEOUT_MS);
+    rc = test_init_client();
     ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
 
     version = MqttClient_GetProtocolVersion(&test_client);
@@ -304,10 +309,7 @@ TEST(get_protocol_version_string)
     int rc;
     const char* version_str;
 
-    rc = MqttClient_Init(&test_client, &test_net, NULL,
-                         test_tx_buf, TEST_TX_BUF_SIZE,
-                         test_rx_buf, TEST_RX_BUF_SIZE,
-                         TEST_CMD_TIMEOUT_MS);
+    rc = test_init_client();
     ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
 
     version_str = MqttClient_GetProtocolVersionString(&test_client);
@@ -351,10 +353,7 @@ TEST(subscribe_null_subscribe)
 {
     int rc;
 
-    rc = MqttClient_Init(&test_client, &test_net, NULL,
-                         test_tx_buf, TEST_TX_BUF_SIZE,
-                         test_rx_buf, TEST_RX_BUF_SIZE,
-                         TEST_CMD_TIMEOUT_MS);
+    rc = test_init_client();
     ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
 
     rc = MqttClient_Subscribe(&test_client, NULL);
@@ -380,10 +379,7 @@ TEST(unsubscribe_null_unsubscribe)
 {
     int rc;
 
-    rc = MqttClient_Init(&test_client, &test_net, NULL,
-                         test_tx_buf, TEST_TX_BUF_SIZE,
-                         test_rx_buf, TEST_RX_BUF_SIZE,
-                         TEST_CMD_TIMEOUT_MS);
+    rc = test_init_client();
     ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
 
     rc = MqttClient_Unsubscribe(&test_client, NULL);
@@ -409,10 +405,7 @@ TEST(publish_null_publish)
 {
     int rc;
 
-    rc = MqttClient_Init(&test_client, &test_net, NULL,
-                         test_tx_buf, TEST_TX_BUF_SIZE,
-                         test_rx_buf, TEST_RX_BUF_SIZE,
-                         TEST_CMD_TIMEOUT_MS);
+    rc = test_init_client();
     ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
 
     rc = MqttClient_Publish(&test_client, NULL);
@@ -474,10 +467,7 @@ TEST(client_flags_set_clear)
     int rc;
     word32 flags;
 
-    rc = MqttClient_Init(&test_client, &test_net, NULL,
-                         test_tx_buf, TEST_TX_BUF_SIZE,
-                         test_rx_buf, TEST_RX_BUF_SIZE,
-                         TEST_CMD_TIMEOUT_MS);
+    rc = test_init_client();
     ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
 
     /* Initially no flags should be set */
