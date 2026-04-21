@@ -4065,14 +4065,12 @@ static void BrokerUsage(const char* prog)
 
 #if !defined(WOLFMQTT_WOLFIP) && !defined(WOLFMQTT_BROKER_CUSTOM_NET) && \
     !defined(NO_MAIN_DRIVER)
-static MqttBroker* g_broker = NULL;
 #include <signal.h>
+static volatile sig_atomic_t g_broker_shutdown = 0;
 static void broker_signal_handler(int signo)
 {
-    if (g_broker != NULL) {
-        PRINTF("broker: received signal %d, shutting down", signo);
-        MqttBroker_Stop(g_broker);
-    }
+    (void)signo;
+    g_broker_shutdown = 1;
 }
 #endif
 
@@ -4162,16 +4160,28 @@ int wolfmqtt_broker(int argc, char** argv)
 
 #if !defined(WOLFMQTT_WOLFIP) && !defined(WOLFMQTT_BROKER_CUSTOM_NET) && \
     !defined(NO_MAIN_DRIVER)
-    g_broker = &broker;
     signal(SIGINT, broker_signal_handler);
     signal(SIGTERM, broker_signal_handler);
-#endif
 
+    rc = MqttBroker_Start(&broker);
+    if (rc == MQTT_CODE_SUCCESS) {
+        while (broker.running && !g_broker_shutdown) {
+            rc = MqttBroker_Step(&broker);
+            if (rc == MQTT_CODE_CONTINUE) {
+                BROKER_SLEEP_MS(10);
+            }
+            else if (rc < 0 && rc != MQTT_CODE_CONTINUE) {
+                break;
+            }
+        }
+        if (g_broker_shutdown) {
+            PRINTF("broker: received shutdown signal, shutting down");
+            MqttBroker_Stop(&broker);
+            rc = MQTT_CODE_SUCCESS;
+        }
+    }
+#else
     rc = MqttBroker_Run(&broker);
-
-#if !defined(WOLFMQTT_WOLFIP) && !defined(WOLFMQTT_BROKER_CUSTOM_NET) && \
-    !defined(NO_MAIN_DRIVER)
-    g_broker = NULL;
 #endif
 
     MqttBroker_Free(&broker);
