@@ -344,17 +344,22 @@ if (WOLFMQTT_BROKER)
         $<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}>)
 endif()
 
-option(WOLFMQTT_UNIT_TESTS "Build unit tests" ON)
-if(WOLFMQTT_UNIT_TESTS)
+add_option("WOLFMQTT_UNIT_TESTS"
+           "Build unit tests (only when wolfMQTT is the top-level project)"
+           "yes" "yes;no")
+# Only build tests when wolfMQTT is the top-level project, to avoid adding
+# a test target to parent projects that consume wolfMQTT via add_subdirectory.
+if(WOLFMQTT_UNIT_TESTS AND CMAKE_SOURCE_DIR STREQUAL PROJECT_SOURCE_DIR)
     enable_testing()
-    add_executable(unit_tests
+    add_executable(wolfmqtt_unit_tests
         tests/unit_test.c
         tests/test_mqtt_packet.c
         tests/test_mqtt_client.c
     )
-    target_include_directories(unit_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
-    target_link_libraries(unit_tests wolfmqtt)
-    add_test(NAME unit_tests COMMAND unit_tests)
+    target_include_directories(wolfmqtt_unit_tests
+        PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(wolfmqtt_unit_tests wolfmqtt)
+    add_test(NAME wolfmqtt_unit_tests COMMAND wolfmqtt_unit_tests)
 endif()
 
 ####################################################

@@ -192,12 +192,29 @@ TEST(init_negative_tx_buf_len)
     ASSERT_EQ(MQTT_CODE_ERROR_BAD_ARG, rc);
 }
 
+TEST(init_negative_rx_buf_len)
+{
+    int rc;
+
+    rc = MqttClient_Init(&test_client, &test_net, NULL,
+                         test_tx_buf, TEST_TX_BUF_SIZE,
+                         test_rx_buf, -1,
+                         TEST_CMD_TIMEOUT_MS);
+    ASSERT_EQ(MQTT_CODE_ERROR_BAD_ARG, rc);
+}
+
 /* ============================================================================
  * MqttClient_DeInit Tests
  * ============================================================================ */
 
 TEST(deinit_null_client)
 {
+    /* MqttClient_DeInit(NULL) still calls MqttProps_ShutDown() under
+     * WOLFMQTT_V5, which decrements a refcount. Pair it with MqttProps_Init()
+     * so the refcount stays balanced across test runs. */
+#ifdef WOLFMQTT_V5
+    (void)MqttProps_Init();
+#endif
     /* Should not crash with NULL client */
     MqttClient_DeInit(NULL);
     /* If we reach here, test passes */
@@ -267,7 +284,7 @@ TEST(connect_with_mock_network)
     /* Connect will fail at the network write stage since mock returns error */
     rc = MqttClient_Connect(&test_client, &connect);
     /* Should fail with network error since mock network write returns error */
-    ASSERT_TRUE(rc < 0);
+    ASSERT_EQ(MQTT_CODE_ERROR_NETWORK, rc);
 }
 
 /* ============================================================================
@@ -499,6 +516,7 @@ void run_mqtt_client_tests(void)
     RUN_TEST(init_zero_rx_buf_len);
     RUN_TEST(init_success);
     RUN_TEST(init_negative_tx_buf_len);
+    RUN_TEST(init_negative_rx_buf_len);
 
     /* MqttClient_DeInit tests */
     RUN_TEST(deinit_null_client);

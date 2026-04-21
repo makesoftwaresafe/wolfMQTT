@@ -22,7 +22,7 @@
 #ifndef WOLFMQTT_UNIT_TEST_H
 #define WOLFMQTT_UNIT_TEST_H
 
-#include <stdio.h>
+#include "wolfmqtt/mqtt_types.h"
 #include <stdlib.h>
 #include <string.h>
 
@@ -98,8 +98,8 @@ static int ut_current_test_failed UT_MAYBE_UNUSED;
 #define ASSERT_TRUE(cond) \
     do { \
         if (!(cond)) { \
-            printf("  " UT_COLOR_RED "FAIL" UT_COLOR_RESET ": %s:%d: " \
-                   "ASSERT_TRUE(" #cond ") failed\n", __FILE__, __LINE__); \
+            PRINTF("  " UT_COLOR_RED "FAIL" UT_COLOR_RESET ": %s:%d: " \
+                   "ASSERT_TRUE(" #cond ") failed", __FILE__, __LINE__); \
             ut_current_test_failed = 1; \
             return; \
         } \
@@ -108,8 +108,8 @@ static int ut_current_test_failed UT_MAYBE_UNUSED;
 #define ASSERT_FALSE(cond) \
     do { \
         if (cond) { \
-            printf("  " UT_COLOR_RED "FAIL" UT_COLOR_RESET ": %s:%d: " \
-                   "ASSERT_FALSE(" #cond ") failed\n", __FILE__, __LINE__); \
+            PRINTF("  " UT_COLOR_RED "FAIL" UT_COLOR_RESET ": %s:%d: " \
+                   "ASSERT_FALSE(" #cond ") failed", __FILE__, __LINE__); \
             ut_current_test_failed = 1; \
             return; \
         } \
@@ -120,9 +120,9 @@ static int ut_current_test_failed UT_MAYBE_UNUSED;
         long long _exp = (long long)(expected); \
         long long _act = (long long)(actual); \
         if (_exp != _act) { \
-            printf("  " UT_COLOR_RED "FAIL" UT_COLOR_RESET ": %s:%d: " \
+            PRINTF("  " UT_COLOR_RED "FAIL" UT_COLOR_RESET ": %s:%d: " \
                    "ASSERT_EQ(" #expected ", " #actual ") failed: " \
-                   "expected %lld, got %lld\n", __FILE__, __LINE__, _exp, _act); \
+                   "expected %lld, got %lld", __FILE__, __LINE__, _exp, _act); \
             ut_current_test_failed = 1; \
             return; \
         } \
@@ -133,8 +133,8 @@ static int ut_current_test_failed UT_MAYBE_UNUSED;
         long long _a = (long long)(a); \
         long long _b = (long long)(b); \
         if (_a == _b) { \
-            printf("  " UT_COLOR_RED "FAIL" UT_COLOR_RESET ": %s:%d: " \
-                   "ASSERT_NE(" #a ", " #b ") failed: both are %lld\n", \
+            PRINTF("  " UT_COLOR_RED "FAIL" UT_COLOR_RESET ": %s:%d: " \
+                   "ASSERT_NE(" #a ", " #b ") failed: both are %lld", \
                    __FILE__, __LINE__, _a); \
             ut_current_test_failed = 1; \
             return; \
@@ -144,8 +144,8 @@ static int ut_current_test_failed UT_MAYBE_UNUSED;
 #define ASSERT_NULL(ptr) \
     do { \
         if ((ptr) != NULL) { \
-            printf("  " UT_COLOR_RED "FAIL" UT_COLOR_RESET ": %s:%d: " \
-                   "ASSERT_NULL(" #ptr ") failed: pointer is not NULL\n", \
+            PRINTF("  " UT_COLOR_RED "FAIL" UT_COLOR_RESET ": %s:%d: " \
+                   "ASSERT_NULL(" #ptr ") failed: pointer is not NULL", \
                    __FILE__, __LINE__); \
             ut_current_test_failed = 1; \
             return; \
@@ -155,8 +155,8 @@ static int ut_current_test_failed UT_MAYBE_UNUSED;
 #define ASSERT_NOT_NULL(ptr) \
     do { \
         if ((ptr) == NULL) { \
-            printf("  " UT_COLOR_RED "FAIL" UT_COLOR_RESET ": %s:%d: " \
-                   "ASSERT_NOT_NULL(" #ptr ") failed: pointer is NULL\n", \
+            PRINTF("  " UT_COLOR_RED "FAIL" UT_COLOR_RESET ": %s:%d: " \
+                   "ASSERT_NOT_NULL(" #ptr ") failed: pointer is NULL", \
                    __FILE__, __LINE__); \
             ut_current_test_failed = 1; \
             return; \
@@ -168,9 +168,9 @@ static int ut_current_test_failed UT_MAYBE_UNUSED;
         const char* _exp = (expected); \
         const char* _act = (actual); \
         if (_exp == NULL || _act == NULL || strcmp(_exp, _act) != 0) { \
-            printf("  " UT_COLOR_RED "FAIL" UT_COLOR_RESET ": %s:%d: " \
+            PRINTF("  " UT_COLOR_RED "FAIL" UT_COLOR_RESET ": %s:%d: " \
                    "ASSERT_STR_EQ(" #expected ", " #actual ") failed: " \
-                   "expected \"%s\", got \"%s\"\n", __FILE__, __LINE__, \
+                   "expected \"%s\", got \"%s\"", __FILE__, __LINE__, \
                    _exp ? _exp : "(null)", _act ? _act : "(null)"); \
             ut_current_test_failed = 1; \
             return; \
@@ -183,8 +183,8 @@ static int ut_current_test_failed UT_MAYBE_UNUSED;
         const void* _act = (actual); \
         size_t _size = (size); \
         if (_exp == NULL || _act == NULL || memcmp(_exp, _act, _size) != 0) { \
-            printf("  " UT_COLOR_RED "FAIL" UT_COLOR_RESET ": %s:%d: " \
-                   "ASSERT_MEM_EQ(" #expected ", " #actual ", %zu) failed\n", \
+            PRINTF("  " UT_COLOR_RED "FAIL" UT_COLOR_RESET ": %s:%d: " \
+                   "ASSERT_MEM_EQ(" #expected ", " #actual ", %zu) failed", \
                    __FILE__, __LINE__, _size); \
             ut_current_test_failed = 1; \
             return; \
@@ -193,7 +193,7 @@ static int ut_current_test_failed UT_MAYBE_UNUSED;
 
 #define FAIL(msg) \
     do { \
-        printf("  " UT_COLOR_RED "FAIL" UT_COLOR_RESET ": %s:%d: %s\n", \
+        PRINTF("  " UT_COLOR_RED "FAIL" UT_COLOR_RESET ": %s:%d: %s", \
                __FILE__, __LINE__, (msg)); \
         ut_current_test_failed = 1; \
         return; \
@@ -215,10 +215,10 @@ static int ut_current_test_failed UT_MAYBE_UNUSED;
         if (ut_suite_teardown) ut_suite_teardown(); \
         if (ut_current_test_failed) { \
             ut_suite_fail_count++; \
-            printf("  " UT_COLOR_RED "[FAIL]" UT_COLOR_RESET " %s\n", #name); \
+            PRINTF("  " UT_COLOR_RED "[FAIL]" UT_COLOR_RESET " %s", #name); \
         } else { \
             ut_suite_pass_count++; \
-            printf("  " UT_COLOR_GREEN "[PASS]" UT_COLOR_RESET " %s\n", #name); \
+            PRINTF("  " UT_COLOR_GREEN "[PASS]" UT_COLOR_RESET " %s", #name); \
         } \
     } while (0)
 
@@ -230,7 +230,7 @@ static int ut_current_test_failed UT_MAYBE_UNUSED;
         ut_suite_name = (name); \
         ut_suite_setup = (setup_fn); \
         ut_suite_teardown = (teardown_fn); \
-        printf("\n" UT_COLOR_CYAN "=== Test Suite: %s ===" UT_COLOR_RESET "\n", \
+        PRINTF("\n" UT_COLOR_CYAN "=== Test Suite: %s ===" UT_COLOR_RESET, \
                ut_suite_name); \
     } while (0)
 
@@ -238,11 +238,11 @@ static int ut_current_test_failed UT_MAYBE_UNUSED;
 #define TEST_SUITE_END() \
     do { \
         int total = ut_suite_pass_count + ut_suite_fail_count; \
-        printf(UT_COLOR_CYAN "--- Suite Results: %s ---" UT_COLOR_RESET "\n", \
+        PRINTF(UT_COLOR_CYAN "--- Suite Results: %s ---" UT_COLOR_RESET, \
                ut_suite_name); \
-        printf("  Passed: " UT_COLOR_GREEN "%d" UT_COLOR_RESET \
+        PRINTF("  Passed: " UT_COLOR_GREEN "%d" UT_COLOR_RESET \
                ", Failed: " UT_COLOR_RED "%d" UT_COLOR_RESET \
-               ", Total: %d\n\n", \
+               ", Total: %d\n", \
                ut_suite_pass_count, ut_suite_fail_count, total); \
         ut_global_pass_count += ut_suite_pass_count; \
         ut_global_fail_count += ut_suite_fail_count; \
@@ -257,32 +257,32 @@ static int ut_current_test_failed UT_MAYBE_UNUSED;
     do { \
         ut_global_pass_count = 0; \
         ut_global_fail_count = 0; \
-        printf(UT_COLOR_CYAN \
+        PRINTF(UT_COLOR_CYAN \
                "============================================\n" \
                "         wolfMQTT Unit Test Runner\n" \
                "============================================" \
-               UT_COLOR_RESET "\n"); \
+               UT_COLOR_RESET); \
     } while (0)
 
 /* Report global results and return exit code */
 #define TEST_RUNNER_END() \
     do { \
         int total = ut_global_pass_count + ut_global_fail_count; \
-        printf(UT_COLOR_CYAN \
+        PRINTF(UT_COLOR_CYAN \
                "============================================\n" \
                "              Final Results\n" \
                "============================================" \
-               UT_COLOR_RESET "\n"); \
-        printf("  Total Passed: " UT_COLOR_GREEN "%d" UT_COLOR_RESET "\n", \
+               UT_COLOR_RESET); \
+        PRINTF("  Total Passed: " UT_COLOR_GREEN "%d" UT_COLOR_RESET, \
                ut_global_pass_count); \
-        printf("  Total Failed: " UT_COLOR_RED "%d" UT_COLOR_RESET "\n", \
+        PRINTF("  Total Failed: " UT_COLOR_RED "%d" UT_COLOR_RESET, \
                ut_global_fail_count); \
-        printf("  Total Tests:  %d\n", total); \
+        PRINTF("  Total Tests:  %d", total); \
         if (ut_global_fail_count > 0) { \
-            printf("\n" UT_COLOR_RED "TESTS FAILED" UT_COLOR_RESET "\n"); \
+            PRINTF("\n" UT_COLOR_RED "TESTS FAILED" UT_COLOR_RESET); \
             return 1; \
         } else { \
-            printf("\n" UT_COLOR_GREEN "ALL TESTS PASSED" UT_COLOR_RESET "\n"); \
+            PRINTF("\n" UT_COLOR_GREEN "ALL TESTS PASSED" UT_COLOR_RESET); \
             return 0; \
         } \
     } while (0)
