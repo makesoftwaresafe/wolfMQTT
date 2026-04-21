@@ -30,6 +30,7 @@
 #include "tests/unit_test.h"
 
 /* Declare test suite runners */
+extern void run_framework_tests(void);
 extern void run_mqtt_packet_tests(void);
 extern void run_mqtt_client_tests(void);
 
@@ -40,6 +41,7 @@ int main(int argc, char** argv)
 
     TEST_RUNNER_BEGIN();
 
+    run_framework_tests();
     run_mqtt_packet_tests();
     run_mqtt_client_tests();
 

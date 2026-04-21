@@ -353,6 +353,7 @@ if(WOLFMQTT_UNIT_TESTS AND CMAKE_SOURCE_DIR STREQUAL PROJECT_SOURCE_DIR)
     enable_testing()
     add_executable(wolfmqtt_unit_tests
         tests/unit_test.c
+        tests/test_framework.c
         tests/test_mqtt_packet.c
         tests/test_mqtt_client.c
     )
