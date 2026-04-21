@@ -131,17 +131,18 @@
 #endif
 
 #ifdef WOLFMQTT_BROKER_AUTH
-/* Constant-time string comparison to prevent timing attacks on auth.
- * Compares all bytes regardless of where differences occur.
- * Returns 0 if equal, non-zero if different. */
-static int BrokerStrCompare(const char* a, const char* b)
+/* Constant-time string comparison for authentication.
+ * Iterates exactly cmp_len times so loop duration is independent of
+ * either input's length; cmp_len is a caller-supplied fixed bound
+ * (the credential buffer size). Length mismatch is folded in via the
+ * final XOR. Returns 0 if equal, non-zero if different. */
+static int BrokerStrCompare(const char* a, const char* b, int cmp_len)
 {
     int result = 0;
     int len_a = (int)XSTRLEN(a);
     int len_b = (int)XSTRLEN(b);
-    int max_len = (len_a > len_b) ? len_a : len_b;
     int i;
-    for (i = 0; i < max_len; i++) {
+    for (i = 0; i < cmp_len; i++) {
         /* Branchless index clamp: when i >= len, reads position 0.
          * Length mismatch is caught by the final XOR below. */
         unsigned int maskA = 0u - (unsigned int)(i < len_a);
@@ -2920,7 +2921,8 @@ static int BrokerHandle_Connect(BrokerClient* bc, int rx_len,
             bc->username == NULL ||
         #endif
             bc->username[0] == '\0' ||
-            BrokerStrCompare(broker->auth_user, bc->username) != 0)) {
+            BrokerStrCompare(broker->auth_user, bc->username,
+                BROKER_MAX_USERNAME_LEN) != 0)) {
             auth_ok = 0;
         }
         if (broker->auth_pass && (
@@ -2928,7 +2930,8 @@ static int BrokerHandle_Connect(BrokerClient* bc, int rx_len,
             bc->password == NULL ||
         #endif
             bc->password[0] == '\0' ||
-            BrokerStrCompare(broker->auth_pass, bc->password) != 0)) {
+            BrokerStrCompare(broker->auth_pass, bc->password,
+                BROKER_MAX_PASSWORD_LEN) != 0)) {
             auth_ok = 0;
         }
         if (!auth_ok) {
