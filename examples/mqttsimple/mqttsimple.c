@@ -410,6 +410,11 @@ int mqttsimple_test(void)
     mqttObj.subscribe.topic_count = sizeof(topics) / sizeof(MqttTopic);
     mqttObj.subscribe.topics = topics;
     rc = MqttClient_Subscribe(&mClient, &mqttObj.subscribe);
+    if (rc == MQTT_CODE_ERROR_SUBSCRIBE_REJECTED) {
+        PRINTF("MQTT Subscribe Rejected: Topic %s, Return Code %u",
+            MQTT_TOPIC_NAME, topics[0].return_code);
+        goto exit;
+    }
     if (rc != MQTT_CODE_SUCCESS) {
         goto exit;
     }

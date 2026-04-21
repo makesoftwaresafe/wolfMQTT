@@ -2413,11 +2413,21 @@ int MqttClient_Subscribe(MqttClient *client, MqttSubscribe *subscribe)
     }
 #endif
 
-    /* Populate return codes */
+    /* Populate return codes and detect broker rejection. A v3.1.1 SUBACK
+     * uses 0x80 to indicate failure; a v5 SUBACK uses any reason code
+     * >= 0x80. In either case, any per-topic code with the high bit set
+     * means the broker rejected that filter. */
     if (rc == MQTT_CODE_SUCCESS) {
+        byte any_rejected = 0;
         for (i = 0; i < subscribe->topic_count && i < MAX_MQTT_TOPICS; i++) {
             topic = &subscribe->topics[i];
             topic->return_code = subscribe->ack.return_codes[i];
+            if (topic->return_code & 0x80) {
+                any_rejected = 1;
+            }
+        }
+        if (any_rejected) {
+            rc = MQTT_TRACE_ERROR(MQTT_CODE_ERROR_SUBSCRIBE_REJECTED);
         }
     }
 
@@ -3065,6 +3075,8 @@ const char* MqttClient_ReturnCodeToString(int return_code)
             return "Error (Not found)";
         case MQTT_CODE_ERROR_CONNECT_REFUSED:
             return "Error (Broker refused connection)";
+        case MQTT_CODE_ERROR_SUBSCRIBE_REJECTED:
+            return "Error (Broker rejected subscription)";
 #if defined(ENABLE_MQTT_CURL)
         case MQTT_CODE_ERROR_CURL:
             return "Error (libcurl)";

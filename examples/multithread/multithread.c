@@ -443,7 +443,9 @@ static void *subscribe_task(void *param)
         rc = check_response(mqttCtx, rc, &startSec, MQTT_PACKET_TYPE_SUBSCRIBE,
             mqttCtx->cmd_timeout_ms);
     } while (rc == MQTT_CODE_CONTINUE);
-    if (rc != MQTT_CODE_SUCCESS) {
+    /* SUBSCRIBE_REJECTED means the SUBACK completed normally (some/all
+     * filters rejected by broker) - no message to cancel in that case. */
+    if (rc != MQTT_CODE_SUCCESS && rc != MQTT_CODE_ERROR_SUBSCRIBE_REJECTED) {
         MqttClient_CancelMessage(&mqttCtx->client,
             (MqttObject*)&mqttCtx->subscribe);
     }
@@ -451,8 +453,9 @@ static void *subscribe_task(void *param)
     PRINTF("MQTT Subscribe: %s (%d)",
         MqttClient_ReturnCodeToString(rc), rc);
 
-    if (rc == MQTT_CODE_SUCCESS) {
-        /* show subscribe results */
+    if (rc == MQTT_CODE_SUCCESS || rc == MQTT_CODE_ERROR_SUBSCRIBE_REJECTED) {
+        /* show subscribe results (also reveals which filters the broker
+         * rejected when rc == MQTT_CODE_ERROR_SUBSCRIBE_REJECTED) */
         for (i = 0; i < mqttCtx->subscribe.topic_count; i++) {
             MqttTopic *topic = &mqttCtx->subscribe.topics[i];
             PRINTF("  Topic %s, Qos %u, Return Code %u",

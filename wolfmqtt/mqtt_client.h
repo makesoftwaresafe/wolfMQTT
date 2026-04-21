@@ -382,8 +382,13 @@ WOLFMQTT_API int MqttClient_Publish_WriteOnly(
  *  \param      client      Pointer to MqttClient structure
  *  \param      subscribe   Pointer to MqttSubscribe structure initialized with
                             subscription topic list and desired QoS.
- *  \return     MQTT_CODE_SUCCESS or MQTT_CODE_ERROR_*
-                (see enum MqttPacketResponseCodes)
+ *  \return     MQTT_CODE_SUCCESS if every topic filter was accepted by the
+                broker, MQTT_CODE_ERROR_SUBSCRIBE_REJECTED if the SUBACK was
+                received but one or more filters were rejected (inspect each
+                subscribe->topics[i].return_code for the per-filter result;
+                v3.1.1 rejection is 0x80, v5 rejection is any reason_code
+                >= 0x80), or another MQTT_CODE_ERROR_* for transport/protocol
+                failures (see enum MqttPacketResponseCodes).
  */
 WOLFMQTT_API int MqttClient_Subscribe(
     MqttClient *client,
