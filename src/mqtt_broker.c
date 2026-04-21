@@ -3369,6 +3369,9 @@ static int BrokerHandle_PublishRel(BrokerClient* bc, int rx_len)
     }
 
 #ifdef WOLFMQTT_V5
+    if (resp.props) {
+        (void)MqttProps_Free(resp.props);
+    }
     resp.reason_code = MQTT_REASON_SUCCESS;
     resp.props = NULL;
 #endif
@@ -3407,6 +3410,9 @@ static int BrokerHandle_PublishRec(BrokerClient* bc, int rx_len)
     }
 
 #ifdef WOLFMQTT_V5
+    if (resp.props) {
+        (void)MqttProps_Free(resp.props);
+    }
     resp.reason_code = MQTT_REASON_SUCCESS;
     resp.props = NULL;
 #endif
