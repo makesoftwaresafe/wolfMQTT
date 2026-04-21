@@ -1740,6 +1740,8 @@ int MqttClient_Connect(MqttClient *client, MqttConnect *mc_connect)
         }
         if (rc != 0) {
             MqttWriteStop(client, &mc_connect->stat);
+            /* Clear tx_buf to remove plaintext credentials before returning */
+            CLIENT_FORCE_ZERO(client->tx_buf, client->write.len);
             return rc; /* Error locking client */
         }
     #endif
