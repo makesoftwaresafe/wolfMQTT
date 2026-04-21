@@ -2581,6 +2581,9 @@ int MqttClient_Ping_ex(MqttClient *client, MqttPing* ping)
 
 int MqttClient_Ping(MqttClient *client)
 {
+    if (client == NULL) {
+        return MQTT_TRACE_ERROR(MQTT_CODE_ERROR_BAD_ARG);
+    }
     return MqttClient_Ping_ex(client, &client->msg.ping);
 }
 
