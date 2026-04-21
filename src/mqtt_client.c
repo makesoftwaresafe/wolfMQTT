@@ -535,6 +535,34 @@ int MqttClient_RespList_Find(MqttClient *client,
 #endif /* WOLFMQTT_MULTITHREAD */
 
 #ifdef WOLFMQTT_V5
+/* Populate client fields from CONNACK server properties so that the
+ * publish/packet-size guards are effective without requiring the
+ * application to register a property callback. */
+static void Handle_ConnectAck_Props(MqttClient* client, MqttProp* props)
+{
+    MqttProp* prop;
+
+    for (prop = props; prop != NULL; prop = prop->next) {
+        if (prop->type == MQTT_PROP_MAX_QOS) {
+            client->max_qos = prop->data_byte;
+        }
+        else if (prop->type == MQTT_PROP_RETAIN_AVAIL) {
+            client->retain_avail = prop->data_byte;
+        }
+        else if (prop->type == MQTT_PROP_MAX_PACKET_SZ) {
+            if ((prop->data_int > 0) &&
+                (prop->data_int <= MQTT_PACKET_SZ_MAX)) {
+                /* Honor the smaller of the client's existing cap
+                 * (0 means unset) and the server's limit. */
+                if ((client->packet_sz_max == 0) ||
+                    (prop->data_int < client->packet_sz_max)) {
+                    client->packet_sz_max = prop->data_int;
+                }
+            }
+        }
+    }
+}
+
 static int Handle_Props(MqttClient* client, MqttProp* props, byte use_cb,
                         byte free_props)
 {
@@ -624,8 +652,13 @@ static int MqttClient_DecodePacket(MqttClient* client, byte* rx_buf,
             rc = MqttDecode_ConnectAck(rx_buf, rx_len, p_connect_ack);
         #ifdef WOLFMQTT_V5
             if (rc >= 0 && doProps) {
-                int tmp = Handle_Props(client, p_connect_ack->props,
-                                       (packet_obj != NULL), 1);
+                int tmp;
+                /* Auto-populate server property fields so that publish and
+                 * packet-size guards are effective even when the
+                 * application has not registered a property callback. */
+                Handle_ConnectAck_Props(client, p_connect_ack->props);
+                tmp = Handle_Props(client, p_connect_ack->props,
+                                   (packet_obj != NULL), 1);
                 p_connect_ack->props = NULL;
                 if (tmp != MQTT_CODE_SUCCESS) {
                     rc = tmp;
