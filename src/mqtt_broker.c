@@ -1241,9 +1241,11 @@ static void BrokerClient_Free(BrokerClient* bc)
     }
 #endif
     if (bc->tx_buf) {
+        BROKER_FORCE_ZERO(bc->tx_buf, bc->tx_buf_len);
         WOLFMQTT_FREE(bc->tx_buf);
     }
     if (bc->rx_buf) {
+        BROKER_FORCE_ZERO(bc->rx_buf, bc->rx_buf_len);
         WOLFMQTT_FREE(bc->rx_buf);
     }
     WOLFMQTT_FREE(bc);
