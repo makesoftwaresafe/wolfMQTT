@@ -2764,7 +2764,11 @@ int MqttClient_Auth(MqttClient *client, MqttAuth* auth)
             wm_SemUnlock(&client->lockClient);
         }
         if (rc != 0) {
+            /* Save write.len before MqttWriteStop zeroes client->write */
+            int xfer = client->write.len;
             MqttWriteStop(client, &auth->stat);
+            /* Clear tx_buf to remove SASL auth data before returning */
+            CLIENT_FORCE_ZERO(client->tx_buf, xfer);
             return rc; /* Error locking client */
         }
     #endif
