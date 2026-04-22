@@ -51,8 +51,11 @@ jobs:
         mkdir build
         cd build
         # Note: -Wno-error=sign-conversion works around a sign mismatch in
-        # libwebsockets v4.3.3 openssl-server.c:311 (lws_filepos_t -> long)
-        cmake .. -DLWS_WITH_WOLFSSL=1 -DLWS_WOLFSSL_INCLUDE_DIRS=/usr/local/include/wolfssl -DLWS_WOLFSSL_LIBRARIES=/usr/local/lib/libwolfssl.so -DLWS_WITH_EXTERNAL_POLL=1 -DLWS_WITHOUT_TESTAPPS=ON -DCMAKE_C_FLAGS="-Wno-error=sign-conversion"
+        # libwebsockets v4.3.3 openssl-server.c:311 (lws_filepos_t -> long).
+        # -Wno-error=incompatible-pointer-types and -Wno-error=discarded-qualifiers
+        # work around libwebsockets openssl-x509.c calling wolfSSL compat APIs
+        # with the wrong const/type (fixed on libwebsockets main, not in any release).
+        cmake .. -DLWS_WITH_WOLFSSL=1 -DLWS_WOLFSSL_INCLUDE_DIRS=/usr/local/include/wolfssl -DLWS_WOLFSSL_LIBRARIES=/usr/local/lib/libwolfssl.so -DLWS_WITH_EXTERNAL_POLL=1 -DLWS_WITHOUT_TESTAPPS=ON -DCMAKE_C_FLAGS="-Wno-error=sign-conversion -Wno-error=incompatible-pointer-types -Wno-error=discarded-qualifiers"
         make
         sudo make install
 
