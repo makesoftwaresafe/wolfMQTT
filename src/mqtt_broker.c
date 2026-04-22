@@ -135,7 +135,9 @@
  * Iterates exactly cmp_len times so loop duration is independent of
  * either input's length; cmp_len is a caller-supplied fixed bound
  * (the credential buffer size). Length mismatch is folded in via the
- * final XOR. Returns 0 if equal, non-zero if different. */
+ * final XOR. Inputs with length >= cmp_len force a mismatch to prevent
+ * bypass when both strings match in the first cmp_len bytes but differ
+ * beyond. Returns 0 if equal, non-zero if different. */
 static int BrokerStrCompare(const char* a, const char* b, int cmp_len)
 {
     int result = 0;
@@ -152,6 +154,10 @@ static int BrokerStrCompare(const char* a, const char* b, int cmp_len)
         result |= (a[ia] ^ b[ib]);
     }
     result |= (len_a ^ len_b);
+    /* Force mismatch if either input meets or exceeds cmp_len, since the
+     * loop cannot observe bytes beyond that bound. */
+    result |= (len_a >= cmp_len);
+    result |= (len_b >= cmp_len);
     return result;
 }
 #endif /* WOLFMQTT_BROKER_AUTH */

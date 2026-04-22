@@ -1739,9 +1739,11 @@ int MqttClient_Connect(MqttClient *client, MqttConnect *mc_connect)
             wm_SemUnlock(&client->lockClient);
         }
         if (rc != 0) {
+            /* Save write.len before MqttWriteStop zeroes client->write */
+            int xfer = client->write.len;
             MqttWriteStop(client, &mc_connect->stat);
             /* Clear tx_buf to remove plaintext credentials before returning */
-            CLIENT_FORCE_ZERO(client->tx_buf, client->write.len);
+            CLIENT_FORCE_ZERO(client->tx_buf, xfer);
             return rc; /* Error locking client */
         }
     #endif
