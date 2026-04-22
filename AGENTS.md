@@ -147,6 +147,31 @@ Uses `.clang-format` with LLVM base style:
 - Tab indentation (4-space tabs)
 - K&R inspired style
 
+## Test Integrity
+Never modify, delete, skip, or weaken tests to make them pass.
+Never hardcode expected values, mock results, or otherwise contrive a passing test result.
+A passing test suite achieved by changing the tests (not the implementation) is not a passing result.
+Fix the code. If the code cannot be fixed within scope, escalate.
+
+Never write a test that uses the code under test as its own oracle. Tests must have an independent oracle: known test vectors from an external source, cross-validation between two independent implementations, or bit-exact comparison against a reference path. A test that encrypts with function A and decrypts with function A proves nothing.
+
+## No Fabrication
+Never report status, results, or completion that does not reflect work actually performed.
+If you are uncertain whether a step succeeded, say so explicitly. Do not paper over uncertainty with confident-sounding output.
+
+## Exit Code Discipline
+Every shell command's exit code must be checked.
+Never proceed after a silent failure.
+A command that failed and was ignored is not a completed step.
+
+### Test vector discipline
+Never derive test vectors from the code under test. Acceptable oracles:
+- OpenSSL (`openssl kdf`, `openssl enc`, `openssl pkcs8 ... | sha256sum`)
+- pyca/cryptography (`pkcs12.load_key_and_certificates`, `private_bytes(DER, PKCS8, NoEncryption)`)
+- Bouncy Castle test vectors
+Compute once, hardcode as `hex!(...)` literals or committed binary fixtures. Tests must be fully offline.
+For PKCS12KDF: use `hexpass:` (BMP/UTF-16BE + null terminator), NOT `pass:` (raw ASCII).
+
 ## Dependencies
 
 - **wolfSSL** - Required for TLS support

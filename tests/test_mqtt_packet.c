@@ -345,6 +345,136 @@ TEST(encode_publish_qos1_valid)
 }
 
 /* ============================================================================
+ * MqttDecode_Publish
+ * ============================================================================ */
+
+TEST(decode_publish_qos0_valid)
+{
+    /* Fixed header (PUBLISH, QoS 0, remain_len=7), topic "a/b",
+     * payload "HI". Using nonzero payload bytes catches a
+     * qos>MQTT_QOS_0 -> qos>=MQTT_QOS_0 mutation that would read
+     * the first 2 payload bytes as a spurious packet_id. */
+    byte buf[] = { 0x30, 7,
+                   0x00, 0x03, 'a', '/', 'b',
+                   'H', 'I' };
+    MqttPublish pub;
+    int rc;
+
+    XMEMSET(&pub, 0, sizeof(pub));
+    rc = MqttDecode_Publish(buf, (int)sizeof(buf), &pub);
+    ASSERT_TRUE(rc > 0);
+    ASSERT_EQ(MQTT_QOS_0, pub.qos);
+    ASSERT_EQ(0, pub.packet_id);
+    ASSERT_EQ(3, pub.topic_name_len);
+    ASSERT_EQ(0, XMEMCMP(pub.topic_name, "a/b", 3));
+    ASSERT_EQ(2, (int)pub.total_len);
+    ASSERT_EQ(2, (int)pub.buffer_len);
+    ASSERT_EQ('H', pub.buffer[0]);
+    ASSERT_EQ('I', pub.buffer[1]);
+}
+
+TEST(decode_publish_qos1_valid)
+{
+    /* Fixed header (PUBLISH | QoS 1 = 0x32, remain_len=7),
+     * topic "t", packet_id=42, payload "xy". */
+    byte buf[] = { 0x32, 7,
+                   0x00, 0x01, 't',
+                   0x00, 0x2A,
+                   'x', 'y' };
+    MqttPublish pub;
+    int rc;
+
+    XMEMSET(&pub, 0, sizeof(pub));
+    rc = MqttDecode_Publish(buf, (int)sizeof(buf), &pub);
+    ASSERT_TRUE(rc > 0);
+    ASSERT_EQ(MQTT_QOS_1, pub.qos);
+    ASSERT_EQ(42, pub.packet_id);
+    ASSERT_EQ(1, pub.topic_name_len);
+    ASSERT_EQ(0, XMEMCMP(pub.topic_name, "t", 1));
+    ASSERT_EQ(2, (int)pub.total_len);
+    ASSERT_EQ(2, (int)pub.buffer_len);
+    ASSERT_EQ('x', pub.buffer[0]);
+    ASSERT_EQ('y', pub.buffer[1]);
+}
+
+/* Zero-payload PUBLISH is valid per spec; catches a
+ * variable_len>remain_len -> variable_len>=remain_len mutation. */
+TEST(decode_publish_qos0_zero_payload)
+{
+    byte buf[] = { 0x30, 3,
+                   0x00, 0x01, 'a' };
+    MqttPublish pub;
+    int rc;
+
+    XMEMSET(&pub, 0, sizeof(pub));
+    rc = MqttDecode_Publish(buf, (int)sizeof(buf), &pub);
+    ASSERT_TRUE(rc > 0);
+    ASSERT_EQ(MQTT_QOS_0, pub.qos);
+    ASSERT_EQ(1, pub.topic_name_len);
+    ASSERT_EQ(0, (int)pub.total_len);
+    ASSERT_EQ(0, (int)pub.buffer_len);
+}
+
+/* Fixed header claims remain_len=3, but topic declares length=5
+ * (consuming 7 bytes of variable header). After decoding the topic,
+ * variable_len (7) exceeds remain_len (3), which must be rejected. */
+TEST(decode_publish_malformed_variable_exceeds_remain)
+{
+    byte buf[] = { 0x30, 3,
+                   0x00, 0x05, 'h', 'e', 'l', 'l', 'o' };
+    MqttPublish pub;
+    int rc;
+
+    XMEMSET(&pub, 0, sizeof(pub));
+    rc = MqttDecode_Publish(buf, (int)sizeof(buf), &pub);
+    ASSERT_EQ(MQTT_CODE_ERROR_OUT_OF_BUFFER, rc);
+}
+
+#ifdef WOLFMQTT_V5
+TEST(decode_publish_v5_with_props_roundtrip)
+{
+    byte buf[256];
+    byte payload[] = { 'p', 'a', 'y' };
+    MqttPublish enc, dec;
+    MqttProp prop;
+    char content_type[] = "text/plain";
+    int enc_len, dec_len;
+
+    XMEMSET(&enc, 0, sizeof(enc));
+    XMEMSET(&prop, 0, sizeof(prop));
+    prop.type = MQTT_PROP_CONTENT_TYPE;
+    prop.data_str.str = content_type;
+    prop.data_str.len = (word16)XSTRLEN(content_type);
+    prop.next = NULL;
+    enc.topic_name = "v5/topic";
+    enc.qos = MQTT_QOS_1;
+    enc.packet_id = 7;
+    enc.protocol_level = MQTT_CONNECT_PROTOCOL_LEVEL_5;
+    enc.props = &prop;
+    enc.buffer = payload;
+    enc.total_len = sizeof(payload);
+
+    enc_len = MqttEncode_Publish(buf, (int)sizeof(buf), &enc, 0);
+    ASSERT_TRUE(enc_len > 0);
+
+    XMEMSET(&dec, 0, sizeof(dec));
+    dec.protocol_level = MQTT_CONNECT_PROTOCOL_LEVEL_5;
+    dec_len = MqttDecode_Publish(buf, enc_len, &dec);
+    ASSERT_TRUE(dec_len > 0);
+    ASSERT_EQ(MQTT_QOS_1, dec.qos);
+    ASSERT_EQ(7, dec.packet_id);
+    ASSERT_EQ((int)XSTRLEN("v5/topic"), (int)dec.topic_name_len);
+    ASSERT_EQ(0, XMEMCMP(dec.topic_name, "v5/topic",
+                         XSTRLEN("v5/topic")));
+    ASSERT_EQ((int)sizeof(payload), (int)dec.total_len);
+    ASSERT_TRUE(dec.props != NULL);
+    if (dec.props) {
+        MqttProps_Free(dec.props);
+    }
+}
+#endif /* WOLFMQTT_V5 */
+
+/* ============================================================================
  * MqttDecode_ConnectAck
  * ============================================================================ */
 
@@ -822,6 +952,15 @@ void run_mqtt_packet_tests(void)
     RUN_TEST(encode_publish_qos2_packet_id_zero);
     RUN_TEST(encode_publish_qos0_packet_id_zero_ok);
     RUN_TEST(encode_publish_qos1_valid);
+
+    /* MqttDecode_Publish */
+    RUN_TEST(decode_publish_qos0_valid);
+    RUN_TEST(decode_publish_qos1_valid);
+    RUN_TEST(decode_publish_qos0_zero_payload);
+    RUN_TEST(decode_publish_malformed_variable_exceeds_remain);
+#ifdef WOLFMQTT_V5
+    RUN_TEST(decode_publish_v5_with_props_roundtrip);
+#endif
 
     /* MqttDecode_ConnectAck */
     RUN_TEST(decode_connack_valid);
