@@ -789,6 +789,115 @@ TEST(encode_connect_fixed_header_flags)
     ASSERT_EQ(0, (int)MQTT_PACKET_FLAGS_GET(tx_buf[0]));
 }
 
+/* [MQTT-3.1.2] CONNECT variable header flags byte encodes credential and
+ * clean-session bits. The flags byte sits at offset 7 inside the variable
+ * header (after 2-byte protocol length, 4-byte "MQTT", 1-byte protocol
+ * level). With a remaining length < 128 the fixed header is 2 bytes, so the
+ * flags byte is tx_buf[9]. */
+TEST(encode_connect_flags_username_password_clean)
+{
+    byte tx_buf[256];
+    MqttConnect conn;
+    int rc;
+    byte flags;
+
+    XMEMSET(&conn, 0, sizeof(conn));
+    conn.client_id = "test_client";
+    conn.username = "user";
+    conn.password = "pass";
+    conn.clean_session = 1;
+    rc = MqttEncode_Connect(tx_buf, (int)sizeof(tx_buf), &conn);
+    ASSERT_TRUE(rc > 0);
+    flags = tx_buf[9];
+    ASSERT_EQ(MQTT_CONNECT_FLAG_USERNAME,
+              flags & MQTT_CONNECT_FLAG_USERNAME);
+    ASSERT_EQ(MQTT_CONNECT_FLAG_PASSWORD,
+              flags & MQTT_CONNECT_FLAG_PASSWORD);
+    ASSERT_EQ(MQTT_CONNECT_FLAG_CLEAN_SESSION,
+              flags & MQTT_CONNECT_FLAG_CLEAN_SESSION);
+    ASSERT_EQ(0, flags & MQTT_CONNECT_FLAG_WILL_FLAG);
+    ASSERT_EQ(0, flags & MQTT_CONNECT_FLAG_WILL_RETAIN);
+    ASSERT_EQ(0, flags & MQTT_CONNECT_FLAG_WILL_QOS_MASK);
+    ASSERT_EQ(0, flags & MQTT_CONNECT_FLAG_RESERVED);
+}
+
+TEST(encode_connect_flags_none)
+{
+    byte tx_buf[256];
+    MqttConnect conn;
+    int rc;
+
+    XMEMSET(&conn, 0, sizeof(conn));
+    conn.client_id = "test_client";
+    rc = MqttEncode_Connect(tx_buf, (int)sizeof(tx_buf), &conn);
+    ASSERT_TRUE(rc > 0);
+    ASSERT_EQ(0, (int)tx_buf[9]);
+}
+
+TEST(encode_connect_flags_clean_session_only)
+{
+    byte tx_buf[256];
+    MqttConnect conn;
+    int rc;
+
+    XMEMSET(&conn, 0, sizeof(conn));
+    conn.client_id = "test_client";
+    conn.clean_session = 1;
+    rc = MqttEncode_Connect(tx_buf, (int)sizeof(tx_buf), &conn);
+    ASSERT_TRUE(rc > 0);
+    ASSERT_EQ(MQTT_CONNECT_FLAG_CLEAN_SESSION, (int)tx_buf[9]);
+}
+
+TEST(encode_connect_flags_username_only)
+{
+    byte tx_buf[256];
+    MqttConnect conn;
+    int rc;
+
+    XMEMSET(&conn, 0, sizeof(conn));
+    conn.client_id = "test_client";
+    conn.username = "user";
+    rc = MqttEncode_Connect(tx_buf, (int)sizeof(tx_buf), &conn);
+    ASSERT_TRUE(rc > 0);
+    ASSERT_EQ(MQTT_CONNECT_FLAG_USERNAME,
+              tx_buf[9] & MQTT_CONNECT_FLAG_USERNAME);
+    ASSERT_EQ(0, tx_buf[9] & MQTT_CONNECT_FLAG_PASSWORD);
+}
+
+TEST(encode_connect_flags_lwt_qos1_retain)
+{
+    byte tx_buf[256];
+    byte lwt_payload[] = {'b', 'y', 'e'};
+    MqttConnect conn;
+    MqttMessage lwt;
+    int rc;
+    byte flags;
+
+    XMEMSET(&conn, 0, sizeof(conn));
+    XMEMSET(&lwt, 0, sizeof(lwt));
+    lwt.topic_name = "will/topic";
+    lwt.buffer = lwt_payload;
+    lwt.total_len = (word32)sizeof(lwt_payload);
+    lwt.qos = MQTT_QOS_1;
+    lwt.retain = 1;
+
+    conn.client_id = "test_client";
+    conn.enable_lwt = 1;
+    conn.lwt_msg = &lwt;
+    rc = MqttEncode_Connect(tx_buf, (int)sizeof(tx_buf), &conn);
+    ASSERT_TRUE(rc > 0);
+    flags = tx_buf[9];
+    ASSERT_EQ(MQTT_CONNECT_FLAG_WILL_FLAG,
+              flags & MQTT_CONNECT_FLAG_WILL_FLAG);
+    ASSERT_EQ(MQTT_CONNECT_FLAG_WILL_RETAIN,
+              flags & MQTT_CONNECT_FLAG_WILL_RETAIN);
+    ASSERT_EQ((int)MQTT_QOS_1,
+              (int)MQTT_CONNECT_FLAG_GET_QOS(flags));
+    ASSERT_EQ(0, flags & MQTT_CONNECT_FLAG_USERNAME);
+    ASSERT_EQ(0, flags & MQTT_CONNECT_FLAG_PASSWORD);
+    ASSERT_EQ(0, flags & MQTT_CONNECT_FLAG_CLEAN_SESSION);
+}
+
 /* ============================================================================
  * QoS 2 next-ack arithmetic (PUBLISH_REC -> REL -> COMP)
  * ============================================================================ */
@@ -1117,6 +1226,11 @@ void run_mqtt_packet_tests(void)
     RUN_TEST(encode_connect_username_only);
     RUN_TEST(encode_connect_no_credentials);
     RUN_TEST(encode_connect_fixed_header_flags);
+    RUN_TEST(encode_connect_flags_username_password_clean);
+    RUN_TEST(encode_connect_flags_none);
+    RUN_TEST(encode_connect_flags_clean_session_only);
+    RUN_TEST(encode_connect_flags_username_only);
+    RUN_TEST(encode_connect_flags_lwt_qos1_retain);
 
     /* QoS 2 ack arithmetic */
     RUN_TEST(qos2_ack_arithmetic);
