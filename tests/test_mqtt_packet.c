@@ -344,6 +344,77 @@ TEST(encode_publish_qos1_valid)
     ASSERT_TRUE(rc > 0);
 }
 
+/* Verify the fixed-header flag bits (retain/QoS/dup) are actually emitted.
+ * Covers deletion mutations of the retain / qos / duplicate branches in
+ * MqttEncode_FixedHeader. */
+TEST(encode_publish_qos1_retain_flags_in_header)
+{
+    byte tx_buf[256];
+    MqttPublish pub;
+    int rc;
+
+    XMEMSET(&pub, 0, sizeof(pub));
+    pub.topic_name = "test/topic";
+    pub.qos = MQTT_QOS_1;
+    pub.retain = 1;
+    pub.duplicate = 0;
+    pub.packet_id = 1;
+    rc = MqttEncode_Publish(tx_buf, (int)sizeof(tx_buf), &pub, 0);
+    ASSERT_TRUE(rc > 0);
+    ASSERT_EQ(MQTT_PACKET_TYPE_PUBLISH,
+              MQTT_PACKET_TYPE_GET(tx_buf[0]));
+    ASSERT_EQ(MQTT_QOS_1,
+              (int)MQTT_PACKET_FLAGS_GET_QOS(tx_buf[0]));
+    ASSERT_TRUE((MQTT_PACKET_FLAGS_GET(tx_buf[0]) &
+                 MQTT_PACKET_FLAG_RETAIN) != 0);
+    ASSERT_TRUE((MQTT_PACKET_FLAGS_GET(tx_buf[0]) &
+                 MQTT_PACKET_FLAG_DUPLICATE) == 0);
+}
+
+TEST(encode_publish_qos2_duplicate_flags_in_header)
+{
+    byte tx_buf[256];
+    MqttPublish pub;
+    int rc;
+
+    XMEMSET(&pub, 0, sizeof(pub));
+    pub.topic_name = "test/topic";
+    pub.qos = MQTT_QOS_2;
+    pub.retain = 0;
+    pub.duplicate = 1;
+    pub.packet_id = 1;
+    rc = MqttEncode_Publish(tx_buf, (int)sizeof(tx_buf), &pub, 0);
+    ASSERT_TRUE(rc > 0);
+    ASSERT_EQ(MQTT_PACKET_TYPE_PUBLISH,
+              MQTT_PACKET_TYPE_GET(tx_buf[0]));
+    ASSERT_EQ(MQTT_QOS_2,
+              (int)MQTT_PACKET_FLAGS_GET_QOS(tx_buf[0]));
+    ASSERT_TRUE((MQTT_PACKET_FLAGS_GET(tx_buf[0]) &
+                 MQTT_PACKET_FLAG_DUPLICATE) != 0);
+    ASSERT_TRUE((MQTT_PACKET_FLAGS_GET(tx_buf[0]) &
+                 MQTT_PACKET_FLAG_RETAIN) == 0);
+}
+
+/* QoS 0, no retain, no dup -> flag nibble must be 0. Catches any mutation
+ * that unconditionally sets flag bits. */
+TEST(encode_publish_qos0_no_flags_in_header)
+{
+    byte tx_buf[256];
+    MqttPublish pub;
+    int rc;
+
+    XMEMSET(&pub, 0, sizeof(pub));
+    pub.topic_name = "test/topic";
+    pub.qos = MQTT_QOS_0;
+    pub.retain = 0;
+    pub.duplicate = 0;
+    rc = MqttEncode_Publish(tx_buf, (int)sizeof(tx_buf), &pub, 0);
+    ASSERT_TRUE(rc > 0);
+    ASSERT_EQ(MQTT_PACKET_TYPE_PUBLISH,
+              MQTT_PACKET_TYPE_GET(tx_buf[0]));
+    ASSERT_EQ(0, (int)MQTT_PACKET_FLAGS_GET(tx_buf[0]));
+}
+
 /* ============================================================================
  * MqttDecode_Publish
  * ============================================================================ */
@@ -559,6 +630,29 @@ TEST(encode_subscribe_valid)
     ASSERT_TRUE(rc > 0);
 }
 
+/* [MQTT-3.8.1-1] SUBSCRIBE fixed header flags must be 0b0010 (reserved).
+ * Verifies the QoS branch in MqttEncode_FixedHeader fires even for non-
+ * PUBLISH packets. */
+TEST(encode_subscribe_fixed_header_flags)
+{
+    byte tx_buf[256];
+    MqttSubscribe sub;
+    MqttTopic topic;
+    int rc;
+
+    XMEMSET(&sub, 0, sizeof(sub));
+    XMEMSET(&topic, 0, sizeof(topic));
+    topic.topic_filter = "test/topic";
+    sub.topics = &topic;
+    sub.topic_count = 1;
+    sub.packet_id = 1;
+    rc = MqttEncode_Subscribe(tx_buf, (int)sizeof(tx_buf), &sub);
+    ASSERT_TRUE(rc > 0);
+    ASSERT_EQ(MQTT_PACKET_TYPE_SUBSCRIBE,
+              MQTT_PACKET_TYPE_GET(tx_buf[0]));
+    ASSERT_EQ(0x2, (int)MQTT_PACKET_FLAGS_GET(tx_buf[0]));
+}
+
 /* ============================================================================
  * MqttEncode_Unsubscribe
  * ============================================================================ */
@@ -595,6 +689,27 @@ TEST(encode_unsubscribe_valid)
     unsub.packet_id = 1;
     rc = MqttEncode_Unsubscribe(tx_buf, (int)sizeof(tx_buf), &unsub);
     ASSERT_TRUE(rc > 0);
+}
+
+/* [MQTT-3.10.1-1] UNSUBSCRIBE fixed header flags must be 0b0010. */
+TEST(encode_unsubscribe_fixed_header_flags)
+{
+    byte tx_buf[256];
+    MqttUnsubscribe unsub;
+    MqttTopic topic;
+    int rc;
+
+    XMEMSET(&unsub, 0, sizeof(unsub));
+    XMEMSET(&topic, 0, sizeof(topic));
+    topic.topic_filter = "test/topic";
+    unsub.topics = &topic;
+    unsub.topic_count = 1;
+    unsub.packet_id = 1;
+    rc = MqttEncode_Unsubscribe(tx_buf, (int)sizeof(tx_buf), &unsub);
+    ASSERT_TRUE(rc > 0);
+    ASSERT_EQ(MQTT_PACKET_TYPE_UNSUBSCRIBE,
+              MQTT_PACKET_TYPE_GET(tx_buf[0]));
+    ASSERT_EQ(0x2, (int)MQTT_PACKET_FLAGS_GET(tx_buf[0]));
 }
 
 /* ============================================================================
@@ -656,6 +771,22 @@ TEST(encode_connect_no_credentials)
     conn.password = NULL;
     rc = MqttEncode_Connect(tx_buf, (int)sizeof(tx_buf), &conn);
     ASSERT_TRUE(rc > 0);
+}
+
+/* [MQTT-3.1.1] CONNECT fixed header flags must be all zero. */
+TEST(encode_connect_fixed_header_flags)
+{
+    byte tx_buf[256];
+    MqttConnect conn;
+    int rc;
+
+    XMEMSET(&conn, 0, sizeof(conn));
+    conn.client_id = "test_client";
+    rc = MqttEncode_Connect(tx_buf, (int)sizeof(tx_buf), &conn);
+    ASSERT_TRUE(rc > 0);
+    ASSERT_EQ(MQTT_PACKET_TYPE_CONNECT,
+              MQTT_PACKET_TYPE_GET(tx_buf[0]));
+    ASSERT_EQ(0, (int)MQTT_PACKET_FLAGS_GET(tx_buf[0]));
 }
 
 /* ============================================================================
@@ -952,6 +1083,9 @@ void run_mqtt_packet_tests(void)
     RUN_TEST(encode_publish_qos2_packet_id_zero);
     RUN_TEST(encode_publish_qos0_packet_id_zero_ok);
     RUN_TEST(encode_publish_qos1_valid);
+    RUN_TEST(encode_publish_qos1_retain_flags_in_header);
+    RUN_TEST(encode_publish_qos2_duplicate_flags_in_header);
+    RUN_TEST(encode_publish_qos0_no_flags_in_header);
 
     /* MqttDecode_Publish */
     RUN_TEST(decode_publish_qos0_valid);
@@ -970,16 +1104,19 @@ void run_mqtt_packet_tests(void)
     /* MqttEncode_Subscribe */
     RUN_TEST(encode_subscribe_packet_id_zero);
     RUN_TEST(encode_subscribe_valid);
+    RUN_TEST(encode_subscribe_fixed_header_flags);
 
     /* MqttEncode_Unsubscribe */
     RUN_TEST(encode_unsubscribe_packet_id_zero);
     RUN_TEST(encode_unsubscribe_valid);
+    RUN_TEST(encode_unsubscribe_fixed_header_flags);
 
     /* MqttEncode_Connect */
     RUN_TEST(encode_connect_password_without_username);
     RUN_TEST(encode_connect_username_and_password);
     RUN_TEST(encode_connect_username_only);
     RUN_TEST(encode_connect_no_credentials);
+    RUN_TEST(encode_connect_fixed_header_flags);
 
     /* QoS 2 ack arithmetic */
     RUN_TEST(qos2_ack_arithmetic);
