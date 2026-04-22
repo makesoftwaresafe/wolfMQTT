@@ -415,6 +415,37 @@ TEST(encode_publish_qos0_no_flags_in_header)
     ASSERT_EQ(0, (int)MQTT_PACKET_FLAGS_GET(tx_buf[0]));
 }
 
+/* f-2360: topic_name with strlen > 65535 must not produce a "successful"
+ * encode. MqttEncode_String returns -1 for oversize strings; the encoder
+ * must surface that as a negative return rather than adding -1 to the
+ * tx_payload pointer and reporting header_len+remain_len as success. */
+TEST(encode_publish_topic_oversized_rejected)
+{
+    const int str_len = 0x10000; /* one byte past MQTT UTF-8 limit */
+    const int buf_len = str_len + 64;
+    byte *tx_buf = (byte*)WOLFMQTT_MALLOC(buf_len);
+    char *topic = (char*)WOLFMQTT_MALLOC(str_len + 1);
+    MqttPublish pub;
+    int rc;
+
+    if (tx_buf == NULL || topic == NULL) {
+        WOLFMQTT_FREE(tx_buf);
+        WOLFMQTT_FREE(topic);
+        FAIL("allocation failed");
+    }
+    XMEMSET(topic, 'A', str_len);
+    topic[str_len] = '\0';
+
+    XMEMSET(&pub, 0, sizeof(pub));
+    pub.topic_name = topic;
+    pub.qos = MQTT_QOS_0;
+    rc = MqttEncode_Publish(tx_buf, buf_len, &pub, 0);
+
+    WOLFMQTT_FREE(topic);
+    WOLFMQTT_FREE(tx_buf);
+    ASSERT_TRUE(rc < 0);
+}
+
 /* ============================================================================
  * MqttDecode_Publish
  * ============================================================================ */
@@ -714,6 +745,40 @@ TEST(encode_subscribe_options_byte_qos2)
     ASSERT_EQ(0x02, tx_buf[rc - 1]);
 }
 
+/* f-2360: topic_filter with strlen > 65535 must be rejected with a negative
+ * return. Guards the unchecked tx_payload += MqttEncode_String(...) in the
+ * SUBSCRIBE payload loop. */
+TEST(encode_subscribe_topic_filter_oversized_rejected)
+{
+    const int str_len = 0x10000; /* one byte past MQTT UTF-8 limit */
+    const int buf_len = str_len + 64;
+    byte *tx_buf = (byte*)WOLFMQTT_MALLOC(buf_len);
+    char *filter = (char*)WOLFMQTT_MALLOC(str_len + 1);
+    MqttSubscribe sub;
+    MqttTopic topic;
+    int rc;
+
+    if (tx_buf == NULL || filter == NULL) {
+        WOLFMQTT_FREE(tx_buf);
+        WOLFMQTT_FREE(filter);
+        FAIL("allocation failed");
+    }
+    XMEMSET(filter, 'A', str_len);
+    filter[str_len] = '\0';
+
+    XMEMSET(&sub, 0, sizeof(sub));
+    XMEMSET(&topic, 0, sizeof(topic));
+    topic.topic_filter = filter;
+    sub.topics = &topic;
+    sub.topic_count = 1;
+    sub.packet_id = 1;
+    rc = MqttEncode_Subscribe(tx_buf, buf_len, &sub);
+
+    WOLFMQTT_FREE(filter);
+    WOLFMQTT_FREE(tx_buf);
+    ASSERT_TRUE(rc < 0);
+}
+
 /* ============================================================================
  * MqttEncode_Unsubscribe
  * ============================================================================ */
@@ -957,6 +1022,130 @@ TEST(encode_connect_flags_lwt_qos1_retain)
     ASSERT_EQ(0, flags & MQTT_CONNECT_FLAG_USERNAME);
     ASSERT_EQ(0, flags & MQTT_CONNECT_FLAG_PASSWORD);
     ASSERT_EQ(0, flags & MQTT_CONNECT_FLAG_CLEAN_SESSION);
+}
+
+/* f-2360: client_id with strlen > 65535 must be rejected with a negative
+ * return. MqttEncode_String returns -1 for such strings; the encoder must
+ * not report header_len+remain_len as a successful encode while tx_payload
+ * silently moves backward by one byte. */
+TEST(encode_connect_client_id_oversized_rejected)
+{
+    const int str_len = 0x10000; /* one byte past MQTT UTF-8 limit */
+    const int buf_len = str_len + 64;
+    byte *tx_buf = (byte*)WOLFMQTT_MALLOC(buf_len);
+    char *client_id = (char*)WOLFMQTT_MALLOC(str_len + 1);
+    MqttConnect conn;
+    int rc;
+
+    if (tx_buf == NULL || client_id == NULL) {
+        WOLFMQTT_FREE(tx_buf);
+        WOLFMQTT_FREE(client_id);
+        FAIL("allocation failed");
+    }
+    XMEMSET(client_id, 'A', str_len);
+    client_id[str_len] = '\0';
+
+    XMEMSET(&conn, 0, sizeof(conn));
+    conn.client_id = client_id;
+    rc = MqttEncode_Connect(tx_buf, buf_len, &conn);
+
+    WOLFMQTT_FREE(client_id);
+    WOLFMQTT_FREE(tx_buf);
+    ASSERT_TRUE(rc < 0);
+}
+
+/* f-2360: username with strlen > 65535. Password is supplied so the
+ * USERNAME+PASSWORD branch exercises both credential encodes. */
+TEST(encode_connect_username_oversized_rejected)
+{
+    const int str_len = 0x10000;
+    const int buf_len = str_len + 128;
+    byte *tx_buf = (byte*)WOLFMQTT_MALLOC(buf_len);
+    char *username = (char*)WOLFMQTT_MALLOC(str_len + 1);
+    MqttConnect conn;
+    int rc;
+
+    if (tx_buf == NULL || username == NULL) {
+        WOLFMQTT_FREE(tx_buf);
+        WOLFMQTT_FREE(username);
+        FAIL("allocation failed");
+    }
+    XMEMSET(username, 'U', str_len);
+    username[str_len] = '\0';
+
+    XMEMSET(&conn, 0, sizeof(conn));
+    conn.client_id = "cid";
+    conn.username = username;
+    conn.password = "pw";
+    rc = MqttEncode_Connect(tx_buf, buf_len, &conn);
+
+    WOLFMQTT_FREE(username);
+    WOLFMQTT_FREE(tx_buf);
+    ASSERT_TRUE(rc < 0);
+}
+
+/* f-2360: password with strlen > 65535. */
+TEST(encode_connect_password_oversized_rejected)
+{
+    const int str_len = 0x10000;
+    const int buf_len = str_len + 128;
+    byte *tx_buf = (byte*)WOLFMQTT_MALLOC(buf_len);
+    char *password = (char*)WOLFMQTT_MALLOC(str_len + 1);
+    MqttConnect conn;
+    int rc;
+
+    if (tx_buf == NULL || password == NULL) {
+        WOLFMQTT_FREE(tx_buf);
+        WOLFMQTT_FREE(password);
+        FAIL("allocation failed");
+    }
+    XMEMSET(password, 'P', str_len);
+    password[str_len] = '\0';
+
+    XMEMSET(&conn, 0, sizeof(conn));
+    conn.client_id = "cid";
+    conn.username = "user";
+    conn.password = password;
+    rc = MqttEncode_Connect(tx_buf, buf_len, &conn);
+
+    WOLFMQTT_FREE(password);
+    WOLFMQTT_FREE(tx_buf);
+    ASSERT_TRUE(rc < 0);
+}
+
+/* f-2360: LWT topic_name with strlen > 65535. */
+TEST(encode_connect_lwt_topic_oversized_rejected)
+{
+    const int str_len = 0x10000;
+    const int buf_len = str_len + 128;
+    byte *tx_buf = (byte*)WOLFMQTT_MALLOC(buf_len);
+    char *lwt_topic = (char*)WOLFMQTT_MALLOC(str_len + 1);
+    byte lwt_payload[] = { 'b', 'y', 'e' };
+    MqttConnect conn;
+    MqttMessage lwt;
+    int rc;
+
+    if (tx_buf == NULL || lwt_topic == NULL) {
+        WOLFMQTT_FREE(tx_buf);
+        WOLFMQTT_FREE(lwt_topic);
+        FAIL("allocation failed");
+    }
+    XMEMSET(lwt_topic, 'T', str_len);
+    lwt_topic[str_len] = '\0';
+
+    XMEMSET(&conn, 0, sizeof(conn));
+    XMEMSET(&lwt, 0, sizeof(lwt));
+    lwt.topic_name = lwt_topic;
+    lwt.buffer = lwt_payload;
+    lwt.total_len = (word32)sizeof(lwt_payload);
+    conn.client_id = "cid";
+    conn.enable_lwt = 1;
+    conn.lwt_msg = &lwt;
+    rc = MqttEncode_Connect(tx_buf, buf_len, &conn);
+
+    WOLFMQTT_FREE(lwt_topic);
+    WOLFMQTT_FREE(tx_buf);
+    ASSERT_TRUE(rc < 0);
 }
 
 /* ============================================================================
@@ -1479,6 +1668,7 @@ void run_mqtt_packet_tests(void)
     RUN_TEST(encode_publish_qos1_retain_flags_in_header);
     RUN_TEST(encode_publish_qos2_duplicate_flags_in_header);
     RUN_TEST(encode_publish_qos0_no_flags_in_header);
+    RUN_TEST(encode_publish_topic_oversized_rejected);
 
     /* MqttDecode_Publish */
     RUN_TEST(decode_publish_qos0_valid);
@@ -1501,6 +1691,7 @@ void run_mqtt_packet_tests(void)
     RUN_TEST(encode_subscribe_options_byte_qos0);
     RUN_TEST(encode_subscribe_options_byte_qos1);
     RUN_TEST(encode_subscribe_options_byte_qos2);
+    RUN_TEST(encode_subscribe_topic_filter_oversized_rejected);
 
     /* MqttEncode_Unsubscribe */
     RUN_TEST(encode_unsubscribe_packet_id_zero);
@@ -1518,6 +1709,10 @@ void run_mqtt_packet_tests(void)
     RUN_TEST(encode_connect_flags_clean_session_only);
     RUN_TEST(encode_connect_flags_username_only);
     RUN_TEST(encode_connect_flags_lwt_qos1_retain);
+    RUN_TEST(encode_connect_client_id_oversized_rejected);
+    RUN_TEST(encode_connect_username_oversized_rejected);
+    RUN_TEST(encode_connect_password_oversized_rejected);
+    RUN_TEST(encode_connect_lwt_topic_oversized_rejected);
 
 #ifdef WOLFMQTT_BROKER
     /* MqttDecode_Connect */

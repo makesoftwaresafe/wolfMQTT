@@ -801,6 +801,12 @@ int MqttEncode_Connect(byte *tx_buf, int tx_buf_len, MqttConnect *mc_connect)
     }
 #endif
 
+    /* MQTT UTF-8 strings are limited to 65535 bytes [MQTT-1.5.3]. Check here
+     * (before writing the fixed header) so a later MqttEncode_String failure
+     * cannot corrupt tx_payload via `tx_payload += -1`. */
+    if (XSTRLEN(mc_connect->client_id) > (size_t)0xFFFF) {
+        return MQTT_TRACE_ERROR(MQTT_CODE_ERROR_BAD_ARG);
+    }
     remain_len += (int)XSTRLEN(mc_connect->client_id) + MQTT_DATA_LEN_SIZE;
     if (mc_connect->enable_lwt) {
         /* Verify all required fields are present */
@@ -809,6 +815,9 @@ int MqttEncode_Connect(byte *tx_buf, int tx_buf_len, MqttConnect *mc_connect)
             (mc_connect->lwt_msg->buffer == NULL &&
              mc_connect->lwt_msg->total_len != 0))
         {
+            return MQTT_TRACE_ERROR(MQTT_CODE_ERROR_BAD_ARG);
+        }
+        if (XSTRLEN(mc_connect->lwt_msg->topic_name) > (size_t)0xFFFF) {
             return MQTT_TRACE_ERROR(MQTT_CODE_ERROR_BAD_ARG);
         }
 
@@ -841,9 +850,15 @@ int MqttEncode_Connect(byte *tx_buf, int tx_buf_len, MqttConnect *mc_connect)
 #endif
     }
     if (mc_connect->username) {
+        if (XSTRLEN(mc_connect->username) > (size_t)0xFFFF) {
+            return MQTT_TRACE_ERROR(MQTT_CODE_ERROR_BAD_ARG);
+        }
         remain_len += (int)XSTRLEN(mc_connect->username) + MQTT_DATA_LEN_SIZE;
     }
     if (mc_connect->password) {
+        if (XSTRLEN(mc_connect->password) > (size_t)0xFFFF) {
+            return MQTT_TRACE_ERROR(MQTT_CODE_ERROR_BAD_ARG);
+        }
         remain_len += (int)XSTRLEN(mc_connect->password) + MQTT_DATA_LEN_SIZE;
     }
 
@@ -1302,6 +1317,12 @@ int MqttEncode_Publish(byte *tx_buf, int tx_buf_len, MqttPublish *publish,
     if (tx_buf == NULL || publish == NULL) {
         return MQTT_TRACE_ERROR(MQTT_CODE_ERROR_BAD_ARG);
     }
+    /* MQTT UTF-8 strings are limited to 65535 bytes [MQTT-1.5.3]. Check here
+     * before writing the fixed header so a later MqttEncode_String failure
+     * cannot corrupt tx_payload via `tx_payload += -1`. */
+    if (XSTRLEN(publish->topic_name) > (size_t)0xFFFF) {
+        return MQTT_TRACE_ERROR(MQTT_CODE_ERROR_BAD_ARG);
+    }
 
     /* Determine packet length */
     variable_len = (int)XSTRLEN(publish->topic_name) + MQTT_DATA_LEN_SIZE;
@@ -1721,6 +1742,10 @@ int MqttEncode_Subscribe(byte *tx_buf, int tx_buf_len,
     for (i = 0; i < subscribe->topic_count; i++) {
         topic = &subscribe->topics[i];
         if ((topic != NULL) && (topic->topic_filter != NULL)) {
+            /* MQTT UTF-8 strings are limited to 65535 bytes [MQTT-1.5.3] */
+            if (XSTRLEN(topic->topic_filter) > (size_t)0xFFFF) {
+                return MQTT_TRACE_ERROR(MQTT_CODE_ERROR_BAD_ARG);
+            }
             remain_len += (int)XSTRLEN(topic->topic_filter) + MQTT_DATA_LEN_SIZE;
             remain_len++; /* For QoS */
         }
@@ -2016,6 +2041,10 @@ int MqttEncode_Unsubscribe(byte *tx_buf, int tx_buf_len,
     for (i = 0; i < unsubscribe->topic_count; i++) {
         topic = &unsubscribe->topics[i];
         if ((topic != NULL) && (topic->topic_filter != NULL)) {
+            /* MQTT UTF-8 strings are limited to 65535 bytes [MQTT-1.5.3] */
+            if (XSTRLEN(topic->topic_filter) > (size_t)0xFFFF) {
+                return MQTT_TRACE_ERROR(MQTT_CODE_ERROR_BAD_ARG);
+            }
             remain_len += (int)XSTRLEN(topic->topic_filter) +
                                 MQTT_DATA_LEN_SIZE;
         }
