@@ -54,6 +54,9 @@ cmake .. -DWITH_WOLFSSL_TREE=/path/to/wolfssl/
 cmake --build .
 ```
 
+Additional CMake options:
+* `-DWOLFMQTT_UNIT_TESTS=no` disables the `wolfmqtt_unit_tests` target (default `yes`). The target is only added when wolfMQTT is the top-level project, so downstream consumers using `add_subdirectory()` are unaffected.
+
 ### vcpkg
 
  You can download and install wolfMQTT using the [vcpkg](https://github.com/Microsoft/vcpkg):
