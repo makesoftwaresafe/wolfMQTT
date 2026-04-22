@@ -653,6 +653,67 @@ TEST(encode_subscribe_fixed_header_flags)
     ASSERT_EQ(0x2, (int)MQTT_PACKET_FLAGS_GET(tx_buf[0]));
 }
 
+/* [MQTT-3.8.3-1] Payload options byte bits 0-1 carry QoS. Remaining bits
+ * carry v5-only No Local (bit 2), Retain As Published (bit 3), and Retain
+ * Handling (bits 4-5); bits 6-7 are reserved. The encoded options byte is
+ * the last byte of a single-topic SUBSCRIBE packet. */
+TEST(encode_subscribe_options_byte_qos0)
+{
+    byte tx_buf[256];
+    MqttSubscribe sub;
+    MqttTopic topic;
+    int rc;
+
+    XMEMSET(&sub, 0, sizeof(sub));
+    XMEMSET(&topic, 0, sizeof(topic));
+    topic.topic_filter = "a";
+    topic.qos = MQTT_QOS_0;
+    sub.topics = &topic;
+    sub.topic_count = 1;
+    sub.packet_id = 1;
+    rc = MqttEncode_Subscribe(tx_buf, (int)sizeof(tx_buf), &sub);
+    ASSERT_TRUE(rc > 0);
+    ASSERT_EQ(0x00, tx_buf[rc - 1]);
+}
+
+TEST(encode_subscribe_options_byte_qos1)
+{
+    byte tx_buf[256];
+    MqttSubscribe sub;
+    MqttTopic topic;
+    int rc;
+
+    XMEMSET(&sub, 0, sizeof(sub));
+    XMEMSET(&topic, 0, sizeof(topic));
+    topic.topic_filter = "a";
+    topic.qos = MQTT_QOS_1;
+    sub.topics = &topic;
+    sub.topic_count = 1;
+    sub.packet_id = 1;
+    rc = MqttEncode_Subscribe(tx_buf, (int)sizeof(tx_buf), &sub);
+    ASSERT_TRUE(rc > 0);
+    ASSERT_EQ(0x01, tx_buf[rc - 1]);
+}
+
+TEST(encode_subscribe_options_byte_qos2)
+{
+    byte tx_buf[256];
+    MqttSubscribe sub;
+    MqttTopic topic;
+    int rc;
+
+    XMEMSET(&sub, 0, sizeof(sub));
+    XMEMSET(&topic, 0, sizeof(topic));
+    topic.topic_filter = "a";
+    topic.qos = MQTT_QOS_2;
+    sub.topics = &topic;
+    sub.topic_count = 1;
+    sub.packet_id = 1;
+    rc = MqttEncode_Subscribe(tx_buf, (int)sizeof(tx_buf), &sub);
+    ASSERT_TRUE(rc > 0);
+    ASSERT_EQ(0x02, tx_buf[rc - 1]);
+}
+
 /* ============================================================================
  * MqttEncode_Unsubscribe
  * ============================================================================ */
@@ -1055,6 +1116,73 @@ TEST(decode_connect_v311_with_lwt)
 #endif /* WOLFMQTT_BROKER */
 
 /* ============================================================================
+ * MqttDecode_Subscribe (broker-side)
+ * ============================================================================ */
+
+#ifdef WOLFMQTT_BROKER
+/* Hand-built v3.1.1 SUBSCRIBE wire buffer serves as an independent oracle.
+ * Wire: type|flags=0x82, remaining=6, packet_id=0x0001, topic_len=0x0001,
+ *       "a", options=0x01 (QoS 1). */
+TEST(decode_subscribe_v311_single_topic)
+{
+    byte rx_buf[] = {
+        0x82, 0x06,
+        0x00, 0x01,
+        0x00, 0x01,
+        0x61,
+        0x01
+    };
+    MqttSubscribe sub;
+    MqttTopic topic_arr[1];
+    int rc;
+
+    XMEMSET(&sub, 0, sizeof(sub));
+    XMEMSET(topic_arr, 0, sizeof(topic_arr));
+    sub.topics = topic_arr;
+    rc = MqttDecode_Subscribe(rx_buf, (int)sizeof(rx_buf), &sub);
+    ASSERT_TRUE(rc > 0);
+    ASSERT_EQ(1, sub.packet_id);
+    ASSERT_EQ(1, sub.topic_count);
+    ASSERT_EQ(MQTT_QOS_1, topic_arr[0].qos);
+    ASSERT_NOT_NULL(topic_arr[0].topic_filter);
+    ASSERT_EQ(0, XMEMCMP(topic_arr[0].topic_filter, "a", 1));
+}
+
+#ifdef WOLFMQTT_V5
+/* [MQTT-3.8.3] v5 SUBSCRIBE options byte carries QoS (bits 0-1), No Local
+ * (bit 2), Retain As Published (bit 3), and Retain Handling (bits 4-5).
+ * Hand-built wire with options = 0x2D (RH=2, RAP=1, NL=1, QoS=1). The
+ * decoder must accept the packet and surface QoS. */
+TEST(decode_subscribe_v5_options_byte_qos_extracted)
+{
+    /* Wire: type|flags=0x82, remaining=7, packet_id=0x0001, props_len=0x00,
+     *       topic_len=0x0001, "a", options=0x2D. */
+    byte rx_buf[] = {
+        0x82, 0x07,
+        0x00, 0x01,
+        0x00,
+        0x00, 0x01,
+        0x61,
+        0x2D
+    };
+    MqttSubscribe sub;
+    MqttTopic topic_arr[1];
+    int rc;
+
+    XMEMSET(&sub, 0, sizeof(sub));
+    XMEMSET(topic_arr, 0, sizeof(topic_arr));
+    sub.topics = topic_arr;
+    sub.protocol_level = MQTT_CONNECT_PROTOCOL_LEVEL_5;
+    rc = MqttDecode_Subscribe(rx_buf, (int)sizeof(rx_buf), &sub);
+    ASSERT_TRUE(rc > 0);
+    ASSERT_EQ(1, sub.packet_id);
+    ASSERT_EQ(1, sub.topic_count);
+    ASSERT_EQ(MQTT_QOS_1, topic_arr[0].qos);
+}
+#endif /* WOLFMQTT_V5 */
+#endif /* WOLFMQTT_BROKER */
+
+/* ============================================================================
  * QoS 2 next-ack arithmetic (PUBLISH_REC -> REL -> COMP)
  * ============================================================================ */
 
@@ -1370,6 +1498,9 @@ void run_mqtt_packet_tests(void)
     RUN_TEST(encode_subscribe_packet_id_zero);
     RUN_TEST(encode_subscribe_valid);
     RUN_TEST(encode_subscribe_fixed_header_flags);
+    RUN_TEST(encode_subscribe_options_byte_qos0);
+    RUN_TEST(encode_subscribe_options_byte_qos1);
+    RUN_TEST(encode_subscribe_options_byte_qos2);
 
     /* MqttEncode_Unsubscribe */
     RUN_TEST(encode_unsubscribe_packet_id_zero);
@@ -1395,6 +1526,12 @@ void run_mqtt_packet_tests(void)
     RUN_TEST(decode_connect_wrong_protocol_name);
     RUN_TEST(decode_connect_wrong_protocol_length);
     RUN_TEST(decode_connect_v311_with_lwt);
+
+    /* MqttDecode_Subscribe */
+    RUN_TEST(decode_subscribe_v311_single_topic);
+#ifdef WOLFMQTT_V5
+    RUN_TEST(decode_subscribe_v5_options_byte_qos_extracted);
+#endif
 #endif
 
     /* QoS 2 ack arithmetic */
