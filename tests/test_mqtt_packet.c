@@ -899,6 +899,162 @@ TEST(encode_connect_flags_lwt_qos1_retain)
 }
 
 /* ============================================================================
+ * MqttDecode_Connect (broker-side)
+ * ============================================================================ */
+
+#ifdef WOLFMQTT_BROKER
+/* (a) Valid v3.1.1 CONNECT with username + password: decoder must surface both
+ * credential strings and the session/keep-alive fields. */
+TEST(decode_connect_v311_username_password)
+{
+    byte buf[256];
+    MqttConnect enc, dec;
+    int enc_len, dec_len;
+
+    XMEMSET(&enc, 0, sizeof(enc));
+    enc.protocol_level = MQTT_CONNECT_PROTOCOL_LEVEL_4;
+    enc.client_id      = "test_client";
+    enc.username       = "user";
+    enc.password       = "pass";
+    enc.clean_session  = 1;
+    enc.keep_alive_sec = 60;
+
+    enc_len = MqttEncode_Connect(buf, (int)sizeof(buf), &enc);
+    ASSERT_TRUE(enc_len > 0);
+
+    XMEMSET(&dec, 0, sizeof(dec));
+    dec_len = MqttDecode_Connect(buf, enc_len, &dec);
+    ASSERT_EQ(enc_len, dec_len);
+    ASSERT_EQ(MQTT_CONNECT_PROTOCOL_LEVEL_4, dec.protocol_level);
+    ASSERT_EQ(1, dec.clean_session);
+    ASSERT_EQ(0, dec.enable_lwt);
+    ASSERT_EQ(60, dec.keep_alive_sec);
+    ASSERT_NOT_NULL(dec.client_id);
+    ASSERT_EQ(0, XMEMCMP(dec.client_id, "test_client",
+                         XSTRLEN("test_client")));
+    ASSERT_NOT_NULL(dec.username);
+    ASSERT_EQ(0, XMEMCMP(dec.username, "user", 4));
+    ASSERT_NOT_NULL(dec.password);
+    ASSERT_EQ(0, XMEMCMP(dec.password, "pass", 4));
+}
+
+/* (b) CONNECT with USERNAME/PASSWORD flags clear: decoder must NULL the
+ * credential fields so the caller never observes uninitialized rx_buf
+ * bytes as credentials. Pre-poison the struct to make the clearing visible. */
+TEST(decode_connect_v311_no_credentials)
+{
+    byte buf[256];
+    MqttConnect enc, dec;
+    int enc_len, dec_len;
+
+    XMEMSET(&enc, 0, sizeof(enc));
+    enc.protocol_level = MQTT_CONNECT_PROTOCOL_LEVEL_4;
+    enc.client_id      = "c1";
+    enc.clean_session  = 1;
+
+    enc_len = MqttEncode_Connect(buf, (int)sizeof(buf), &enc);
+    ASSERT_TRUE(enc_len > 0);
+
+    XMEMSET(&dec, 0, sizeof(dec));
+    dec.username = (const char*)0x1;
+    dec.password = (const char*)0x1;
+    dec_len = MqttDecode_Connect(buf, enc_len, &dec);
+    ASSERT_EQ(enc_len, dec_len);
+    ASSERT_NULL(dec.username);
+    ASSERT_NULL(dec.password);
+}
+
+/* (c) Wrong protocol name ("MQT_" with correct length=4) must be rejected
+ * with MQTT_CODE_ERROR_MALFORMED_DATA. Catches an '||' -> '&&' mutation of
+ * the protocol-name guard, where an acceptance would require both the
+ * length and name to simultaneously be wrong. */
+TEST(decode_connect_wrong_protocol_name)
+{
+    byte buf[] = {
+        0x10, 0x10,                     /* CONNECT, remain_len = 16 */
+        0x00, 0x04,                     /* protocol name length = 4 */
+        'M', 'Q', 'T', '_',             /* WRONG protocol name */
+        0x04,                           /* protocol level = v3.1.1 */
+        0x02,                           /* flags: clean_session */
+        0x00, 0x3C,                     /* keep alive = 60 */
+        0x00, 0x04, 'c', 'i', 'd', '1'  /* client_id "cid1" */
+    };
+    MqttConnect dec;
+    int rc;
+
+    XMEMSET(&dec, 0, sizeof(dec));
+    rc = MqttDecode_Connect(buf, (int)sizeof(buf), &dec);
+    ASSERT_EQ(MQTT_CODE_ERROR_MALFORMED_DATA, rc);
+}
+
+/* (d) Wrong protocol length (3 instead of 4) must be rejected with
+ * MQTT_CODE_ERROR_MALFORMED_DATA. Paired with (c) this covers both sides
+ * of the length/name disjunction. */
+TEST(decode_connect_wrong_protocol_length)
+{
+    byte buf[] = {
+        0x10, 0x10,
+        0x00, 0x03,                     /* WRONG protocol name length = 3 */
+        'M', 'Q', 'T', 'T',
+        0x04,
+        0x02,
+        0x00, 0x3C,
+        0x00, 0x04, 'c', 'i', 'd', '1'
+    };
+    MqttConnect dec;
+    int rc;
+
+    XMEMSET(&dec, 0, sizeof(dec));
+    rc = MqttDecode_Connect(buf, (int)sizeof(buf), &dec);
+    ASSERT_EQ(MQTT_CODE_ERROR_MALFORMED_DATA, rc);
+}
+
+/* (e) CONNECT with WILL_FLAG set: decoder must set enable_lwt=1 and populate
+ * lwt_msg topic/payload/qos/retain from the flags and payload. Catches a
+ * mutation that flips the enable_lwt boolean, which would drop LWT decoding
+ * entirely. */
+TEST(decode_connect_v311_with_lwt)
+{
+    byte buf[256];
+    byte lwt_payload[] = { 'b', 'y', 'e' };
+    MqttConnect enc, dec;
+    MqttMessage enc_lwt, dec_lwt;
+    int enc_len, dec_len;
+
+    XMEMSET(&enc, 0, sizeof(enc));
+    XMEMSET(&enc_lwt, 0, sizeof(enc_lwt));
+    enc.protocol_level = MQTT_CONNECT_PROTOCOL_LEVEL_4;
+    enc.client_id      = "c1";
+    enc.enable_lwt     = 1;
+    enc.lwt_msg        = &enc_lwt;
+    enc_lwt.topic_name = "will/topic";
+    enc_lwt.buffer     = lwt_payload;
+    enc_lwt.total_len  = (word32)sizeof(lwt_payload);
+    enc_lwt.qos        = MQTT_QOS_1;
+    enc_lwt.retain     = 1;
+
+    enc_len = MqttEncode_Connect(buf, (int)sizeof(buf), &enc);
+    ASSERT_TRUE(enc_len > 0);
+
+    XMEMSET(&dec, 0, sizeof(dec));
+    XMEMSET(&dec_lwt, 0, sizeof(dec_lwt));
+    dec.lwt_msg = &dec_lwt;
+    dec_len = MqttDecode_Connect(buf, enc_len, &dec);
+    ASSERT_EQ(enc_len, dec_len);
+    ASSERT_EQ(1, dec.enable_lwt);
+    ASSERT_EQ((int)MQTT_QOS_1, (int)dec_lwt.qos);
+    ASSERT_EQ(1, dec_lwt.retain);
+    ASSERT_EQ((int)XSTRLEN("will/topic"), (int)dec_lwt.topic_name_len);
+    ASSERT_EQ(0, XMEMCMP(dec_lwt.topic_name, "will/topic",
+                         XSTRLEN("will/topic")));
+    ASSERT_EQ((word32)sizeof(lwt_payload), dec_lwt.total_len);
+    ASSERT_EQ((word32)sizeof(lwt_payload), dec_lwt.buffer_len);
+    ASSERT_NOT_NULL(dec_lwt.buffer);
+    ASSERT_EQ(0, XMEMCMP(dec_lwt.buffer, lwt_payload, sizeof(lwt_payload)));
+}
+#endif /* WOLFMQTT_BROKER */
+
+/* ============================================================================
  * QoS 2 next-ack arithmetic (PUBLISH_REC -> REL -> COMP)
  * ============================================================================ */
 
@@ -1231,6 +1387,15 @@ void run_mqtt_packet_tests(void)
     RUN_TEST(encode_connect_flags_clean_session_only);
     RUN_TEST(encode_connect_flags_username_only);
     RUN_TEST(encode_connect_flags_lwt_qos1_retain);
+
+#ifdef WOLFMQTT_BROKER
+    /* MqttDecode_Connect */
+    RUN_TEST(decode_connect_v311_username_password);
+    RUN_TEST(decode_connect_v311_no_credentials);
+    RUN_TEST(decode_connect_wrong_protocol_name);
+    RUN_TEST(decode_connect_wrong_protocol_length);
+    RUN_TEST(decode_connect_v311_with_lwt);
+#endif
 
     /* QoS 2 ack arithmetic */
     RUN_TEST(qos2_ack_arithmetic);
