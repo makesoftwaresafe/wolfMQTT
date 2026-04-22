@@ -132,7 +132,7 @@ int SN_Decode_Header(byte *rx_buf, int rx_buf_len,
             case SN_MSG_TYPE_REGACK:
             case SN_MSG_TYPE_PUBACK:
                 if (rx_buf_len < 3) {
-                    MQTT_TRACE_ERROR(MQTT_CODE_ERROR_BAD_ARG);
+                    return MQTT_TRACE_ERROR(MQTT_CODE_ERROR_BAD_ARG);
                 }
                 /* octet 4-5 */
                 rc = MqttDecode_Num(rx_buf + 2, p_packet_id,
@@ -154,7 +154,7 @@ int SN_Decode_Header(byte *rx_buf, int rx_buf_len,
                 break;
             case SN_MSG_TYPE_SUBACK:
                 if (rx_buf_len < 4) {
-                    MQTT_TRACE_ERROR(MQTT_CODE_ERROR_BAD_ARG);
+                    return MQTT_TRACE_ERROR(MQTT_CODE_ERROR_BAD_ARG);
                 }
                 /* octet 5-6 */
                 rc = MqttDecode_Num(rx_buf + 3, p_packet_id,
