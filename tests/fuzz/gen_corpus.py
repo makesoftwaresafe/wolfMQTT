@@ -180,6 +180,11 @@ def main():
                connect + gen_subscribe("test/#"))
     write_seed("seq_connect_subscribe_wildcard.bin",
                connect + gen_subscribe("+/data/#"))
+    # SUBSCRIBE options byte with QoS bits = 0b11 (reserved). Exercises the
+    # BrokerHandle_Subscribe cap that clamps surfaced QoS=3 down to QoS 2
+    # before BrokerSubs_Add / SUBACK.
+    write_seed("seq_connect_subscribe_qos3.bin",
+               connect + gen_subscribe("test/#", qos=3))
     write_seed("seq_connect_unsubscribe.bin",
                connect + gen_unsubscribe("test/#"))
     write_seed("seq_connect_pingreq.bin",

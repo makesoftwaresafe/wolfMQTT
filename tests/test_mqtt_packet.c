@@ -1408,6 +1408,34 @@ TEST(decode_subscribe_v311_single_topic)
     ASSERT_EQ(0, XMEMCMP(topic_arr[0].topic_filter, "a", 1));
 }
 
+/* Options byte QoS bits (0-1) = 0b11 is reserved. The decoder forwards the
+ * raw value verbatim (options & 0x03 == 3), so the broker's
+ * BrokerHandle_Subscribe cap at MQTT_QOS_2 is the only thing preventing
+ * QoS=3 from propagating into BrokerSubs_Add / the SUBACK return code.
+ * This test pins the precondition: if the decoder ever starts rejecting
+ * QoS=3, the broker cap becomes dead code and this test will flag it. */
+TEST(decode_subscribe_v311_qos3_reserved)
+{
+    byte rx_buf[] = {
+        0x82, 0x06,
+        0x00, 0x01,
+        0x00, 0x01,
+        0x61,
+        0x03
+    };
+    MqttSubscribe sub;
+    MqttTopic topic_arr[1];
+    int rc;
+
+    XMEMSET(&sub, 0, sizeof(sub));
+    XMEMSET(topic_arr, 0, sizeof(topic_arr));
+    sub.topics = topic_arr;
+    rc = MqttDecode_Subscribe(rx_buf, (int)sizeof(rx_buf), &sub);
+    ASSERT_TRUE(rc > 0);
+    ASSERT_EQ(1, sub.topic_count);
+    ASSERT_EQ(MQTT_QOS_3, topic_arr[0].qos);
+}
+
 #ifdef WOLFMQTT_V5
 /* [MQTT-3.8.3] v5 SUBSCRIBE options byte carries QoS (bits 0-1), No Local
  * (bit 2), Retain As Published (bit 3), and Retain Handling (bits 4-5).
@@ -1916,6 +1944,7 @@ void run_mqtt_packet_tests(void)
 
     /* MqttDecode_Subscribe */
     RUN_TEST(decode_subscribe_v311_single_topic);
+    RUN_TEST(decode_subscribe_v311_qos3_reserved);
 #ifdef WOLFMQTT_V5
     RUN_TEST(decode_subscribe_v5_options_byte_qos_extracted);
 #endif
