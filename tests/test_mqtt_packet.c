@@ -804,6 +804,28 @@ TEST(encode_subscribe_topic_filter_oversized_rejected)
     ASSERT_TRUE(rc < 0);
 }
 
+/* [MQTT-3.8.1-1] SUBSCRIBE fixed header reserved flags MUST equal 0b0010,
+ * which encodes QoS 1. Verifies the QoS 1 bit directly via
+ * MQTT_PACKET_FLAGS_GET_QOS so a mutation of MQTT_QOS_1 to MQTT_QOS_0 in
+ * MqttEncode_Subscribe's call to MqttEncode_FixedHeader is detected. */
+TEST(encode_subscribe_has_qos1_flag)
+{
+    byte tx_buf[256];
+    MqttSubscribe sub;
+    MqttTopic topic;
+    int rc;
+
+    XMEMSET(&sub, 0, sizeof(sub));
+    XMEMSET(&topic, 0, sizeof(topic));
+    topic.topic_filter = "test/topic";
+    sub.topics = &topic;
+    sub.topic_count = 1;
+    sub.packet_id = 1;
+    rc = MqttEncode_Subscribe(tx_buf, (int)sizeof(tx_buf), &sub);
+    ASSERT_TRUE(rc > 0);
+    ASSERT_EQ(MQTT_QOS_1, MQTT_PACKET_FLAGS_GET_QOS(tx_buf[0]));
+}
+
 /* ============================================================================
  * MqttEncode_Unsubscribe
  * ============================================================================ */
@@ -930,6 +952,28 @@ TEST(encode_unsubscribe_topic_filter_oversized_second_rejected)
     WOLFMQTT_FREE(filter);
     WOLFMQTT_FREE(tx_buf);
     ASSERT_TRUE(rc < 0);
+}
+
+/* [MQTT-3.10.1-1] UNSUBSCRIBE fixed header reserved flags MUST equal 0b0010,
+ * which encodes QoS 1. Verifies the QoS 1 bit directly via
+ * MQTT_PACKET_FLAGS_GET_QOS so a mutation of MQTT_QOS_1 to MQTT_QOS_0 in
+ * MqttEncode_Unsubscribe's call to MqttEncode_FixedHeader is detected. */
+TEST(encode_unsubscribe_has_qos1_flag)
+{
+    byte tx_buf[256];
+    MqttUnsubscribe unsub;
+    MqttTopic topic;
+    int rc;
+
+    XMEMSET(&unsub, 0, sizeof(unsub));
+    XMEMSET(&topic, 0, sizeof(topic));
+    topic.topic_filter = "test/topic";
+    unsub.topics = &topic;
+    unsub.topic_count = 1;
+    unsub.packet_id = 1;
+    rc = MqttEncode_Unsubscribe(tx_buf, (int)sizeof(tx_buf), &unsub);
+    ASSERT_TRUE(rc > 0);
+    ASSERT_EQ(MQTT_QOS_1, MQTT_PACKET_FLAGS_GET_QOS(tx_buf[0]));
 }
 
 /* ============================================================================
@@ -2039,6 +2083,7 @@ void run_mqtt_packet_tests(void)
     RUN_TEST(encode_subscribe_options_byte_qos1);
     RUN_TEST(encode_subscribe_options_byte_qos2);
     RUN_TEST(encode_subscribe_topic_filter_oversized_rejected);
+    RUN_TEST(encode_subscribe_has_qos1_flag);
 
     /* MqttEncode_Unsubscribe */
     RUN_TEST(encode_unsubscribe_packet_id_zero);
@@ -2046,6 +2091,7 @@ void run_mqtt_packet_tests(void)
     RUN_TEST(encode_unsubscribe_fixed_header_flags);
     RUN_TEST(encode_unsubscribe_topic_filter_oversized_rejected);
     RUN_TEST(encode_unsubscribe_topic_filter_oversized_second_rejected);
+    RUN_TEST(encode_unsubscribe_has_qos1_flag);
 
     /* MqttEncode_Connect */
     RUN_TEST(encode_connect_password_without_username);
