@@ -840,6 +840,75 @@ TEST(encode_unsubscribe_fixed_header_flags)
     ASSERT_EQ(0x2, (int)MQTT_PACKET_FLAGS_GET(tx_buf[0]));
 }
 
+/* topic_filter with strlen > 65535 must be rejected with a negative
+ * return. Guards the unchecked tx_payload += MqttEncode_String(...) in the
+ * UNSUBSCRIBE payload loop. */
+TEST(encode_unsubscribe_topic_filter_oversized_rejected)
+{
+    const int str_len = 0x10000; /* one byte past MQTT UTF-8 limit */
+    const int buf_len = str_len + 64;
+    byte *tx_buf = (byte*)WOLFMQTT_MALLOC(buf_len);
+    char *filter = (char*)WOLFMQTT_MALLOC(str_len + 1);
+    MqttUnsubscribe unsub;
+    MqttTopic topic;
+    int rc;
+
+    if (tx_buf == NULL || filter == NULL) {
+        WOLFMQTT_FREE(tx_buf);
+        WOLFMQTT_FREE(filter);
+        FAIL("allocation failed");
+    }
+    XMEMSET(filter, 'A', str_len);
+    filter[str_len] = '\0';
+
+    XMEMSET(&unsub, 0, sizeof(unsub));
+    XMEMSET(&topic, 0, sizeof(topic));
+    topic.topic_filter = filter;
+    unsub.topics = &topic;
+    unsub.topic_count = 1;
+    unsub.packet_id = 1;
+    rc = MqttEncode_Unsubscribe(tx_buf, buf_len, &unsub);
+
+    WOLFMQTT_FREE(filter);
+    WOLFMQTT_FREE(tx_buf);
+    ASSERT_TRUE(rc < 0);
+}
+
+/* when multiple topics are supplied and a later one is oversized,
+ * the encoder must still reject — the length-validation loop covers every
+ * entry, not just the first. */
+TEST(encode_unsubscribe_topic_filter_oversized_second_rejected)
+{
+    const int str_len = 0x10000;
+    const int buf_len = str_len + 128;
+    byte *tx_buf = (byte*)WOLFMQTT_MALLOC(buf_len);
+    char *filter = (char*)WOLFMQTT_MALLOC(str_len + 1);
+    MqttUnsubscribe unsub;
+    MqttTopic topics[2];
+    int rc;
+
+    if (tx_buf == NULL || filter == NULL) {
+        WOLFMQTT_FREE(tx_buf);
+        WOLFMQTT_FREE(filter);
+        FAIL("allocation failed");
+    }
+    XMEMSET(filter, 'B', str_len);
+    filter[str_len] = '\0';
+
+    XMEMSET(&unsub, 0, sizeof(unsub));
+    XMEMSET(topics, 0, sizeof(topics));
+    topics[0].topic_filter = "ok/topic";
+    topics[1].topic_filter = filter;
+    unsub.topics = topics;
+    unsub.topic_count = 2;
+    unsub.packet_id = 1;
+    rc = MqttEncode_Unsubscribe(tx_buf, buf_len, &unsub);
+
+    WOLFMQTT_FREE(filter);
+    WOLFMQTT_FREE(tx_buf);
+    ASSERT_TRUE(rc < 0);
+}
+
 /* ============================================================================
  * MqttEncode_Connect
  * ============================================================================ */
@@ -1699,6 +1768,8 @@ void run_mqtt_packet_tests(void)
     RUN_TEST(encode_unsubscribe_packet_id_zero);
     RUN_TEST(encode_unsubscribe_valid);
     RUN_TEST(encode_unsubscribe_fixed_header_flags);
+    RUN_TEST(encode_unsubscribe_topic_filter_oversized_rejected);
+    RUN_TEST(encode_unsubscribe_topic_filter_oversized_second_rejected);
 
     /* MqttEncode_Connect */
     RUN_TEST(encode_connect_password_without_username);
