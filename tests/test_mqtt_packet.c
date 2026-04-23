@@ -161,6 +161,29 @@ TEST(encode_vbi_null_buf)
     ASSERT_EQ(4, MqttEncode_Vbi(NULL, 2097152));
 }
 
+/* [MQTT-2.2.3] Values above 268,435,455 must be rejected. Without the guard,
+ * the encoding loop's rc < 4 terminator would silently truncate the value
+ * to 4 bytes and produce a valid-looking but incorrect encoding. */
+TEST(encode_vbi_overflow_above_max)
+{
+    byte buf[4];
+    int rc = MqttEncode_Vbi(buf, 268435456);
+    ASSERT_EQ(MQTT_CODE_ERROR_MALFORMED_DATA, rc);
+}
+
+TEST(encode_vbi_overflow_u32_max)
+{
+    byte buf[4];
+    int rc = MqttEncode_Vbi(buf, 0xFFFFFFFF);
+    ASSERT_EQ(MQTT_CODE_ERROR_MALFORMED_DATA, rc);
+}
+
+TEST(encode_vbi_overflow_null_buf)
+{
+    int rc = MqttEncode_Vbi(NULL, 268435456);
+    ASSERT_EQ(MQTT_CODE_ERROR_MALFORMED_DATA, rc);
+}
+
 TEST(decode_vbi_one_byte_zero)
 {
     byte buf[1] = { 0x00 };
@@ -1864,6 +1887,9 @@ void run_mqtt_packet_tests(void)
     RUN_TEST(encode_vbi_three_bytes);
     RUN_TEST(encode_vbi_four_bytes);
     RUN_TEST(encode_vbi_null_buf);
+    RUN_TEST(encode_vbi_overflow_above_max);
+    RUN_TEST(encode_vbi_overflow_u32_max);
+    RUN_TEST(encode_vbi_overflow_null_buf);
     RUN_TEST(decode_vbi_one_byte_zero);
     RUN_TEST(decode_vbi_one_byte_max);
     RUN_TEST(decode_vbi_two_bytes_min);
