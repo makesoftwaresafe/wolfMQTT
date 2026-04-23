@@ -804,6 +804,41 @@ TEST(encode_subscribe_topic_filter_oversized_rejected)
     ASSERT_TRUE(rc < 0);
 }
 
+/* when multiple topics are supplied and a later one is oversized,
+ * the encoder must still reject — the length-validation loop covers every
+ * entry, not just the first. */
+TEST(encode_subscribe_topic_filter_oversized_second_rejected)
+{
+    const int str_len = 0x10000;
+    const int buf_len = str_len + 128;
+    byte *tx_buf = (byte*)WOLFMQTT_MALLOC(buf_len);
+    char *filter = (char*)WOLFMQTT_MALLOC(str_len + 1);
+    MqttSubscribe sub;
+    MqttTopic topics[2];
+    int rc;
+
+    if (tx_buf == NULL || filter == NULL) {
+        WOLFMQTT_FREE(tx_buf);
+        WOLFMQTT_FREE(filter);
+        FAIL("allocation failed");
+    }
+    XMEMSET(filter, 'B', str_len);
+    filter[str_len] = '\0';
+
+    XMEMSET(&sub, 0, sizeof(sub));
+    XMEMSET(topics, 0, sizeof(topics));
+    topics[0].topic_filter = "ok/topic";
+    topics[1].topic_filter = filter;
+    sub.topics = topics;
+    sub.topic_count = 2;
+    sub.packet_id = 1;
+    rc = MqttEncode_Subscribe(tx_buf, buf_len, &sub);
+
+    WOLFMQTT_FREE(filter);
+    WOLFMQTT_FREE(tx_buf);
+    ASSERT_TRUE(rc < 0);
+}
+
 /* [MQTT-3.8.1-1] SUBSCRIBE fixed header reserved flags MUST equal 0b0010,
  * which encodes QoS 1. Verifies the QoS 1 bit directly via
  * MQTT_PACKET_FLAGS_GET_QOS so a mutation of MQTT_QOS_1 to MQTT_QOS_0 in
@@ -2027,7 +2062,7 @@ TEST(auth_v5_invalid_reason_code_rejected)
 
     XMEMSET(&dec, 0, sizeof(dec));
     dec_len = MqttDecode_Auth(buf, 4, &dec);
-    ASSERT_TRUE(dec_len < 0);
+    ASSERT_EQ(MQTT_CODE_ERROR_MALFORMED_DATA, dec_len);
 }
 #endif /* WOLFMQTT_V5 */
 
@@ -2109,6 +2144,7 @@ void run_mqtt_packet_tests(void)
     RUN_TEST(encode_subscribe_options_byte_qos1);
     RUN_TEST(encode_subscribe_options_byte_qos2);
     RUN_TEST(encode_subscribe_topic_filter_oversized_rejected);
+    RUN_TEST(encode_subscribe_topic_filter_oversized_second_rejected);
     RUN_TEST(encode_subscribe_has_qos1_flag);
 
     /* MqttEncode_Unsubscribe */
