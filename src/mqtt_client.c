@@ -1725,6 +1725,10 @@ int MqttClient_Connect(MqttClient *client, MqttConnect *mc_connect)
             MQTT_PACKET_TYPE_CONNECT, 0, 0);
     #endif
         if (rc <= 0) {
+            /* Encode failed: tx_buf may hold partial plaintext credentials.
+             * Zero the full buffer before MqttWriteStop releases lockSend
+             * so no other thread can see residual data. */
+            CLIENT_FORCE_ZERO(client->tx_buf, client->tx_buf_len);
             MqttWriteStop(client, &mc_connect->stat);
             return rc;
         }
@@ -1741,9 +1745,11 @@ int MqttClient_Connect(MqttClient *client, MqttConnect *mc_connect)
         if (rc != 0) {
             /* Save write.len before MqttWriteStop zeroes client->write */
             int xfer = client->write.len;
-            MqttWriteStop(client, &mc_connect->stat);
-            /* Clear tx_buf to remove plaintext credentials before returning */
+            /* Clear tx_buf to remove plaintext credentials BEFORE
+             * MqttWriteStop releases lockSend, so another thread cannot
+             * race in and repopulate tx_buf before it is scrubbed. */
             CLIENT_FORCE_ZERO(client->tx_buf, xfer);
+            MqttWriteStop(client, &mc_connect->stat);
             return rc; /* Error locking client */
         }
     #endif
@@ -1766,11 +1772,12 @@ int MqttClient_Connect(MqttClient *client, MqttConnect *mc_connect)
             return rc;
         }
     #endif
-        MqttWriteStop(client, &mc_connect->stat);
-
-        /* Clear tx_buf to remove any plaintext credentials from memory.
-         * Use xfer (saved before MqttWriteStop zeroes client->write) */
+        /* Clear tx_buf to remove any plaintext credentials from memory
+         * BEFORE MqttWriteStop releases lockSend, so another thread cannot
+         * race in and populate tx_buf before it is scrubbed.
+         * Use xfer (saved before MqttWriteStop zeroes client->write). */
         CLIENT_FORCE_ZERO(client->tx_buf, xfer);
+        MqttWriteStop(client, &mc_connect->stat);
 
         if (rc != xfer) {
             MqttClient_CancelMessage(client, (MqttObject*)mc_connect);
@@ -2750,6 +2757,10 @@ int MqttClient_Auth(MqttClient *client, MqttAuth* auth)
             MQTT_PACKET_TYPE_AUTH, 0, 0);
     #endif
         if (rc <= 0) {
+            /* Encode failed: tx_buf may hold partial SASL auth data.
+             * Zero the full buffer before MqttWriteStop releases lockSend
+             * so no other thread can see residual data. */
+            CLIENT_FORCE_ZERO(client->tx_buf, client->tx_buf_len);
             MqttWriteStop(client, &auth->stat);
             return rc;
         }
@@ -2766,9 +2777,11 @@ int MqttClient_Auth(MqttClient *client, MqttAuth* auth)
         if (rc != 0) {
             /* Save write.len before MqttWriteStop zeroes client->write */
             int xfer = client->write.len;
-            MqttWriteStop(client, &auth->stat);
-            /* Clear tx_buf to remove SASL auth data before returning */
+            /* Clear tx_buf to remove SASL auth data BEFORE MqttWriteStop
+             * releases lockSend, to prevent a racing thread from
+             * repopulating tx_buf before it is scrubbed. */
             CLIENT_FORCE_ZERO(client->tx_buf, xfer);
+            MqttWriteStop(client, &auth->stat);
             return rc; /* Error locking client */
         }
     #endif
@@ -2790,11 +2803,12 @@ int MqttClient_Auth(MqttClient *client, MqttAuth* auth)
             return rc;
         }
     #endif
-        MqttWriteStop(client, &auth->stat);
-
-        /* Clear tx_buf to remove any SASL auth data from memory.
-         * Use xfer (saved before MqttWriteStop zeroes client->write) */
+        /* Clear tx_buf to remove any SASL auth data from memory BEFORE
+         * MqttWriteStop releases lockSend, to prevent a racing thread
+         * from populating tx_buf before it is scrubbed.
+         * Use xfer (saved before MqttWriteStop zeroes client->write). */
         CLIENT_FORCE_ZERO(client->tx_buf, xfer);
+        MqttWriteStop(client, &auth->stat);
 
         if (rc != xfer) {
             MqttClient_CancelMessage(client, (MqttObject*)auth);

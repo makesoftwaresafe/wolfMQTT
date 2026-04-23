@@ -3393,11 +3393,6 @@ static int BrokerHandle_PublishRel(BrokerClient* bc, int rx_len)
             (int)bc->sock, resp.packet_id);
         rc = MqttPacket_Write(&bc->client, bc->tx_buf, rc);
     }
-#ifdef WOLFMQTT_V5
-    if (resp.props) {
-        (void)MqttProps_Free(resp.props);
-    }
-#endif
     return rc;
 }
 
@@ -3434,11 +3429,6 @@ static int BrokerHandle_PublishRec(BrokerClient* bc, int rx_len)
             (int)bc->sock, resp.packet_id);
         rc = MqttPacket_Write(&bc->client, bc->tx_buf, rc);
     }
-#ifdef WOLFMQTT_V5
-    if (resp.props) {
-        (void)MqttProps_Free(resp.props);
-    }
-#endif
     return rc;
 }
 
@@ -3875,6 +3865,25 @@ int MqttBroker_Start(MqttBroker* broker)
 
 #ifdef WOLFMQTT_BROKER_AUTH
     if (broker->auth_user || broker->auth_pass) {
+        /* Reject configured credentials that would be silently rejected
+         * by BrokerStrCompare's cmp_len guard. Catching this at startup
+         * avoids a confusing state where every client auth fails. */
+        if (broker->auth_user &&
+                XSTRLEN(broker->auth_user) >= BROKER_MAX_USERNAME_LEN) {
+            WBLOG_ERR(broker,
+                "broker: auth_user length %u >= BROKER_MAX_USERNAME_LEN (%d)",
+                (unsigned)XSTRLEN(broker->auth_user),
+                BROKER_MAX_USERNAME_LEN);
+            return MQTT_CODE_ERROR_BAD_ARG;
+        }
+        if (broker->auth_pass &&
+                XSTRLEN(broker->auth_pass) >= BROKER_MAX_PASSWORD_LEN) {
+            WBLOG_ERR(broker,
+                "broker: auth_pass length %u >= BROKER_MAX_PASSWORD_LEN (%d)",
+                (unsigned)XSTRLEN(broker->auth_pass),
+                BROKER_MAX_PASSWORD_LEN);
+            return MQTT_CODE_ERROR_BAD_ARG;
+        }
         WBLOG_INFO(broker, "broker: auth enabled user=%s",
             broker->auth_user ? broker->auth_user : "(null)");
     #ifdef ENABLE_MQTT_TLS
@@ -4187,7 +4196,7 @@ int wolfmqtt_broker(int argc, char** argv)
             if (rc == MQTT_CODE_CONTINUE) {
                 BROKER_SLEEP_MS(10);
             }
-            else if (rc < 0 && rc != MQTT_CODE_CONTINUE) {
+            else if (rc < 0) {
                 break;
             }
         }
