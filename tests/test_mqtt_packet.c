@@ -1522,11 +1522,34 @@ TEST(decode_suback_valid)
     buf[1] = 3;
     buf[2] = 0;
     buf[3] = 1;
-    buf[4] = 0;
+    buf[4] = MQTT_QOS_2;
     XMEMSET(&ack, 0, sizeof(ack));
     rc = MqttDecode_SubscribeAck(buf, 5, &ack);
     ASSERT_TRUE(rc > 0);
     ASSERT_EQ(1, ack.packet_id);
+    ASSERT_EQ(MQTT_QOS_2, ack.return_codes[0]);
+}
+
+TEST(decode_suback_multiple_return_codes)
+{
+    byte buf[7];
+    MqttSubscribeAck ack;
+    int rc;
+
+    buf[0] = MQTT_PACKET_TYPE_SET(MQTT_PACKET_TYPE_SUBSCRIBE_ACK);
+    buf[1] = 5;
+    buf[2] = 0;
+    buf[3] = 1;
+    buf[4] = MQTT_QOS_1;
+    buf[5] = MQTT_QOS_2;
+    buf[6] = MQTT_SUBSCRIBE_ACK_CODE_FAILURE;
+    XMEMSET(&ack, 0, sizeof(ack));
+    rc = MqttDecode_SubscribeAck(buf, 7, &ack);
+    ASSERT_TRUE(rc > 0);
+    ASSERT_EQ(1, ack.packet_id);
+    ASSERT_EQ(MQTT_QOS_1, ack.return_codes[0]);
+    ASSERT_EQ(MQTT_QOS_2, ack.return_codes[1]);
+    ASSERT_EQ(MQTT_SUBSCRIBE_ACK_CODE_FAILURE, ack.return_codes[2]);
 }
 
 TEST(decode_suback_malformed_remain_len_zero)
@@ -2061,6 +2084,7 @@ void run_mqtt_packet_tests(void)
 
     /* MqttDecode_SubscribeAck */
     RUN_TEST(decode_suback_valid);
+    RUN_TEST(decode_suback_multiple_return_codes);
     RUN_TEST(decode_suback_malformed_remain_len_zero);
     RUN_TEST(decode_suback_malformed_remain_len_one);
 
