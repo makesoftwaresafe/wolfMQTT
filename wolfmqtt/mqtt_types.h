@@ -203,6 +203,14 @@ enum MqttPacketResponseCodes {
                                  * a network, memory, TLS, or system error. */
 #endif
     MQTT_CODE_ERROR_PROPERTY_MISMATCH = -17,
+    MQTT_CODE_ERROR_CONNECT_REFUSED = -18, /* Broker rejected the CONNECT;
+                                              see MqttConnect.ack.return_code
+                                              for the specific reason. */
+    MQTT_CODE_ERROR_SUBSCRIBE_REJECTED = -19, /* Broker rejected one or more
+                                                 topic filters in a SUBSCRIBE;
+                                                 see each
+                                                 MqttTopic.return_code for the
+                                                 per-filter result. */
 
     MQTT_CODE_CONTINUE = -101,
     MQTT_CODE_STDIN_WAKE = -102,

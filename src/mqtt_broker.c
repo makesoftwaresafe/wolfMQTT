@@ -131,17 +131,20 @@
 #endif
 
 #ifdef WOLFMQTT_BROKER_AUTH
-/* Constant-time string comparison to prevent timing attacks on auth.
- * Compares all bytes regardless of where differences occur.
- * Returns 0 if equal, non-zero if different. */
-static int BrokerStrCompare(const char* a, const char* b)
+/* Constant-time string comparison for authentication.
+ * Iterates exactly cmp_len times so loop duration is independent of
+ * either input's length; cmp_len is a caller-supplied fixed bound
+ * (the credential buffer size). Length mismatch is folded in via the
+ * final XOR. Inputs with length >= cmp_len force a mismatch to prevent
+ * bypass when both strings match in the first cmp_len bytes but differ
+ * beyond. Returns 0 if equal, non-zero if different. */
+static int BrokerStrCompare(const char* a, const char* b, int cmp_len)
 {
     int result = 0;
     int len_a = (int)XSTRLEN(a);
     int len_b = (int)XSTRLEN(b);
-    int max_len = (len_a > len_b) ? len_a : len_b;
     int i;
-    for (i = 0; i < max_len; i++) {
+    for (i = 0; i < cmp_len; i++) {
         /* Branchless index clamp: when i >= len, reads position 0.
          * Length mismatch is caught by the final XOR below. */
         unsigned int maskA = 0u - (unsigned int)(i < len_a);
@@ -151,6 +154,10 @@ static int BrokerStrCompare(const char* a, const char* b)
         result |= (a[ia] ^ b[ib]);
     }
     result |= (len_a ^ len_b);
+    /* Force mismatch if either input meets or exceeds cmp_len, since the
+     * loop cannot observe bytes beyond that bound. */
+    result |= (len_a >= cmp_len);
+    result |= (len_b >= cmp_len);
     return result;
 }
 #endif /* WOLFMQTT_BROKER_AUTH */
@@ -1240,9 +1247,11 @@ static void BrokerClient_Free(BrokerClient* bc)
     }
 #endif
     if (bc->tx_buf) {
+        BROKER_FORCE_ZERO(bc->tx_buf, bc->tx_buf_len);
         WOLFMQTT_FREE(bc->tx_buf);
     }
     if (bc->rx_buf) {
+        BROKER_FORCE_ZERO(bc->rx_buf, bc->rx_buf_len);
         WOLFMQTT_FREE(bc->rx_buf);
     }
     WOLFMQTT_FREE(bc);
@@ -1847,6 +1856,7 @@ static int BrokerRetained_Store(MqttBroker* broker, const char* topic,
 #else
     {
         byte is_new = 0;
+        byte* new_payload = NULL;
         BrokerRetainedMsg* cur = broker->retained;
         while (cur) {
             if (cur->topic != NULL && XSTRCMP(cur->topic, topic) == 0) {
@@ -1855,16 +1865,8 @@ static int BrokerRetained_Store(MqttBroker* broker, const char* topic,
             }
             cur = cur->next;
         }
-        if (msg != NULL) {
-            /* Replace existing: free old payload */
-            if (msg->payload) {
-                WOLFMQTT_FREE(msg->payload);
-                msg->payload = NULL;
-            }
-            msg->payload_len = 0;
-        }
-        else {
-            /* Allocate new */
+        if (msg == NULL) {
+            /* Allocate new node + topic */
             int tlen = (int)XSTRLEN(topic);
             msg = (BrokerRetainedMsg*)WOLFMQTT_MALLOC(
                 sizeof(BrokerRetainedMsg));
@@ -1886,16 +1888,22 @@ static int BrokerRetained_Store(MqttBroker* broker, const char* topic,
                 is_new = 1;
             }
         }
+        /* Stage new payload in a temp; only touch the stored message after
+         * all allocations succeed, so an OOM cannot destroy the prior one. */
         if (rc == MQTT_CODE_SUCCESS && payload_len > 0 && payload != NULL) {
-            msg->payload = (byte*)WOLFMQTT_MALLOC(payload_len);
-            if (msg->payload == NULL) {
+            new_payload = (byte*)WOLFMQTT_MALLOC(payload_len);
+            if (new_payload == NULL) {
                 rc = MQTT_CODE_ERROR_MEMORY;
             }
             else {
-                XMEMCPY(msg->payload, payload, payload_len);
+                XMEMCPY(new_payload, payload, payload_len);
             }
         }
         if (rc == MQTT_CODE_SUCCESS) {
+            if (!is_new && msg->payload != NULL) {
+                WOLFMQTT_FREE(msg->payload);
+            }
+            msg->payload = new_payload;
             msg->payload_len = payload_len;
             if (is_new) {
                 msg->next = broker->retained;
@@ -2921,7 +2929,8 @@ static int BrokerHandle_Connect(BrokerClient* bc, int rx_len,
             bc->username == NULL ||
         #endif
             bc->username[0] == '\0' ||
-            BrokerStrCompare(broker->auth_user, bc->username) != 0)) {
+            BrokerStrCompare(broker->auth_user, bc->username,
+                BROKER_MAX_USERNAME_LEN) != 0)) {
             auth_ok = 0;
         }
         if (broker->auth_pass && (
@@ -2929,7 +2938,8 @@ static int BrokerHandle_Connect(BrokerClient* bc, int rx_len,
             bc->password == NULL ||
         #endif
             bc->password[0] == '\0' ||
-            BrokerStrCompare(broker->auth_pass, bc->password) != 0)) {
+            BrokerStrCompare(broker->auth_pass, bc->password,
+                BROKER_MAX_PASSWORD_LEN) != 0)) {
             auth_ok = 0;
         }
         if (!auth_ok) {
@@ -3370,6 +3380,9 @@ static int BrokerHandle_PublishRel(BrokerClient* bc, int rx_len)
     }
 
 #ifdef WOLFMQTT_V5
+    if (resp.props) {
+        (void)MqttProps_Free(resp.props);
+    }
     resp.reason_code = MQTT_REASON_SUCCESS;
     resp.props = NULL;
 #endif
@@ -3380,11 +3393,6 @@ static int BrokerHandle_PublishRel(BrokerClient* bc, int rx_len)
             (int)bc->sock, resp.packet_id);
         rc = MqttPacket_Write(&bc->client, bc->tx_buf, rc);
     }
-#ifdef WOLFMQTT_V5
-    if (resp.props) {
-        (void)MqttProps_Free(resp.props);
-    }
-#endif
     return rc;
 }
 
@@ -3408,6 +3416,9 @@ static int BrokerHandle_PublishRec(BrokerClient* bc, int rx_len)
     }
 
 #ifdef WOLFMQTT_V5
+    if (resp.props) {
+        (void)MqttProps_Free(resp.props);
+    }
     resp.reason_code = MQTT_REASON_SUCCESS;
     resp.props = NULL;
 #endif
@@ -3418,11 +3429,6 @@ static int BrokerHandle_PublishRec(BrokerClient* bc, int rx_len)
             (int)bc->sock, resp.packet_id);
         rc = MqttPacket_Write(&bc->client, bc->tx_buf, rc);
     }
-#ifdef WOLFMQTT_V5
-    if (resp.props) {
-        (void)MqttProps_Free(resp.props);
-    }
-#endif
     return rc;
 }
 
@@ -3859,6 +3865,25 @@ int MqttBroker_Start(MqttBroker* broker)
 
 #ifdef WOLFMQTT_BROKER_AUTH
     if (broker->auth_user || broker->auth_pass) {
+        /* Reject configured credentials that would be silently rejected
+         * by BrokerStrCompare's cmp_len guard. Catching this at startup
+         * avoids a confusing state where every client auth fails. */
+        if (broker->auth_user &&
+                XSTRLEN(broker->auth_user) >= BROKER_MAX_USERNAME_LEN) {
+            WBLOG_ERR(broker,
+                "broker: auth_user length %u >= BROKER_MAX_USERNAME_LEN (%d)",
+                (unsigned)XSTRLEN(broker->auth_user),
+                BROKER_MAX_USERNAME_LEN);
+            return MQTT_CODE_ERROR_BAD_ARG;
+        }
+        if (broker->auth_pass &&
+                XSTRLEN(broker->auth_pass) >= BROKER_MAX_PASSWORD_LEN) {
+            WBLOG_ERR(broker,
+                "broker: auth_pass length %u >= BROKER_MAX_PASSWORD_LEN (%d)",
+                (unsigned)XSTRLEN(broker->auth_pass),
+                BROKER_MAX_PASSWORD_LEN);
+            return MQTT_CODE_ERROR_BAD_ARG;
+        }
         WBLOG_INFO(broker, "broker: auth enabled user=%s",
             broker->auth_user ? broker->auth_user : "(null)");
     #ifdef ENABLE_MQTT_TLS
@@ -4066,14 +4091,12 @@ static void BrokerUsage(const char* prog)
 
 #if !defined(WOLFMQTT_WOLFIP) && !defined(WOLFMQTT_BROKER_CUSTOM_NET) && \
     !defined(NO_MAIN_DRIVER)
-static MqttBroker* g_broker = NULL;
 #include <signal.h>
+static volatile sig_atomic_t g_broker_shutdown = 0;
 static void broker_signal_handler(int signo)
 {
-    if (g_broker != NULL) {
-        PRINTF("broker: received signal %d, shutting down", signo);
-        MqttBroker_Stop(g_broker);
-    }
+    (void)signo;
+    g_broker_shutdown = 1;
 }
 #endif
 
@@ -4163,16 +4186,31 @@ int wolfmqtt_broker(int argc, char** argv)
 
 #if !defined(WOLFMQTT_WOLFIP) && !defined(WOLFMQTT_BROKER_CUSTOM_NET) && \
     !defined(NO_MAIN_DRIVER)
-    g_broker = &broker;
+    /* Reset shutdown flag so this wrapper is reusable across multiple
+     * invocations in the same process (tests, embedding). */
+    g_broker_shutdown = 0;
     signal(SIGINT, broker_signal_handler);
     signal(SIGTERM, broker_signal_handler);
-#endif
 
+    rc = MqttBroker_Start(&broker);
+    if (rc == MQTT_CODE_SUCCESS) {
+        while (broker.running && !g_broker_shutdown) {
+            rc = MqttBroker_Step(&broker);
+            if (rc == MQTT_CODE_CONTINUE) {
+                BROKER_SLEEP_MS(10);
+            }
+            else if (rc < 0) {
+                break;
+            }
+        }
+        if (g_broker_shutdown) {
+            PRINTF("broker: received shutdown signal, shutting down");
+            MqttBroker_Stop(&broker);
+            rc = MQTT_CODE_SUCCESS;
+        }
+    }
+#else
     rc = MqttBroker_Run(&broker);
-
-#if !defined(WOLFMQTT_WOLFIP) && !defined(WOLFMQTT_BROKER_CUSTOM_NET) && \
-    !defined(NO_MAIN_DRIVER)
-    g_broker = NULL;
 #endif
 
     MqttBroker_Free(&broker);

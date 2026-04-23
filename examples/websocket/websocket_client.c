@@ -186,6 +186,11 @@ int main(int argc, char *argv[])
     printf("MQTT Subscribe: %s (QoS %d)\n", 
             topics[0].topic_filter, topics[0].qos);
     rc = MqttClient_Subscribe(&client, &subscribe);
+    if (rc == MQTT_CODE_ERROR_SUBSCRIBE_REJECTED) {
+        printf("MqttClient_Subscribe rejected: Topic %s, Return Code %u\n",
+            topics[0].topic_filter, topics[0].return_code);
+        goto exit;
+    }
     if (rc != MQTT_CODE_SUCCESS) {
         printf("MqttClient_Subscribe failed: %d\n", rc);
         goto exit;

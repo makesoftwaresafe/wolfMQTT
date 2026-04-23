@@ -535,6 +535,40 @@ int MqttClient_RespList_Find(MqttClient *client,
 #endif /* WOLFMQTT_MULTITHREAD */
 
 #ifdef WOLFMQTT_V5
+/* Populate client fields from CONNACK server properties so that the
+ * publish/packet-size guards are effective without requiring the
+ * application to register a property callback. */
+static void Handle_ConnectAck_Props(MqttClient* client, MqttProp* props)
+{
+    MqttProp* prop;
+
+    for (prop = props; prop != NULL; prop = prop->next) {
+        if (prop->type == MQTT_PROP_MAX_QOS) {
+            /* MQTT v5 [3.1.2.11.6]: only 0 or 1 are legal. Clamp a
+             * non-conforming broker value so client-side publish guards
+             * remain meaningful. */
+            client->max_qos = (prop->data_byte <= MQTT_QOS_1) ?
+                    prop->data_byte : MQTT_QOS_1;
+        }
+        else if (prop->type == MQTT_PROP_RETAIN_AVAIL) {
+            /* MQTT v5 [3.1.2.11.5]: only 0 or 1 are legal. */
+            client->retain_avail = (prop->data_byte <= 1) ?
+                    prop->data_byte : 1;
+        }
+        else if (prop->type == MQTT_PROP_MAX_PACKET_SZ) {
+            if ((prop->data_int > 0) &&
+                (prop->data_int <= MQTT_PACKET_SZ_MAX)) {
+                /* Honor the smaller of the client's existing cap
+                 * (0 means unset) and the server's limit. */
+                if ((client->packet_sz_max == 0) ||
+                    (prop->data_int < client->packet_sz_max)) {
+                    client->packet_sz_max = prop->data_int;
+                }
+            }
+        }
+    }
+}
+
 static int Handle_Props(MqttClient* client, MqttProp* props, byte use_cb,
                         byte free_props)
 {
@@ -624,8 +658,16 @@ static int MqttClient_DecodePacket(MqttClient* client, byte* rx_buf,
             rc = MqttDecode_ConnectAck(rx_buf, rx_len, p_connect_ack);
         #ifdef WOLFMQTT_V5
             if (rc >= 0 && doProps) {
-                int tmp = Handle_Props(client, p_connect_ack->props,
-                                       (packet_obj != NULL), 1);
+                int tmp;
+                /* Only latch server-supplied session limits when the broker
+                 * accepted the connection. A refused CONNACK must not
+                 * mutate long-lived MqttClient state. */
+                if (p_connect_ack->return_code ==
+                        MQTT_CONNECT_ACK_CODE_ACCEPTED) {
+                    Handle_ConnectAck_Props(client, p_connect_ack->props);
+                }
+                tmp = Handle_Props(client, p_connect_ack->props,
+                                   (packet_obj != NULL), 1);
                 p_connect_ack->props = NULL;
                 if (tmp != MQTT_CODE_SUCCESS) {
                     rc = tmp;
@@ -1682,6 +1724,13 @@ int MqttClient_Connect(MqttClient *client, MqttConnect *mc_connect)
     #ifdef WOLFMQTT_V5
         /* Use specified protocol version if set */
         mc_connect->protocol_level = client->protocol_level;
+
+        /* Reset server-supplied session limits so stale values from a
+         * prior broker do not leak across reconnects. An accepted CONNACK
+         * will repopulate these in Handle_ConnectAck_Props. */
+        client->max_qos = MQTT_QOS_2;
+        client->retain_avail = 1;
+        client->packet_sz_max = 0;
     #endif
 
         /* Encode the connect packet */
@@ -1692,6 +1741,10 @@ int MqttClient_Connect(MqttClient *client, MqttConnect *mc_connect)
             MQTT_PACKET_TYPE_CONNECT, 0, 0);
     #endif
         if (rc <= 0) {
+            /* Encode failed: tx_buf may hold partial plaintext credentials.
+             * Zero the full buffer before MqttWriteStop releases lockSend
+             * so no other thread can see residual data. */
+            CLIENT_FORCE_ZERO(client->tx_buf, client->tx_buf_len);
             MqttWriteStop(client, &mc_connect->stat);
             return rc;
         }
@@ -1706,6 +1759,12 @@ int MqttClient_Connect(MqttClient *client, MqttConnect *mc_connect)
             wm_SemUnlock(&client->lockClient);
         }
         if (rc != 0) {
+            /* Save write.len before MqttWriteStop zeroes client->write */
+            int xfer = client->write.len;
+            /* Clear tx_buf to remove plaintext credentials BEFORE
+             * MqttWriteStop releases lockSend, so another thread cannot
+             * race in and repopulate tx_buf before it is scrubbed. */
+            CLIENT_FORCE_ZERO(client->tx_buf, xfer);
             MqttWriteStop(client, &mc_connect->stat);
             return rc; /* Error locking client */
         }
@@ -1729,11 +1788,12 @@ int MqttClient_Connect(MqttClient *client, MqttConnect *mc_connect)
             return rc;
         }
     #endif
-        MqttWriteStop(client, &mc_connect->stat);
-
-        /* Clear tx_buf to remove any plaintext credentials from memory.
-         * Use xfer (saved before MqttWriteStop zeroes client->write) */
+        /* Clear tx_buf to remove any plaintext credentials from memory
+         * BEFORE MqttWriteStop releases lockSend, so another thread cannot
+         * race in and populate tx_buf before it is scrubbed.
+         * Use xfer (saved before MqttWriteStop zeroes client->write). */
         CLIENT_FORCE_ZERO(client->tx_buf, xfer);
+        MqttWriteStop(client, &mc_connect->stat);
 
         if (rc != xfer) {
             MqttClient_CancelMessage(client, (MqttObject*)mc_connect);
@@ -1833,6 +1893,14 @@ int MqttClient_Connect(MqttClient *client, MqttConnect *mc_connect)
 
     /* reset state */
     mc_connect->stat.write = MQTT_MSG_BEGIN;
+
+    /* CONNACK was received and decoded, but the broker refused the
+     * connection. The specific reason is in mc_connect->ack.return_code
+     * (MqttConnectAckReturnCodes for v3.1.1, MqttReasonCodes for v5). */
+    if (rc == MQTT_CODE_SUCCESS &&
+            mc_connect->ack.return_code != MQTT_CONNECT_ACK_CODE_ACCEPTED) {
+        rc = MQTT_TRACE_ERROR(MQTT_CODE_ERROR_CONNECT_REFUSED);
+    }
 
     return rc;
 }
@@ -2372,11 +2440,22 @@ int MqttClient_Subscribe(MqttClient *client, MqttSubscribe *subscribe)
     }
 #endif
 
-    /* Populate return codes */
+    /* Populate return codes and detect broker rejection. A v3.1.1 SUBACK
+     * uses MQTT_SUBSCRIBE_ACK_CODE_FAILURE (0x80) to indicate failure;
+     * a v5 SUBACK uses any reason code >= 0x80. In either case, any
+     * per-topic code with the high bit set means the broker rejected
+     * that filter. */
     if (rc == MQTT_CODE_SUCCESS) {
+        byte any_rejected = 0;
         for (i = 0; i < subscribe->topic_count && i < MAX_MQTT_TOPICS; i++) {
             topic = &subscribe->topics[i];
             topic->return_code = subscribe->ack.return_codes[i];
+            if (topic->return_code & MQTT_SUBSCRIBE_ACK_CODE_FAILURE) {
+                any_rejected = 1;
+            }
+        }
+        if (any_rejected) {
+            rc = MQTT_TRACE_ERROR(MQTT_CODE_ERROR_SUBSCRIBE_REJECTED);
         }
     }
 
@@ -2698,6 +2777,10 @@ int MqttClient_Auth(MqttClient *client, MqttAuth* auth)
             MQTT_PACKET_TYPE_AUTH, 0, 0);
     #endif
         if (rc <= 0) {
+            /* Encode failed: tx_buf may hold partial SASL auth data.
+             * Zero the full buffer before MqttWriteStop releases lockSend
+             * so no other thread can see residual data. */
+            CLIENT_FORCE_ZERO(client->tx_buf, client->tx_buf_len);
             MqttWriteStop(client, &auth->stat);
             return rc;
         }
@@ -2712,6 +2795,12 @@ int MqttClient_Auth(MqttClient *client, MqttAuth* auth)
             wm_SemUnlock(&client->lockClient);
         }
         if (rc != 0) {
+            /* Save write.len before MqttWriteStop zeroes client->write */
+            int xfer = client->write.len;
+            /* Clear tx_buf to remove SASL auth data BEFORE MqttWriteStop
+             * releases lockSend, to prevent a racing thread from
+             * repopulating tx_buf before it is scrubbed. */
+            CLIENT_FORCE_ZERO(client->tx_buf, xfer);
             MqttWriteStop(client, &auth->stat);
             return rc; /* Error locking client */
         }
@@ -2734,7 +2823,13 @@ int MqttClient_Auth(MqttClient *client, MqttAuth* auth)
             return rc;
         }
     #endif
+        /* Clear tx_buf to remove any SASL auth data from memory BEFORE
+         * MqttWriteStop releases lockSend, to prevent a racing thread
+         * from populating tx_buf before it is scrubbed.
+         * Use xfer (saved before MqttWriteStop zeroes client->write). */
+        CLIENT_FORCE_ZERO(client->tx_buf, xfer);
         MqttWriteStop(client, &auth->stat);
+
         if (rc != xfer) {
             MqttClient_CancelMessage(client, (MqttObject*)auth);
             return rc;
@@ -3025,6 +3120,10 @@ const char* MqttClient_ReturnCodeToString(int return_code)
             return "Error (System resource failed)";
         case MQTT_CODE_ERROR_NOT_FOUND:
             return "Error (Not found)";
+        case MQTT_CODE_ERROR_CONNECT_REFUSED:
+            return "Error (Broker refused connection)";
+        case MQTT_CODE_ERROR_SUBSCRIBE_REJECTED:
+            return "Error (Broker rejected subscription)";
 #if defined(ENABLE_MQTT_CURL)
         case MQTT_CODE_ERROR_CURL:
             return "Error (libcurl)";

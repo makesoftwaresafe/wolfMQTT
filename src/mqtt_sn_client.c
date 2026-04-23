@@ -1177,6 +1177,14 @@ int SN_Client_Connect(MqttClient *client, SN_Connect *mc_connect)
     /* reset state */
     mc_connect->stat.write = MQTT_MSG_BEGIN;
 
+    /* CONNACK was received and decoded, but the gateway refused the
+     * connection. The specific reason is in mc_connect->ack.return_code
+     * (SN_ReturnCodes). */
+    if (rc == MQTT_CODE_SUCCESS &&
+            mc_connect->ack.return_code != SN_RC_ACCEPTED) {
+        rc = MQTT_TRACE_ERROR(MQTT_CODE_ERROR_CONNECT_REFUSED);
+    }
+
     return rc;
 }
 

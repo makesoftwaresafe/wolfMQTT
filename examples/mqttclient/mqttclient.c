@@ -440,16 +440,22 @@ int mqttclient_test(MQTTCtx *mqttCtx)
 
         PRINTF("MQTT Subscribe: %s (%d)",
             MqttClient_ReturnCodeToString(rc), rc);
-        if (rc != MQTT_CODE_SUCCESS) {
+        if (rc != MQTT_CODE_SUCCESS &&
+                rc != MQTT_CODE_ERROR_SUBSCRIBE_REJECTED) {
             goto disconn;
         }
 
-        /* show subscribe results */
+        /* show subscribe results (also reveals which filters the broker
+         * rejected when rc == MQTT_CODE_ERROR_SUBSCRIBE_REJECTED) */
         for (i = 0; i < mqttCtx->subscribe.topic_count; i++) {
             MqttTopic *topic = &mqttCtx->subscribe.topics[i];
             PRINTF("  Topic %s, Qos %u, Return Code %u",
                 topic->topic_filter,
                 topic->qos, topic->return_code);
+        }
+
+        if (rc == MQTT_CODE_ERROR_SUBSCRIBE_REJECTED) {
+            goto disconn;
         }
     }
     else {
