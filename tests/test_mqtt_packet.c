@@ -1604,6 +1604,86 @@ TEST(decode_publish_resp_malformed_remain_len_one)
 }
 
 /* ============================================================================
+ * MqttEncode_PublishResp fixed-header QoS bits
+ *
+ * MQTT-3.6.1-1: PUBREL fixed header reserved flags MUST be 0010 (QoS 1 bit).
+ * All other publish response types (PUBACK/PUBREC/PUBCOMP) use QoS 0 flags.
+ * ============================================================================ */
+
+TEST(encode_publish_rel_has_qos1_flag)
+{
+    byte buf[8];
+    MqttPublishResp resp;
+    int enc_len;
+
+    XMEMSET(&resp, 0, sizeof(resp));
+    resp.packet_id = 1;
+
+    enc_len = MqttEncode_PublishResp(buf, (int)sizeof(buf),
+                  MQTT_PACKET_TYPE_PUBLISH_REL, &resp);
+    ASSERT_TRUE(enc_len > 0);
+
+    /* Fixed header: packet type PUBREL (6) in upper nibble, QoS 1 in flags */
+    ASSERT_EQ(MQTT_PACKET_TYPE_PUBLISH_REL,
+              MQTT_PACKET_TYPE_GET(buf[0]));
+    ASSERT_EQ(0x02, buf[0] & MQTT_PACKET_FLAG_QOS_MASK);
+}
+
+TEST(encode_publish_ack_has_qos0_flag)
+{
+    byte buf[8];
+    MqttPublishResp resp;
+    int enc_len;
+
+    XMEMSET(&resp, 0, sizeof(resp));
+    resp.packet_id = 1;
+
+    enc_len = MqttEncode_PublishResp(buf, (int)sizeof(buf),
+                  MQTT_PACKET_TYPE_PUBLISH_ACK, &resp);
+    ASSERT_TRUE(enc_len > 0);
+
+    ASSERT_EQ(MQTT_PACKET_TYPE_PUBLISH_ACK,
+              MQTT_PACKET_TYPE_GET(buf[0]));
+    ASSERT_EQ(0x00, buf[0] & MQTT_PACKET_FLAG_QOS_MASK);
+}
+
+TEST(encode_publish_rec_has_qos0_flag)
+{
+    byte buf[8];
+    MqttPublishResp resp;
+    int enc_len;
+
+    XMEMSET(&resp, 0, sizeof(resp));
+    resp.packet_id = 1;
+
+    enc_len = MqttEncode_PublishResp(buf, (int)sizeof(buf),
+                  MQTT_PACKET_TYPE_PUBLISH_REC, &resp);
+    ASSERT_TRUE(enc_len > 0);
+
+    ASSERT_EQ(MQTT_PACKET_TYPE_PUBLISH_REC,
+              MQTT_PACKET_TYPE_GET(buf[0]));
+    ASSERT_EQ(0x00, buf[0] & MQTT_PACKET_FLAG_QOS_MASK);
+}
+
+TEST(encode_publish_comp_has_qos0_flag)
+{
+    byte buf[8];
+    MqttPublishResp resp;
+    int enc_len;
+
+    XMEMSET(&resp, 0, sizeof(resp));
+    resp.packet_id = 1;
+
+    enc_len = MqttEncode_PublishResp(buf, (int)sizeof(buf),
+                  MQTT_PACKET_TYPE_PUBLISH_COMP, &resp);
+    ASSERT_TRUE(enc_len > 0);
+
+    ASSERT_EQ(MQTT_PACKET_TYPE_PUBLISH_COMP,
+              MQTT_PACKET_TYPE_GET(buf[0]));
+    ASSERT_EQ(0x00, buf[0] & MQTT_PACKET_FLAG_QOS_MASK);
+}
+
+/* ============================================================================
  * MqttDecode_UnsubscribeAck
  * ============================================================================ */
 
@@ -1988,6 +2068,12 @@ void run_mqtt_packet_tests(void)
     RUN_TEST(decode_publish_resp_valid);
     RUN_TEST(decode_publish_resp_malformed_remain_len_zero);
     RUN_TEST(decode_publish_resp_malformed_remain_len_one);
+
+    /* MqttEncode_PublishResp fixed-header QoS bits */
+    RUN_TEST(encode_publish_rel_has_qos1_flag);
+    RUN_TEST(encode_publish_ack_has_qos0_flag);
+    RUN_TEST(encode_publish_rec_has_qos0_flag);
+    RUN_TEST(encode_publish_comp_has_qos0_flag);
 
     /* MqttDecode_UnsubscribeAck */
     RUN_TEST(decode_unsuback_valid);
