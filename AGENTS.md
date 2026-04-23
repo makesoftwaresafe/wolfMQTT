@@ -149,11 +149,13 @@ Uses `.clang-format` with LLVM base style:
 
 ## Test Integrity
 Never modify, delete, skip, or weaken tests to make them pass.
-Never hardcode expected values, mock results, or otherwise contrive a passing test result.
+Never fabricate, adjust, or derive expected values from the code under test just to force a pass; fixed expected values are acceptable when they come from an independent oracle, such as committed test vectors or other externally verified results.
 A passing test suite achieved by changing the tests (not the implementation) is not a passing result.
 Fix the code. If the code cannot be fixed within scope, escalate.
 
-Never write a test that uses the code under test as its own oracle. Tests must have an independent oracle: known test vectors from an external source, cross-validation between two independent implementations, or bit-exact comparison against a reference path. A test that encrypts with function A and decrypts with function A proves nothing.
+Do not use the code under test as its only oracle where an independent oracle is required, especially for crypto, KDFs, canonical encodings, and other security-sensitive transformations. In those cases, tests should use known external test vectors, cross-validation against an independent implementation, or bit-exact comparison against a trusted reference path. For example, a test that only encrypts with function A and decrypts with function A is insufficient to validate the correctness of the cryptographic primitive.
+
+Roundtrip/property tests are still acceptable where they match the behavior being validated, such as encode/decode or serialize/parse flows already used elsewhere in this repository, but they should not be the sole oracle when stronger independent validation is needed.
 
 ## No Fabrication
 Never report status, results, or completion that does not reflect work actually performed.

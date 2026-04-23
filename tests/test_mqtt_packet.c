@@ -533,46 +533,48 @@ TEST(decode_publish_malformed_variable_exceeds_remain)
 }
 
 #ifdef WOLFMQTT_V5
-TEST(decode_publish_v5_with_props_roundtrip)
+/* Hand-validated MQTT v5 PUBLISH packet (independent oracle, not produced by
+ * MqttEncode_Publish) so encode and decode cannot hide a shared bug:
+ *   fixed header:     0x30 (PUBLISH, QoS 0), remain_len = 21
+ *   topic:            "a/b"             (2-byte len + 3 bytes)
+ *   props length:     0x0D (13)
+ *   property:         0x03 CONTENT_TYPE, 2-byte len 0x000A, "text/plain"
+ *   payload:          "HI"
+ */
+TEST(decode_publish_v5_content_type_property)
 {
-    byte buf[256];
-    byte payload[] = { 'p', 'a', 'y' };
-    MqttPublish enc, dec;
-    MqttProp prop;
-    char content_type[] = "text/plain";
-    int enc_len, dec_len;
+    byte buf[] = {
+        0x30, 21,
+        0x00, 0x03, 'a', '/', 'b',
+        0x0D,
+        0x03, 0x00, 0x0A,
+        't', 'e', 'x', 't', '/', 'p', 'l', 'a', 'i', 'n',
+        'H', 'I'
+    };
+    MqttPublish pub;
+    MqttProp* prop;
+    int rc;
 
-    XMEMSET(&enc, 0, sizeof(enc));
-    XMEMSET(&prop, 0, sizeof(prop));
-    prop.type = MQTT_PROP_CONTENT_TYPE;
-    prop.data_str.str = content_type;
-    prop.data_str.len = (word16)XSTRLEN(content_type);
-    prop.next = NULL;
-    enc.topic_name = "v5/topic";
-    enc.qos = MQTT_QOS_1;
-    enc.packet_id = 7;
-    enc.protocol_level = MQTT_CONNECT_PROTOCOL_LEVEL_5;
-    enc.props = &prop;
-    enc.buffer = payload;
-    enc.total_len = sizeof(payload);
+    XMEMSET(&pub, 0, sizeof(pub));
+    pub.protocol_level = MQTT_CONNECT_PROTOCOL_LEVEL_5;
+    rc = MqttDecode_Publish(buf, (int)sizeof(buf), &pub);
+    ASSERT_TRUE(rc > 0);
+    ASSERT_EQ(MQTT_QOS_0, pub.qos);
+    ASSERT_EQ(0, pub.packet_id);
+    ASSERT_EQ(3, pub.topic_name_len);
+    ASSERT_EQ(0, XMEMCMP(pub.topic_name, "a/b", 3));
+    ASSERT_EQ(2, (int)pub.total_len);
 
-    enc_len = MqttEncode_Publish(buf, (int)sizeof(buf), &enc, 0);
-    ASSERT_TRUE(enc_len > 0);
-
-    XMEMSET(&dec, 0, sizeof(dec));
-    dec.protocol_level = MQTT_CONNECT_PROTOCOL_LEVEL_5;
-    dec_len = MqttDecode_Publish(buf, enc_len, &dec);
-    ASSERT_TRUE(dec_len > 0);
-    ASSERT_EQ(MQTT_QOS_1, dec.qos);
-    ASSERT_EQ(7, dec.packet_id);
-    ASSERT_EQ((int)XSTRLEN("v5/topic"), (int)dec.topic_name_len);
-    ASSERT_EQ(0, XMEMCMP(dec.topic_name, "v5/topic",
-                         XSTRLEN("v5/topic")));
-    ASSERT_EQ((int)sizeof(payload), (int)dec.total_len);
-    ASSERT_TRUE(dec.props != NULL);
-    if (dec.props) {
-        MqttProps_Free(dec.props);
+    for (prop = pub.props; prop != NULL; prop = prop->next) {
+        if (prop->type == MQTT_PROP_CONTENT_TYPE)
+            break;
     }
+    ASSERT_TRUE(prop != NULL);
+    ASSERT_EQ(MQTT_PROP_CONTENT_TYPE, prop->type);
+    ASSERT_EQ(10, (int)prop->data_str.len);
+    ASSERT_EQ(0, XMEMCMP(prop->data_str.str, "text/plain", 10));
+
+    MqttProps_Free(pub.props);
 }
 #endif /* WOLFMQTT_V5 */
 
@@ -1676,7 +1678,7 @@ void run_mqtt_packet_tests(void)
     RUN_TEST(decode_publish_qos0_zero_payload);
     RUN_TEST(decode_publish_malformed_variable_exceeds_remain);
 #ifdef WOLFMQTT_V5
-    RUN_TEST(decode_publish_v5_with_props_roundtrip);
+    RUN_TEST(decode_publish_v5_content_type_property);
 #endif
 
     /* MqttDecode_ConnectAck */
