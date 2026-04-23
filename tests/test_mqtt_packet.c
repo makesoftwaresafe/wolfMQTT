@@ -1053,16 +1053,28 @@ TEST(encode_connect_fixed_header_flags)
     ASSERT_EQ(0, (int)MQTT_PACKET_FLAGS_GET(tx_buf[0]));
 }
 
+/* CONNECT variable header layout: 2-byte protocol name length + 4-byte "MQTT"
+ * + 1-byte protocol level + 1-byte connect flags. Offset computed from the
+ * decoded VBI instead of assuming a 1-byte remaining-length encoding. */
+static int connect_flags_offset(const byte *tx_buf, int tx_buf_len)
+{
+    word32 remain_len = 0;
+    int vbi_len = MqttDecode_Vbi((byte*)&tx_buf[1], &remain_len,
+                                 (word32)(tx_buf_len - 1));
+    if (vbi_len < 0) {
+        return vbi_len;
+    }
+    return 1 + vbi_len + 2 + 4 + 1;
+}
+
 /* [MQTT-3.1.2] CONNECT variable header flags byte encodes credential and
- * clean-session bits. The flags byte sits at offset 7 inside the variable
- * header (after 2-byte protocol length, 4-byte "MQTT", 1-byte protocol
- * level). With a remaining length < 128 the fixed header is 2 bytes, so the
- * flags byte is tx_buf[9]. */
+ * clean-session bits. */
 TEST(encode_connect_flags_username_password_clean)
 {
     byte tx_buf[256];
     MqttConnect conn;
     int rc;
+    int flags_off;
     byte flags;
 
     XMEMSET(&conn, 0, sizeof(conn));
@@ -1072,7 +1084,9 @@ TEST(encode_connect_flags_username_password_clean)
     conn.clean_session = 1;
     rc = MqttEncode_Connect(tx_buf, (int)sizeof(tx_buf), &conn);
     ASSERT_TRUE(rc > 0);
-    flags = tx_buf[9];
+    flags_off = connect_flags_offset(tx_buf, rc);
+    ASSERT_TRUE(flags_off > 0 && flags_off < rc);
+    flags = tx_buf[flags_off];
     ASSERT_EQ(MQTT_CONNECT_FLAG_USERNAME,
               flags & MQTT_CONNECT_FLAG_USERNAME);
     ASSERT_EQ(MQTT_CONNECT_FLAG_PASSWORD,
@@ -1090,12 +1104,15 @@ TEST(encode_connect_flags_none)
     byte tx_buf[256];
     MqttConnect conn;
     int rc;
+    int flags_off;
 
     XMEMSET(&conn, 0, sizeof(conn));
     conn.client_id = "test_client";
     rc = MqttEncode_Connect(tx_buf, (int)sizeof(tx_buf), &conn);
     ASSERT_TRUE(rc > 0);
-    ASSERT_EQ(0, (int)tx_buf[9]);
+    flags_off = connect_flags_offset(tx_buf, rc);
+    ASSERT_TRUE(flags_off > 0 && flags_off < rc);
+    ASSERT_EQ(0, (int)tx_buf[flags_off]);
 }
 
 TEST(encode_connect_flags_clean_session_only)
@@ -1103,13 +1120,16 @@ TEST(encode_connect_flags_clean_session_only)
     byte tx_buf[256];
     MqttConnect conn;
     int rc;
+    int flags_off;
 
     XMEMSET(&conn, 0, sizeof(conn));
     conn.client_id = "test_client";
     conn.clean_session = 1;
     rc = MqttEncode_Connect(tx_buf, (int)sizeof(tx_buf), &conn);
     ASSERT_TRUE(rc > 0);
-    ASSERT_EQ(MQTT_CONNECT_FLAG_CLEAN_SESSION, (int)tx_buf[9]);
+    flags_off = connect_flags_offset(tx_buf, rc);
+    ASSERT_TRUE(flags_off > 0 && flags_off < rc);
+    ASSERT_EQ(MQTT_CONNECT_FLAG_CLEAN_SESSION, (int)tx_buf[flags_off]);
 }
 
 TEST(encode_connect_flags_username_only)
@@ -1117,15 +1137,18 @@ TEST(encode_connect_flags_username_only)
     byte tx_buf[256];
     MqttConnect conn;
     int rc;
+    int flags_off;
 
     XMEMSET(&conn, 0, sizeof(conn));
     conn.client_id = "test_client";
     conn.username = "user";
     rc = MqttEncode_Connect(tx_buf, (int)sizeof(tx_buf), &conn);
     ASSERT_TRUE(rc > 0);
+    flags_off = connect_flags_offset(tx_buf, rc);
+    ASSERT_TRUE(flags_off > 0 && flags_off < rc);
     ASSERT_EQ(MQTT_CONNECT_FLAG_USERNAME,
-              tx_buf[9] & MQTT_CONNECT_FLAG_USERNAME);
-    ASSERT_EQ(0, tx_buf[9] & MQTT_CONNECT_FLAG_PASSWORD);
+              tx_buf[flags_off] & MQTT_CONNECT_FLAG_USERNAME);
+    ASSERT_EQ(0, tx_buf[flags_off] & MQTT_CONNECT_FLAG_PASSWORD);
 }
 
 TEST(encode_connect_flags_lwt_qos1_retain)
@@ -1135,6 +1158,7 @@ TEST(encode_connect_flags_lwt_qos1_retain)
     MqttConnect conn;
     MqttMessage lwt;
     int rc;
+    int flags_off;
     byte flags;
 
     XMEMSET(&conn, 0, sizeof(conn));
@@ -1150,7 +1174,9 @@ TEST(encode_connect_flags_lwt_qos1_retain)
     conn.lwt_msg = &lwt;
     rc = MqttEncode_Connect(tx_buf, (int)sizeof(tx_buf), &conn);
     ASSERT_TRUE(rc > 0);
-    flags = tx_buf[9];
+    flags_off = connect_flags_offset(tx_buf, rc);
+    ASSERT_TRUE(flags_off > 0 && flags_off < rc);
+    flags = tx_buf[flags_off];
     ASSERT_EQ(MQTT_CONNECT_FLAG_WILL_FLAG,
               flags & MQTT_CONNECT_FLAG_WILL_FLAG);
     ASSERT_EQ(MQTT_CONNECT_FLAG_WILL_RETAIN,

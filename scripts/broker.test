@@ -338,12 +338,18 @@ timeout 30 ./$sub_bin -T -h 127.0.0.1 -p $port -n "wolfMQTT/example/lwttopic" \
     >"${TMP_DIR}/t6b_sub.log" 2>&1 &
 T6B_WATCHER_PID=$!
 TEST_PIDS+=($T6B_WATCHER_PID)
-wait_for_file "${TMP_DIR}/t6b_watcher.ready" 5
+if ! wait_for_file "${TMP_DIR}/t6b_watcher.ready" 5; then
+    echo "FAIL: Keep-alive timeout window (watcher did not become ready)"
+    FAIL=1
+fi
 ./$sub_bin -T -h 127.0.0.1 -p $port -n "test/ka2_trigger" -i "ka2_client" -l -k 4 \
     -R "${TMP_DIR}/t6b_client.ready" >"${TMP_DIR}/t6b_client.log" 2>&1 &
 T6B_CLIENT_PID=$!
 TEST_PIDS+=($T6B_CLIENT_PID)
-wait_for_file "${TMP_DIR}/t6b_client.ready" 5
+if ! wait_for_file "${TMP_DIR}/t6b_client.ready" 5; then
+    echo "FAIL: Keep-alive timeout window (client did not become ready)"
+    FAIL=1
+fi
 T6B_T_START=$(date +%s)
 kill -STOP $T6B_CLIENT_PID 2>/dev/null
 T6B_ELAPSED=-1
