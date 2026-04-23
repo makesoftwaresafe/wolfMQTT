@@ -1686,6 +1686,125 @@ TEST(publish_resp_v5_success_no_props_roundtrip)
     ASSERT_TRUE(dec_len > 0);
     ASSERT_EQ(MQTT_REASON_SUCCESS, dec.reason_code);
 }
+
+/* ============================================================================
+ * MqttEncode/Decode_Auth roundtrip
+ *
+ * Every reason code accepted by MqttEncode_Auth must round-trip through
+ * MqttDecode_Auth. MQTT 5.0 section 3.15.1 lists SUCCESS (0x00), CONT_AUTH
+ * (0x18), and REAUTH (0x19) as valid AUTH reason codes.
+ * ============================================================================ */
+
+static void auth_roundtrip_with_method(byte reason_code)
+{
+    byte buf[256];
+    MqttAuth enc, dec;
+    MqttProp prop;
+    int enc_len, dec_len;
+    char auth_method[] = "SCRAM-SHA-256";
+
+    XMEMSET(&enc, 0, sizeof(enc));
+    XMEMSET(&prop, 0, sizeof(prop));
+    prop.type = MQTT_PROP_AUTH_METHOD;
+    prop.data_str.str = auth_method;
+    prop.data_str.len = (word16)XSTRLEN(auth_method);
+    prop.next = NULL;
+    enc.reason_code = reason_code;
+    enc.props = &prop;
+
+    enc_len = MqttEncode_Auth(buf, (int)sizeof(buf), &enc);
+    ASSERT_TRUE(enc_len > 0);
+
+    XMEMSET(&dec, 0, sizeof(dec));
+    dec_len = MqttDecode_Auth(buf, enc_len, &dec);
+    ASSERT_TRUE(dec_len > 0);
+    ASSERT_EQ(enc_len, dec_len);
+    ASSERT_EQ(reason_code, dec.reason_code);
+    ASSERT_NOT_NULL(dec.props);
+    ASSERT_EQ(MQTT_PROP_AUTH_METHOD, dec.props->type);
+    if (dec.props) {
+        MqttProps_Free(dec.props);
+    }
+}
+
+TEST(auth_v5_cont_auth_roundtrip)
+{
+    auth_roundtrip_with_method(MQTT_REASON_CONT_AUTH);
+}
+
+TEST(auth_v5_reauth_roundtrip)
+{
+    auth_roundtrip_with_method(MQTT_REASON_REAUTH);
+}
+
+TEST(auth_v5_reauth_decodes_without_error)
+{
+    /* Decode a hand-built REAUTH packet to guard against encoder changes
+     * masking a decoder-only regression. */
+    byte buf[64];
+    MqttAuth enc, dec;
+    MqttProp prop;
+    int enc_len, dec_len;
+    char auth_method[] = "OAUTH";
+
+    XMEMSET(&enc, 0, sizeof(enc));
+    XMEMSET(&prop, 0, sizeof(prop));
+    prop.type = MQTT_PROP_AUTH_METHOD;
+    prop.data_str.str = auth_method;
+    prop.data_str.len = (word16)XSTRLEN(auth_method);
+    prop.next = NULL;
+    enc.reason_code = MQTT_REASON_REAUTH;
+    enc.props = &prop;
+
+    enc_len = MqttEncode_Auth(buf, (int)sizeof(buf), &enc);
+    ASSERT_TRUE(enc_len > 0);
+    ASSERT_EQ(MQTT_REASON_REAUTH, buf[2]);
+
+    XMEMSET(&dec, 0, sizeof(dec));
+    dec_len = MqttDecode_Auth(buf, enc_len, &dec);
+    ASSERT_NE(MQTT_CODE_ERROR_MALFORMED_DATA, dec_len);
+    ASSERT_TRUE(dec_len > 0);
+    if (dec.props) {
+        MqttProps_Free(dec.props);
+    }
+}
+
+TEST(auth_v5_success_remaining_length_zero)
+{
+    /* Per MQTT 5.0 3.15.2, a Remaining Length of 0 means SUCCESS with no
+     * properties. Build that wire form directly since MqttEncode_Auth does
+     * not emit it. */
+    byte buf[2];
+    MqttAuth dec;
+    int dec_len;
+
+    buf[0] = (byte)(MQTT_PACKET_TYPE_AUTH << 4);
+    buf[1] = 0x00; /* Remaining Length */
+
+    XMEMSET(&dec, 0, sizeof(dec));
+    dec_len = MqttDecode_Auth(buf, (int)sizeof(buf), &dec);
+    ASSERT_EQ(2, dec_len);
+    ASSERT_EQ(MQTT_REASON_SUCCESS, dec.reason_code);
+    ASSERT_NULL(dec.props);
+}
+
+TEST(auth_v5_invalid_reason_code_rejected)
+{
+    /* A reason code outside {SUCCESS, CONT_AUTH, REAUTH} must not decode
+     * as a valid AUTH packet. Use 0x7F which is not assigned for AUTH. */
+    byte buf[8];
+    MqttAuth dec;
+    int dec_len;
+
+    buf[0] = (byte)(MQTT_PACKET_TYPE_AUTH << 4);
+    buf[1] = 0x02; /* Remaining Length */
+    buf[2] = 0x7F; /* Invalid reason code */
+    buf[3] = 0x00; /* Property Length = 0 */
+
+    XMEMSET(&dec, 0, sizeof(dec));
+    dec_len = MqttDecode_Auth(buf, 4, &dec);
+    ASSERT_TRUE(dec_len < 0);
+}
 #endif /* WOLFMQTT_V5 */
 
 /* ============================================================================
@@ -1824,6 +1943,13 @@ void run_mqtt_packet_tests(void)
     RUN_TEST(publish_resp_v5_success_with_props_roundtrip);
     RUN_TEST(publish_resp_v5_error_no_props_roundtrip);
     RUN_TEST(publish_resp_v5_success_no_props_roundtrip);
+
+    /* MqttEncode/Decode_Auth */
+    RUN_TEST(auth_v5_cont_auth_roundtrip);
+    RUN_TEST(auth_v5_reauth_roundtrip);
+    RUN_TEST(auth_v5_reauth_decodes_without_error);
+    RUN_TEST(auth_v5_success_remaining_length_zero);
+    RUN_TEST(auth_v5_invalid_reason_code_rejected);
 #endif
 
     TEST_SUITE_END();

@@ -2704,7 +2704,8 @@ int MqttDecode_Auth(byte *rx_buf, int rx_buf_len, MqttAuth *auth)
         /* Decode variable header */
         auth->reason_code = *rx_payload++;
         if ((auth->reason_code == MQTT_REASON_SUCCESS) ||
-            (auth->reason_code == MQTT_REASON_CONT_AUTH))
+            (auth->reason_code == MQTT_REASON_CONT_AUTH) ||
+            (auth->reason_code == MQTT_REASON_REAUTH))
         {
             /* Decode Length of Properties */
             if (rx_buf_len < (rx_payload - rx_buf)) {
