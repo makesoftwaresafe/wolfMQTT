@@ -287,6 +287,103 @@ TEST(connect_with_mock_network)
     ASSERT_EQ(MQTT_CODE_ERROR_NETWORK, rc);
 }
 
+/* Regression test for tx_buf credential zeroing after CONNECT is sent.
+ * Guards CLIENT_FORCE_ZERO(client->tx_buf, xfer) in MqttClient_Connect: the
+ * original issue being prevented is plaintext credentials lingering in the
+ * client's tx_buf after the CONNECT packet is written. Without this test, a
+ * regression that deletes that line (or passes length 0) would pass silently. */
+#define TEST_CONNECT_USERNAME "user"
+#define TEST_CONNECT_PASSWORD "secret"
+
+static int connect_mock_xfer;
+static byte connect_mock_sent[TEST_TX_BUF_SIZE];
+
+static int mock_net_write_accept(void *context, const byte* buf, int buf_len,
+    int timeout_ms)
+{
+    (void)context; (void)timeout_ms;
+    if (buf != NULL && buf_len > 0 &&
+        buf_len <= (int)sizeof(connect_mock_sent)) {
+        XMEMCPY(connect_mock_sent, buf, (size_t)buf_len);
+        connect_mock_xfer = buf_len;
+    }
+    /* Pretend the full packet was sent so MqttClient_Connect reaches the
+     * CLIENT_FORCE_ZERO step. */
+    return buf_len;
+}
+
+static int buf_contains(const byte* buf, int buf_len,
+    const char* needle, int needle_len)
+{
+    int i;
+    if (buf == NULL || needle_len <= 0 || buf_len < needle_len) {
+        return 0;
+    }
+    for (i = 0; i + needle_len <= buf_len; i++) {
+        if (XMEMCMP(&buf[i], needle, (size_t)needle_len) == 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+TEST(connect_clears_tx_buf_credentials)
+{
+    int rc;
+    int i;
+    MqttConnect connect;
+    const int user_len = (int)sizeof(TEST_CONNECT_USERNAME) - 1;
+    const int pass_len = (int)sizeof(TEST_CONNECT_PASSWORD) - 1;
+
+    rc = test_init_client();
+    ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
+
+    /* Swap in a write mock that accepts the packet and records what was
+     * sent. Read still returns MQTT_CODE_ERROR_NETWORK so MqttClient_Connect
+     * returns after the CLIENT_FORCE_ZERO step. */
+    connect_mock_xfer = 0;
+    XMEMSET(connect_mock_sent, 0, sizeof(connect_mock_sent));
+    test_net.write = mock_net_write_accept;
+
+    XMEMSET(&connect, 0, sizeof(connect));
+    connect.keep_alive_sec = 60;
+    connect.clean_session = 1;
+    connect.client_id = "test_client";
+    connect.username = TEST_CONNECT_USERNAME;
+    connect.password = TEST_CONNECT_PASSWORD;
+
+    rc = MqttClient_Connect(&test_client, &connect);
+    /* The read mock cannot deliver a CONNECT_ACK, so a successful return
+     * would be wrong regardless of the zeroing step. */
+    ASSERT_NE(MQTT_CODE_SUCCESS, rc);
+
+    /* Confirm the write path actually ran with credentials present. Without
+     * this, the zeroing assertion below could pass trivially. */
+    ASSERT_TRUE(connect_mock_xfer > 0);
+    ASSERT_TRUE(buf_contains(connect_mock_sent, connect_mock_xfer,
+                             TEST_CONNECT_USERNAME, user_len));
+    ASSERT_TRUE(buf_contains(connect_mock_sent, connect_mock_xfer,
+                             TEST_CONNECT_PASSWORD, pass_len));
+
+    /* Core regression check: credentials must not remain in tx_buf after
+     * MqttClient_Connect returns. Scans the full buffer because the zeroed
+     * region covers [0..xfer) and the remainder was zero-initialized at
+     * setup. */
+    ASSERT_FALSE(buf_contains(test_client.tx_buf, TEST_TX_BUF_SIZE,
+                              TEST_CONNECT_USERNAME, user_len));
+    ASSERT_FALSE(buf_contains(test_client.tx_buf, TEST_TX_BUF_SIZE,
+                              TEST_CONNECT_PASSWORD, pass_len));
+
+    /* Stronger boundary check: every byte the mock observed being written
+     * must now be zero. This catches both deletion of the CLIENT_FORCE_ZERO
+     * call and an `xfer` -> `0` mutation that turns the wipe into a no-op. */
+    for (i = 0; i < connect_mock_xfer; i++) {
+        if (test_client.tx_buf[i] != 0) {
+            FAIL("tx_buf byte within xfer range is non-zero after CONNECT");
+        }
+    }
+}
+
 /* ============================================================================
  * MqttClient_Disconnect Tests
  * ============================================================================ */
@@ -527,6 +624,7 @@ void run_mqtt_client_tests(void)
     RUN_TEST(connect_null_connect);
     RUN_TEST(connect_both_null);
     RUN_TEST(connect_with_mock_network);
+    RUN_TEST(connect_clears_tx_buf_credentials);
 
     /* MqttClient_Disconnect tests */
     RUN_TEST(disconnect_null_client);
