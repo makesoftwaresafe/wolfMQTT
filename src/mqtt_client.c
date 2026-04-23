@@ -544,10 +544,16 @@ static void Handle_ConnectAck_Props(MqttClient* client, MqttProp* props)
 
     for (prop = props; prop != NULL; prop = prop->next) {
         if (prop->type == MQTT_PROP_MAX_QOS) {
-            client->max_qos = prop->data_byte;
+            /* MQTT v5 [3.1.2.11.6]: only 0 or 1 are legal. Clamp a
+             * non-conforming broker value so client-side publish guards
+             * remain meaningful. */
+            client->max_qos = (prop->data_byte <= MQTT_QOS_1) ?
+                    prop->data_byte : MQTT_QOS_1;
         }
         else if (prop->type == MQTT_PROP_RETAIN_AVAIL) {
-            client->retain_avail = prop->data_byte;
+            /* MQTT v5 [3.1.2.11.5]: only 0 or 1 are legal. */
+            client->retain_avail = (prop->data_byte <= 1) ?
+                    prop->data_byte : 1;
         }
         else if (prop->type == MQTT_PROP_MAX_PACKET_SZ) {
             if ((prop->data_int > 0) &&
@@ -653,10 +659,13 @@ static int MqttClient_DecodePacket(MqttClient* client, byte* rx_buf,
         #ifdef WOLFMQTT_V5
             if (rc >= 0 && doProps) {
                 int tmp;
-                /* Auto-populate server property fields so that publish and
-                 * packet-size guards are effective even when the
-                 * application has not registered a property callback. */
-                Handle_ConnectAck_Props(client, p_connect_ack->props);
+                /* Only latch server-supplied session limits when the broker
+                 * accepted the connection. A refused CONNACK must not
+                 * mutate long-lived MqttClient state. */
+                if (p_connect_ack->return_code ==
+                        MQTT_CONNECT_ACK_CODE_ACCEPTED) {
+                    Handle_ConnectAck_Props(client, p_connect_ack->props);
+                }
                 tmp = Handle_Props(client, p_connect_ack->props,
                                    (packet_obj != NULL), 1);
                 p_connect_ack->props = NULL;
@@ -1715,6 +1724,13 @@ int MqttClient_Connect(MqttClient *client, MqttConnect *mc_connect)
     #ifdef WOLFMQTT_V5
         /* Use specified protocol version if set */
         mc_connect->protocol_level = client->protocol_level;
+
+        /* Reset server-supplied session limits so stale values from a
+         * prior broker do not leak across reconnects. An accepted CONNACK
+         * will repopulate these in Handle_ConnectAck_Props. */
+        client->max_qos = MQTT_QOS_2;
+        client->retain_avail = 1;
+        client->packet_sz_max = 0;
     #endif
 
         /* Encode the connect packet */
@@ -2425,15 +2441,16 @@ int MqttClient_Subscribe(MqttClient *client, MqttSubscribe *subscribe)
 #endif
 
     /* Populate return codes and detect broker rejection. A v3.1.1 SUBACK
-     * uses 0x80 to indicate failure; a v5 SUBACK uses any reason code
-     * >= 0x80. In either case, any per-topic code with the high bit set
-     * means the broker rejected that filter. */
+     * uses MQTT_SUBSCRIBE_ACK_CODE_FAILURE (0x80) to indicate failure;
+     * a v5 SUBACK uses any reason code >= 0x80. In either case, any
+     * per-topic code with the high bit set means the broker rejected
+     * that filter. */
     if (rc == MQTT_CODE_SUCCESS) {
         byte any_rejected = 0;
         for (i = 0; i < subscribe->topic_count && i < MAX_MQTT_TOPICS; i++) {
             topic = &subscribe->topics[i];
             topic->return_code = subscribe->ack.return_codes[i];
-            if (topic->return_code & 0x80) {
+            if (topic->return_code & MQTT_SUBSCRIBE_ACK_CODE_FAILURE) {
                 any_rejected = 1;
             }
         }

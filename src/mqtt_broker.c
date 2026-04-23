@@ -4186,6 +4186,9 @@ int wolfmqtt_broker(int argc, char** argv)
 
 #if !defined(WOLFMQTT_WOLFIP) && !defined(WOLFMQTT_BROKER_CUSTOM_NET) && \
     !defined(NO_MAIN_DRIVER)
+    /* Reset shutdown flag so this wrapper is reusable across multiple
+     * invocations in the same process (tests, embedding). */
+    g_broker_shutdown = 0;
     signal(SIGINT, broker_signal_handler);
     signal(SIGTERM, broker_signal_handler);
 

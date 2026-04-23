@@ -470,6 +470,13 @@ static void *subscribe_task(void *param)
     }
 #endif
 
+    /* Broker rejected the subscription: signal the other threads to stop
+     * so waitMessage_task (which will never receive the expected messages)
+     * does not hang this example. */
+    if (rc == MQTT_CODE_ERROR_SUBSCRIBE_REJECTED) {
+        mqtt_stop_set();
+    }
+
     THREAD_EXIT(0);
 }
 
