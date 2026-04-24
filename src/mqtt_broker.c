@@ -35,7 +35,19 @@
 
 #ifdef WOLFMQTT_BROKER
 
-#define BROKER_FORCE_ZERO(mem, len) Mqtt_ForceZero(mem, (word32)(len))
+/* Secure memory zeroing - uses volatile pointer to prevent the compiler
+ * from optimizing away the stores (dead-store elimination). */
+static void MqttBroker_ForceZero(void* mem, word32 len)
+{
+    volatile byte* p = (volatile byte*)mem;
+    word32 i;
+    for (i = 0; i < len; i++) {
+        p[i] = 0;
+    }
+}
+
+#define BROKER_FORCE_ZERO(mem, len) \
+    MqttBroker_ForceZero(mem, (word32)(len))
 
 /* -------------------------------------------------------------------------- */
 /* Platform includes                                                           */
@@ -2693,6 +2705,13 @@ static int BrokerHandle_Connect(BrokerClient* bc, int rx_len,
         return rc;
     }
 
+#ifdef WOLFMQTT_V5
+    /* Initialize early so every `goto send_connack` below produces a CONNACK
+     * matching the client's protocol level (v5 CONNACK has a Properties
+     * length and uses v5 reason codes). */
+    ack.protocol_level = mc.protocol_level;
+#endif
+
     /* Store client ID */
 #ifdef WOLFMQTT_STATIC_MEMORY
     bc->client_id[0] = '\0';
@@ -2909,7 +2928,6 @@ static int BrokerHandle_Connect(BrokerClient* bc, int rx_len,
     ack.flags = 0;
     ack.return_code = MQTT_CONNECT_ACK_CODE_ACCEPTED;
 #ifdef WOLFMQTT_V5
-    ack.protocol_level = mc.protocol_level;
     ack.props = NULL;
 #endif
 

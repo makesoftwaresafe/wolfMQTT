@@ -2741,27 +2741,28 @@ int MqttDecode_Auth(byte *rx_buf, int rx_buf_len, MqttAuth *auth)
                     if (tmp < 0)
                         return tmp;
                     rx_payload += tmp;
-            }
-            else if (auth->reason_code != MQTT_REASON_SUCCESS) {
-                /* The Reason Code and Property Length can be omitted if the
-                   Reason Code is 0x00 (Success) and there are no Properties.
-                   In this case the AUTH has a Remaining Length of 0. */
-                return MQTT_TRACE_ERROR(MQTT_CODE_ERROR_MALFORMED_DATA);
-            }
-            if (auth->props != NULL) {
-                /* Must have Authentication Method */
+                }
+                else if (auth->reason_code != MQTT_REASON_SUCCESS) {
+                    /* The Reason Code and Property Length can be omitted if
+                       the Reason Code is 0x00 (Success) and there are no
+                       Properties. In this case the AUTH has a Remaining
+                       Length of 0. */
+                    return MQTT_TRACE_ERROR(MQTT_CODE_ERROR_MALFORMED_DATA);
+                }
+                if (auth->props != NULL) {
+                    /* Must have Authentication Method */
 
-                /* Must have Authentication Data */
+                    /* Must have Authentication Data */
 
-                /* May have zero or more User Property pairs */
+                    /* May have zero or more User Property pairs */
+                }
+                else {
+                    return MQTT_TRACE_ERROR(MQTT_CODE_ERROR_MALFORMED_DATA);
+                }
             }
             else {
                 return MQTT_TRACE_ERROR(MQTT_CODE_ERROR_MALFORMED_DATA);
             }
-        }
-        else {
-            return MQTT_TRACE_ERROR(MQTT_CODE_ERROR_MALFORMED_DATA);
-        }
         }
         else {
             return MQTT_TRACE_ERROR(MQTT_CODE_ERROR_MALFORMED_DATA);
