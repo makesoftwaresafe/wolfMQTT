@@ -801,8 +801,18 @@ int MqttEncode_Connect(byte *tx_buf, int tx_buf_len, MqttConnect *mc_connect)
     }
 #endif
 
-    remain_len += (int)XSTRLEN(mc_connect->client_id) + MQTT_DATA_LEN_SIZE;
+    /* MQTT UTF-8 strings are limited to 65535 bytes [MQTT-1.5.3]. Check here
+     * (before writing the fixed header) so a later MqttEncode_String failure
+     * cannot corrupt tx_payload via `tx_payload += -1`. */
+    {
+        size_t str_len = XSTRLEN(mc_connect->client_id);
+        if (str_len > (size_t)0xFFFF) {
+            return MQTT_TRACE_ERROR(MQTT_CODE_ERROR_BAD_ARG);
+        }
+        remain_len += (int)str_len + MQTT_DATA_LEN_SIZE;
+    }
     if (mc_connect->enable_lwt) {
+        size_t str_len;
         /* Verify all required fields are present */
         if (mc_connect->lwt_msg == NULL ||
             mc_connect->lwt_msg->topic_name == NULL ||
@@ -811,8 +821,12 @@ int MqttEncode_Connect(byte *tx_buf, int tx_buf_len, MqttConnect *mc_connect)
         {
             return MQTT_TRACE_ERROR(MQTT_CODE_ERROR_BAD_ARG);
         }
+        str_len = XSTRLEN(mc_connect->lwt_msg->topic_name);
+        if (str_len > (size_t)0xFFFF) {
+            return MQTT_TRACE_ERROR(MQTT_CODE_ERROR_BAD_ARG);
+        }
 
-        remain_len += (int)XSTRLEN(mc_connect->lwt_msg->topic_name);
+        remain_len += (int)str_len;
         remain_len += MQTT_DATA_LEN_SIZE;
         /* LWT payload uses word16 length prefix, validate it fits */
         if (mc_connect->lwt_msg->total_len > (word32)0xFFFF) {
@@ -841,10 +855,18 @@ int MqttEncode_Connect(byte *tx_buf, int tx_buf_len, MqttConnect *mc_connect)
 #endif
     }
     if (mc_connect->username) {
-        remain_len += (int)XSTRLEN(mc_connect->username) + MQTT_DATA_LEN_SIZE;
+        size_t str_len = XSTRLEN(mc_connect->username);
+        if (str_len > (size_t)0xFFFF) {
+            return MQTT_TRACE_ERROR(MQTT_CODE_ERROR_BAD_ARG);
+        }
+        remain_len += (int)str_len + MQTT_DATA_LEN_SIZE;
     }
     if (mc_connect->password) {
-        remain_len += (int)XSTRLEN(mc_connect->password) + MQTT_DATA_LEN_SIZE;
+        size_t str_len = XSTRLEN(mc_connect->password);
+        if (str_len > (size_t)0xFFFF) {
+            return MQTT_TRACE_ERROR(MQTT_CODE_ERROR_BAD_ARG);
+        }
+        remain_len += (int)str_len + MQTT_DATA_LEN_SIZE;
     }
 
     /* Encode fixed header */
@@ -1302,9 +1324,18 @@ int MqttEncode_Publish(byte *tx_buf, int tx_buf_len, MqttPublish *publish,
     if (tx_buf == NULL || publish == NULL) {
         return MQTT_TRACE_ERROR(MQTT_CODE_ERROR_BAD_ARG);
     }
+    /* MQTT UTF-8 strings are limited to 65535 bytes [MQTT-1.5.3]. Check here
+     * before writing the fixed header so a later MqttEncode_String failure
+     * cannot corrupt tx_payload via `tx_payload += -1`. */
+    {
+        size_t str_len = XSTRLEN(publish->topic_name);
+        if (str_len > (size_t)0xFFFF) {
+            return MQTT_TRACE_ERROR(MQTT_CODE_ERROR_BAD_ARG);
+        }
 
-    /* Determine packet length */
-    variable_len = (int)XSTRLEN(publish->topic_name) + MQTT_DATA_LEN_SIZE;
+        /* Determine packet length */
+        variable_len = (int)str_len + MQTT_DATA_LEN_SIZE;
+    }
     if (publish->qos > MQTT_QOS_0) {
         if (publish->packet_id == 0) {
             return MQTT_TRACE_ERROR(MQTT_CODE_ERROR_PACKET_ID);
@@ -1721,7 +1752,12 @@ int MqttEncode_Subscribe(byte *tx_buf, int tx_buf_len,
     for (i = 0; i < subscribe->topic_count; i++) {
         topic = &subscribe->topics[i];
         if ((topic != NULL) && (topic->topic_filter != NULL)) {
-            remain_len += (int)XSTRLEN(topic->topic_filter) + MQTT_DATA_LEN_SIZE;
+            /* MQTT UTF-8 strings are limited to 65535 bytes [MQTT-1.5.3] */
+            size_t str_len = XSTRLEN(topic->topic_filter);
+            if (str_len > (size_t)0xFFFF) {
+                return MQTT_TRACE_ERROR(MQTT_CODE_ERROR_BAD_ARG);
+            }
+            remain_len += (int)str_len + MQTT_DATA_LEN_SIZE;
             remain_len++; /* For QoS */
         }
         else {
@@ -2016,8 +2052,12 @@ int MqttEncode_Unsubscribe(byte *tx_buf, int tx_buf_len,
     for (i = 0; i < unsubscribe->topic_count; i++) {
         topic = &unsubscribe->topics[i];
         if ((topic != NULL) && (topic->topic_filter != NULL)) {
-            remain_len += (int)XSTRLEN(topic->topic_filter) +
-                                MQTT_DATA_LEN_SIZE;
+            /* MQTT UTF-8 strings are limited to 65535 bytes [MQTT-1.5.3] */
+            size_t str_len = XSTRLEN(topic->topic_filter);
+            if (str_len > (size_t)0xFFFF) {
+                return MQTT_TRACE_ERROR(MQTT_CODE_ERROR_BAD_ARG);
+            }
+            remain_len += (int)str_len + MQTT_DATA_LEN_SIZE;
         }
         else {
             /* Topic count is invalid */
@@ -2675,7 +2715,8 @@ int MqttDecode_Auth(byte *rx_buf, int rx_buf_len, MqttAuth *auth)
         /* Decode variable header */
         auth->reason_code = *rx_payload++;
         if ((auth->reason_code == MQTT_REASON_SUCCESS) ||
-            (auth->reason_code == MQTT_REASON_CONT_AUTH))
+            (auth->reason_code == MQTT_REASON_CONT_AUTH) ||
+            (auth->reason_code == MQTT_REASON_REAUTH))
         {
             /* Decode Length of Properties */
             if (rx_buf_len < (rx_payload - rx_buf)) {
@@ -2700,27 +2741,28 @@ int MqttDecode_Auth(byte *rx_buf, int rx_buf_len, MqttAuth *auth)
                     if (tmp < 0)
                         return tmp;
                     rx_payload += tmp;
-            }
-            else if (auth->reason_code != MQTT_REASON_SUCCESS) {
-                /* The Reason Code and Property Length can be omitted if the
-                   Reason Code is 0x00 (Success) and there are no Properties.
-                   In this case the AUTH has a Remaining Length of 0. */
-                return MQTT_TRACE_ERROR(MQTT_CODE_ERROR_MALFORMED_DATA);
-            }
-            if (auth->props != NULL) {
-                /* Must have Authentication Method */
+                }
+                else if (auth->reason_code != MQTT_REASON_SUCCESS) {
+                    /* The Reason Code and Property Length can be omitted if
+                       the Reason Code is 0x00 (Success) and there are no
+                       Properties. In this case the AUTH has a Remaining
+                       Length of 0. */
+                    return MQTT_TRACE_ERROR(MQTT_CODE_ERROR_MALFORMED_DATA);
+                }
+                if (auth->props != NULL) {
+                    /* Must have Authentication Method */
 
-                /* Must have Authentication Data */
+                    /* Must have Authentication Data */
 
-                /* May have zero or more User Property pairs */
+                    /* May have zero or more User Property pairs */
+                }
+                else {
+                    return MQTT_TRACE_ERROR(MQTT_CODE_ERROR_MALFORMED_DATA);
+                }
             }
             else {
                 return MQTT_TRACE_ERROR(MQTT_CODE_ERROR_MALFORMED_DATA);
             }
-        }
-        else {
-            return MQTT_TRACE_ERROR(MQTT_CODE_ERROR_OUT_OF_BUFFER);
-        }
         }
         else {
             return MQTT_TRACE_ERROR(MQTT_CODE_ERROR_MALFORMED_DATA);

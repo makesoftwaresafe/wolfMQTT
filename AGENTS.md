@@ -147,6 +147,50 @@ Uses `.clang-format` with LLVM base style:
 - Tab indentation (4-space tabs)
 - K&R inspired style
 
+## Test Integrity
+Never modify, delete, skip, or weaken tests to make them pass.
+Never fabricate, adjust, or derive expected values from the code under test just to force a pass; fixed expected values are acceptable when they come from an independent oracle, such as committed test vectors or other externally verified results.
+A passing test suite achieved by changing the tests (not the implementation) is not a passing result.
+Fix the code. If the code cannot be fixed within scope, escalate.
+
+Do not use the code under test as its only oracle where an independent oracle is required, especially for crypto, KDFs, canonical encodings, and other security-sensitive transformations. In those cases, tests should use known external test vectors, cross-validation against an independent implementation, or bit-exact comparison against a trusted reference path. For example, a test that only encrypts with function A and decrypts with function A is insufficient to validate the correctness of the cryptographic primitive.
+
+Roundtrip/property tests are still acceptable where they match the behavior being validated, such as encode/decode or serialize/parse flows already used elsewhere in this repository, but they should not be the sole oracle when stronger independent validation is needed.
+
+## No Fabrication
+Never report status, results, or completion that does not reflect work actually performed.
+If you are uncertain whether a step succeeded, say so explicitly. Do not paper over uncertainty with confident-sounding output.
+
+## Exit Code Discipline
+Every shell command's exit code must be checked.
+Never proceed after a silent failure.
+A command that failed and was ignored is not a completed step.
+
+## MQTT Specification Discipline
+Wire format and protocol behavior are governed by the published MQTT specifications. Treat the spec as the source of truth, not the code.
+
+Relevant specifications:
+- MQTT v3.1.1 — OASIS Standard (`mqtt-v3.1.1-os`)
+- MQTT v5.0 — OASIS Standard (`mqtt-v5.0`)
+- MQTT-SN v1.2 — OASIS
+
+When implementing or testing a normative requirement, cite it in a comment so reviewers can verify against the spec:
+- MQTT v3.1.1 / v5.0: bracketed conformance identifiers, e.g. `[MQTT-3.8.1-1]`, `[MQTT-2.3.1-1]`.
+- When a rule has no bracketed identifier, reference the section number, e.g. `MQTT 5.0 section 3.15.2`.
+- MQTT-SN v1.2: `MQTT-SN 1.2 section X.Y`.
+
+Match the version scope of the change. MQTT v5.0 adds packets and fields (AUTH, Reason Codes, Properties) that do not exist in v3.1.1; do not apply a v5-only rule to v3.1.1 code paths or vice versa. Guard v5-only logic with `WOLFMQTT_V5` and v3.1.1-only logic accordingly.
+
+## Test Oracle Discipline
+Do not use the code under test as its own oracle for wire-format behavior. For encoder or decoder tests, use one of:
+- A hand-constructed byte sequence that matches the spec wire format, built by reading the relevant section (not captured from encoder output). Comment the byte layout so the fixture is auditable.
+- Values from the spec's worked examples or conformance annex.
+- A cross-check against an independent implementation (e.g. mosquitto) captured once and committed as a fixed byte array.
+
+Roundtrip tests (encode then decode, or vice versa) are acceptable for regression and structural coverage, but they cannot be the sole oracle for a wire-format rule — a bug present in both encoder and decoder will still roundtrip. Pair roundtrip coverage with at least one independent fixture per rule.
+
+Tests must be fully offline and must not fetch vectors from the network at runtime.
+
 ## Dependencies
 
 - **wolfSSL** - Required for TLS support

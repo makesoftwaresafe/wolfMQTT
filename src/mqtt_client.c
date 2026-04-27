@@ -26,7 +26,19 @@
 
 #include "wolfmqtt/mqtt_client.h"
 
-#define CLIENT_FORCE_ZERO(mem, len) Mqtt_ForceZero(mem, (word32)(len))
+/* Secure memory zeroing - uses volatile pointer to prevent the compiler
+ * from optimizing away the stores (dead-store elimination). */
+static void MqttClient_ForceZero(void* mem, word32 len)
+{
+    volatile byte* p = (volatile byte*)mem;
+    word32 i;
+    for (i = 0; i < len; i++) {
+        p[i] = 0;
+    }
+}
+
+#define CLIENT_FORCE_ZERO(mem, len) \
+    MqttClient_ForceZero(mem, (word32)(len))
 
 /* DOCUMENTED BUILD OPTIONS:
  *
@@ -3013,6 +3025,7 @@ int MqttClient_NetDisconnect(MqttClient *client)
 {
 #ifdef WOLFMQTT_MULTITHREAD
     MqttPendResp *tmpResp;
+    MqttPendResp *nextResp;
     int rc;
 #endif
 
@@ -3027,7 +3040,6 @@ int MqttClient_NetDisconnect(MqttClient *client)
     #ifdef WOLFMQTT_DEBUG_CLIENT
         PRINTF("Net Disconnect: Removing pending responses");
     #endif
-        MqttPendResp *nextResp;
         for (tmpResp = client->firstPendResp;
              tmpResp != NULL;
              tmpResp = nextResp) {

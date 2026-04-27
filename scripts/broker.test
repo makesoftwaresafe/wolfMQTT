@@ -297,6 +297,93 @@ else
 fi
 fi # has_will
 
+# --- Test 6b: Keep-alive timeout window precision ---
+echo ""
+echo "--- Test 6b: Keep-alive timeout window ---"
+if [ "$has_will" = "no" ]; then
+    echo "SKIP: Keep-alive timeout window (not built with will support)"
+else
+# Validate that the broker's 1.5x keep_alive multiplier (mqtt_broker.c:
+# keep_alive_sec * 3 / 2) is honored. Test 6 above only checks that the LWT
+# is eventually delivered, so silent mutations (e.g. *1, *2, *3) would still
+# pass. This test measures wall-clock time from client freeze to LWT
+# delivery and asserts a tight bound that catches significant multiplier
+# changes.
+#
+# k=4 is used to widen the discrimination window. The broker checks timing
+# at integer-second resolution, so the keepalive fire happens at
+# last_rx_int + threshold + 1 wall seconds, where threshold = floor(k*mult).
+#
+# Expected fire window (relative to client freeze):
+#   mult  threshold  fire window (s)  +will_delay (v5)
+#   1.0       4           4-5              9-10
+#   1.5       6           6-7             11-12   <- spec compliant
+#   2.0       8           8-9             13-14
+#   3.0      12          12-13            17-18
+#   4.0      16          16-17            21-22
+v5_active=no
+if ./$sub_bin -h 2>&1 | grep -q "Max packet size"; then
+    v5_active=yes
+fi
+if [ "$v5_active" = "yes" ]; then
+    LO_BOUND=10
+    HI_BOUND=14
+else
+    LO_BOUND=5
+    HI_BOUND=9
+fi
+rm -f "${TMP_DIR}/t6b_watcher.ready" "${TMP_DIR}/t6b_client.ready"
+t6b_setup_ok=1
+timeout 30 ./$sub_bin -T -h 127.0.0.1 -p $port -n "wolfMQTT/example/lwttopic" \
+    -i "t6b_watcher" -R "${TMP_DIR}/t6b_watcher.ready" \
+    >"${TMP_DIR}/t6b_sub.log" 2>&1 &
+T6B_WATCHER_PID=$!
+TEST_PIDS+=($T6B_WATCHER_PID)
+if ! wait_for_file "${TMP_DIR}/t6b_watcher.ready" 5; then
+    echo "FAIL: Keep-alive timeout window (watcher did not become ready)"
+    FAIL=1
+    t6b_setup_ok=0
+fi
+./$sub_bin -T -h 127.0.0.1 -p $port -n "test/ka2_trigger" -i "ka2_client" -l -k 4 \
+    -R "${TMP_DIR}/t6b_client.ready" >"${TMP_DIR}/t6b_client.log" 2>&1 &
+T6B_CLIENT_PID=$!
+TEST_PIDS+=($T6B_CLIENT_PID)
+if ! wait_for_file "${TMP_DIR}/t6b_client.ready" 5; then
+    echo "FAIL: Keep-alive timeout window (client did not become ready)"
+    FAIL=1
+    t6b_setup_ok=0
+fi
+if [ $t6b_setup_ok -eq 1 ]; then
+    kill -STOP $T6B_CLIENT_PID 2>/dev/null
+    T6B_T_START=$(date +%s)
+    T6B_ELAPSED=-1
+    T6B_DEADLINE=$((T6B_T_START + HI_BOUND + 5))
+    while [ $(date +%s) -lt $T6B_DEADLINE ]; do
+        if grep -q "ka2_client" "${TMP_DIR}/t6b_sub.log" 2>/dev/null; then
+            T6B_ELAPSED=$(($(date +%s) - T6B_T_START))
+            break
+        fi
+        sleep 0.1
+    done
+fi
+kill -9 $T6B_CLIENT_PID 2>/dev/null
+wait $T6B_CLIENT_PID 2>/dev/null || true
+kill $T6B_WATCHER_PID 2>/dev/null
+wait $T6B_WATCHER_PID 2>/dev/null || true
+TEST_PIDS=()
+if [ $t6b_setup_ok -eq 1 ]; then
+    if [ $T6B_ELAPSED -lt 0 ]; then
+        echo "FAIL: Keep-alive timeout window (no LWT within $((HI_BOUND + 5))s)"
+        FAIL=1
+    elif [ $T6B_ELAPSED -lt $LO_BOUND ] || [ $T6B_ELAPSED -gt $HI_BOUND ]; then
+        echo "FAIL: Keep-alive timeout window (elapsed=${T6B_ELAPSED}s, expected ${LO_BOUND}-${HI_BOUND}s)"
+        FAIL=1
+    else
+        echo "PASS: Keep-alive timeout window (elapsed=${T6B_ELAPSED}s, expected ${LO_BOUND}-${HI_BOUND}s)"
+    fi
+fi
+fi # has_will
+
 fi # skip_plain (tests 1-6)
 
 # --- Test 7: Username/password auth ---
