@@ -175,8 +175,17 @@ static int BrokerStrCompare(const char* a, const char* b, int cmp_len)
 #endif /* WOLFMQTT_BROKER_AUTH */
 
 /* Store a string of known length into a BrokerClient field.
- * Static mode: copies into fixed-size buffer with truncation.
- * Dynamic mode: frees old value, allocates new buffer, copies. */
+ * Static mode: copies into fixed-size buffer with truncation. The
+ *   sensitive-wipe variant zeros the full max_len buffer, so it is
+ *   unaffected by string contents.
+ * Dynamic mode: frees old value, allocates new buffer, copies. The
+ *   sensitive-wipe path uses XSTRLEN(buf)+1, which is correct only when
+ *   stored values contain no embedded NUL. MqttDecode_String enforces
+ *   [MQTT-1.5.3-2] / [MQTT-1.5.4-2] (rejects U+0000), so any string that
+ *   reaches this function via the protocol path satisfies that invariant.
+ *   Do not call the dynamic-mode sensitive path with src bytes that bypass
+ *   that decoder without first capping src_len at the first NUL, or the
+ *   wipe will leave trailing bytes uncleared. */
 #ifdef WOLFMQTT_STATIC_MEMORY
 static void BrokerStore_String(char* dst, int max_len,
     const char* src, word16 src_len)

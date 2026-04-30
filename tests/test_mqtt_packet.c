@@ -555,6 +555,23 @@ TEST(decode_publish_malformed_variable_exceeds_remain)
     ASSERT_EQ(MQTT_CODE_ERROR_OUT_OF_BUFFER, rc);
 }
 
+/* [MQTT-1.5.3-2] / [MQTT-4.7.3-2]: a topic name containing U+0000 must be
+ * rejected. Without this check, downstream broker logic uses C-string
+ * semantics on the stored topic and a publish to "se\0cret" would route
+ * to subscribers of "se". */
+TEST(decode_publish_rejects_nul_in_topic)
+{
+    byte buf[] = { 0x30, 10,
+                   0x00, 0x07, 's', 'e', 0x00, 'c', 'r', 'e', 't',
+                   'X' };
+    MqttPublish pub;
+    int rc;
+
+    XMEMSET(&pub, 0, sizeof(pub));
+    rc = MqttDecode_Publish(buf, (int)sizeof(buf), &pub);
+    ASSERT_EQ(MQTT_CODE_ERROR_MALFORMED_DATA, rc);
+}
+
 #ifdef WOLFMQTT_V5
 /* Hand-validated MQTT v5 PUBLISH packet (independent oracle, not produced by
  * MqttEncode_Publish) so encode and decode cannot hide a shared bug:
@@ -1501,6 +1518,98 @@ TEST(decode_connect_v311_with_lwt)
     ASSERT_NOT_NULL(dec_lwt.buffer);
     ASSERT_EQ(0, XMEMCMP(dec_lwt.buffer, lwt_payload, sizeof(lwt_payload)));
 }
+
+/* [MQTT-1.5.3-2]: an embedded NUL in the ClientId must be rejected.
+ * Otherwise BrokerClient_FindByClientId() (which uses XSTRCMP) will treat
+ * "ad\0min" as "ad" and collide with an existing "ad" session. */
+TEST(decode_connect_rejects_nul_in_client_id)
+{
+    byte buf[] = {
+        0x10, 0x12,                         /* CONNECT, remain_len = 18 */
+        0x00, 0x04, 'M', 'Q', 'T', 'T',     /* protocol name */
+        0x04,                               /* protocol level v3.1.1 */
+        0x02,                               /* flags: clean_session */
+        0x00, 0x3C,                         /* keep alive */
+        0x00, 0x06, 'a', 'd', 0x00, 'm', 'i', 'n'  /* client_id with NUL */
+    };
+    MqttConnect dec;
+    int rc;
+
+    XMEMSET(&dec, 0, sizeof(dec));
+    rc = MqttDecode_Connect(buf, (int)sizeof(buf), &dec);
+    ASSERT_EQ(MQTT_CODE_ERROR_MALFORMED_DATA, rc);
+}
+
+/* [MQTT-1.5.3-2]: an embedded NUL in the username must be rejected.
+ * Otherwise BrokerStrCompare() (which uses XSTRLEN) will treat
+ * "us\0er" as "us" and accept it against a configured "us" credential. */
+TEST(decode_connect_rejects_nul_in_username)
+{
+    byte buf[] = {
+        0x10, 0x15,                         /* CONNECT, remain_len = 21 */
+        0x00, 0x04, 'M', 'Q', 'T', 'T',
+        0x04,
+        0x82,                               /* clean_session + USERNAME */
+        0x00, 0x3C,
+        0x00, 0x02, 'c', '1',               /* client_id "c1" */
+        0x00, 0x05, 'u', 's', 0x00, 'e', 'r'  /* username with NUL */
+    };
+    MqttConnect dec;
+    int rc;
+
+    XMEMSET(&dec, 0, sizeof(dec));
+    rc = MqttDecode_Connect(buf, (int)sizeof(buf), &dec);
+    ASSERT_EQ(MQTT_CODE_ERROR_MALFORMED_DATA, rc);
+}
+
+/* [MQTT-1.5.3-2]: an embedded NUL in the password must be rejected.
+ * Same auth-bypass mechanism as the username test, applied to the
+ * password field. */
+TEST(decode_connect_rejects_nul_in_password)
+{
+    byte buf[] = {
+        0x10, 0x16,                         /* CONNECT, remain_len = 22 */
+        0x00, 0x04, 'M', 'Q', 'T', 'T',
+        0x04,
+        0xC2,                               /* clean_session + USER + PASS */
+        0x00, 0x3C,
+        0x00, 0x02, 'c', '1',
+        0x00, 0x01, 'u',                    /* username "u" */
+        0x00, 0x03, 'p', 0x00, 'w'          /* password with NUL */
+    };
+    MqttConnect dec;
+    int rc;
+
+    XMEMSET(&dec, 0, sizeof(dec));
+    rc = MqttDecode_Connect(buf, (int)sizeof(buf), &dec);
+    ASSERT_EQ(MQTT_CODE_ERROR_MALFORMED_DATA, rc);
+}
+
+/* [MQTT-1.5.3-2] / [MQTT-4.7.3-2]: a Will Topic with embedded NUL must
+ * be rejected. The same C-string truncation that affects PUBLISH topics
+ * applies to Will Topics persisted by the broker. */
+TEST(decode_connect_rejects_nul_in_will_topic)
+{
+    byte buf[] = {
+        0x10, 0x16,                         /* CONNECT, remain_len = 22 */
+        0x00, 0x04, 'M', 'Q', 'T', 'T',
+        0x04,
+        0x06,                               /* clean_session + WILL_FLAG */
+        0x00, 0x3C,
+        0x00, 0x02, 'c', '1',               /* client_id */
+        0x00, 0x03, 't', 0x00, 'p',         /* will topic with NUL */
+        0x00, 0x01, 'X'                     /* will payload */
+    };
+    MqttConnect dec;
+    MqttMessage lwt;
+    int rc;
+
+    XMEMSET(&dec, 0, sizeof(dec));
+    XMEMSET(&lwt, 0, sizeof(lwt));
+    dec.lwt_msg = &lwt;
+    rc = MqttDecode_Connect(buf, (int)sizeof(buf), &dec);
+    ASSERT_EQ(MQTT_CODE_ERROR_MALFORMED_DATA, rc);
+}
 #endif /* WOLFMQTT_BROKER */
 
 /* ============================================================================
@@ -1564,6 +1673,28 @@ TEST(decode_subscribe_v311_qos3_reserved)
     ASSERT_EQ(MQTT_QOS_3, topic_arr[0].qos);
 }
 
+/* [MQTT-1.5.3-2] / [MQTT-4.7.3-2]: a topic filter containing U+0000 must
+ * be rejected. Without this check, a stored filter "a\0b" would match
+ * topic "a" once iteration hits the embedded NUL in BrokerTopicMatch. */
+TEST(decode_subscribe_rejects_nul_in_filter)
+{
+    byte rx_buf[] = {
+        0x82, 0x08,
+        0x00, 0x01,                    /* packet_id */
+        0x00, 0x03, 'a', 0x00, 'b',    /* filter "a\0b" */
+        0x00                           /* options: QoS 0 */
+    };
+    MqttSubscribe sub;
+    MqttTopic topic_arr[1];
+    int rc;
+
+    XMEMSET(&sub, 0, sizeof(sub));
+    XMEMSET(topic_arr, 0, sizeof(topic_arr));
+    sub.topics = topic_arr;
+    rc = MqttDecode_Subscribe(rx_buf, (int)sizeof(rx_buf), &sub);
+    ASSERT_EQ(MQTT_CODE_ERROR_MALFORMED_DATA, rc);
+}
+
 #ifdef WOLFMQTT_V5
 /* [MQTT-3.8.3] v5 SUBSCRIBE options byte carries QoS (bits 0-1), No Local
  * (bit 2), Retain As Published (bit 3), and Retain Handling (bits 4-5).
@@ -1595,7 +1726,57 @@ TEST(decode_subscribe_v5_options_byte_qos_extracted)
     ASSERT_EQ(1, sub.topic_count);
     ASSERT_EQ(MQTT_QOS_1, topic_arr[0].qos);
 }
+
+/* [MQTT-1.5.4-2]: an embedded NUL in a v5 STRING property must be
+ * rejected. Uses a PUBLISH packet with a Content Type property whose
+ * value contains 0x00. The MqttDecode_Props path now propagates the
+ * underlying MALFORMED_DATA from MqttDecode_String instead of masking
+ * it as MQTT_CODE_ERROR_PROPERTY. */
+TEST(decode_publish_v5_rejects_nul_in_string_property)
+{
+    /* Wire: PUBLISH QoS 0, remain_len=13, topic "a/b", props_len=7,
+     *       prop 0x03 CONTENT_TYPE, str_len=4, "t\0xt". No payload. */
+    byte buf[] = {
+        0x30, 13,
+        0x00, 0x03, 'a', '/', 'b',
+        0x07,
+        0x03, 0x00, 0x04, 't', 0x00, 'x', 't'
+    };
+    MqttPublish pub;
+    int rc;
+
+    XMEMSET(&pub, 0, sizeof(pub));
+    pub.protocol_level = MQTT_CONNECT_PROTOCOL_LEVEL_5;
+    rc = MqttDecode_Publish(buf, (int)sizeof(buf), &pub);
+    ASSERT_EQ(MQTT_CODE_ERROR_MALFORMED_DATA, rc);
+    MqttProps_Free(pub.props);
+}
 #endif /* WOLFMQTT_V5 */
+
+/* ============================================================================
+ * MqttDecode_Unsubscribe (broker-side)
+ * ============================================================================ */
+
+/* [MQTT-1.5.3-2] / [MQTT-4.7.3-2]: a topic filter containing U+0000 in an
+ * UNSUBSCRIBE must be rejected — MqttDecode_Unsubscribe shares the same
+ * MqttDecode_String chokepoint that SUBSCRIBE uses. */
+TEST(decode_unsubscribe_rejects_nul_in_filter)
+{
+    byte rx_buf[] = {
+        0xA2, 0x07,
+        0x00, 0x01,                    /* packet_id */
+        0x00, 0x03, 'a', 0x00, 'b'     /* filter "a\0b" */
+    };
+    MqttUnsubscribe unsub;
+    MqttTopic topic_arr[1];
+    int rc;
+
+    XMEMSET(&unsub, 0, sizeof(unsub));
+    XMEMSET(topic_arr, 0, sizeof(topic_arr));
+    unsub.topics = topic_arr;
+    rc = MqttDecode_Unsubscribe(rx_buf, (int)sizeof(rx_buf), &unsub);
+    ASSERT_EQ(MQTT_CODE_ERROR_MALFORMED_DATA, rc);
+}
 #endif /* WOLFMQTT_BROKER */
 
 /* ============================================================================
@@ -2127,6 +2308,7 @@ void run_mqtt_packet_tests(void)
     RUN_TEST(decode_publish_qos1_valid);
     RUN_TEST(decode_publish_qos0_zero_payload);
     RUN_TEST(decode_publish_malformed_variable_exceeds_remain);
+    RUN_TEST(decode_publish_rejects_nul_in_topic);
 #ifdef WOLFMQTT_V5
     RUN_TEST(decode_publish_v5_content_type_property);
 #endif
@@ -2178,13 +2360,22 @@ void run_mqtt_packet_tests(void)
     RUN_TEST(decode_connect_wrong_protocol_name);
     RUN_TEST(decode_connect_wrong_protocol_length);
     RUN_TEST(decode_connect_v311_with_lwt);
+    RUN_TEST(decode_connect_rejects_nul_in_client_id);
+    RUN_TEST(decode_connect_rejects_nul_in_username);
+    RUN_TEST(decode_connect_rejects_nul_in_password);
+    RUN_TEST(decode_connect_rejects_nul_in_will_topic);
 
     /* MqttDecode_Subscribe */
     RUN_TEST(decode_subscribe_v311_single_topic);
     RUN_TEST(decode_subscribe_v311_qos3_reserved);
+    RUN_TEST(decode_subscribe_rejects_nul_in_filter);
 #ifdef WOLFMQTT_V5
     RUN_TEST(decode_subscribe_v5_options_byte_qos_extracted);
+    RUN_TEST(decode_publish_v5_rejects_nul_in_string_property);
 #endif
+
+    /* MqttDecode_Unsubscribe */
+    RUN_TEST(decode_unsubscribe_rejects_nul_in_filter);
 #endif
 
     /* QoS 2 ack arithmetic */

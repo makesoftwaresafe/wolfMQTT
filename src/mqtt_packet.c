@@ -347,6 +347,19 @@ int MqttDecode_String(byte *buf, const char **pstr, word16 *pstr_len, word32 buf
         return MQTT_TRACE_ERROR(MQTT_CODE_ERROR_OUT_OF_BUFFER);
     }
     buf += len;
+    /* [MQTT-1.5.3-2] / [MQTT-1.5.4-2]: a UTF-8 encoded string MUST NOT
+     * include U+0000. Reject so downstream C-string handling cannot be
+     * tricked by an embedded NUL truncating the value.
+     *
+     * The CONNECT Password field is technically Binary Data per spec,
+     * not a UTF-8 string, so the prohibition does not formally apply.
+     * The check is still enforced here because wolfMQTT compares
+     * passwords with XSTRLEN/XSTRCMP, so a binary password with an
+     * embedded NUL would be silently truncated and enable an auth
+     * bypass — exactly the class of attack this validation prevents. */
+    if (str_len > 0 && XMEMCHR(buf, 0x00, str_len) != NULL) {
+        return MQTT_TRACE_ERROR(MQTT_CODE_ERROR_MALFORMED_DATA);
+    }
     if (pstr_len) {
         *pstr_len = str_len;
     }
@@ -640,7 +653,10 @@ int MqttDecode_Props(MqttPacketType packet, MqttProp** props, byte* pbuf,
                         (const char**)&cur_prop->data_str.str,
                         &cur_prop->data_str.len,
                         (word32)(buf_len - (buf - pbuf)));
-                if ((tmp >= 0) && ((word32)tmp <= (buf_len - (buf - pbuf)))) {
+                if (tmp < 0) {
+                    rc = tmp;
+                }
+                else if ((word32)tmp <= (buf_len - (buf - pbuf))) {
                     buf += tmp;
                     total += tmp;
                     prop_len -= (word32)tmp;
@@ -702,7 +718,10 @@ int MqttDecode_Props(MqttPacketType packet, MqttProp** props, byte* pbuf,
                         (const char**)&cur_prop->data_str.str,
                         &cur_prop->data_str.len,
                         (word32)(buf_len - (buf - pbuf)));
-                if ((tmp >= 0) && ((word32)tmp <= (buf_len - (buf - pbuf)))) {
+                if (tmp < 0) {
+                    rc = tmp;
+                }
+                else if ((word32)tmp <= (buf_len - (buf - pbuf))) {
                     buf += tmp;
                     total += tmp;
                     prop_len -= (word32)tmp;
@@ -711,8 +730,11 @@ int MqttDecode_Props(MqttPacketType packet, MqttProp** props, byte* pbuf,
                                 (const char**)&cur_prop->data_str2.str,
                                 &cur_prop->data_str2.len,
                                 (word32)(buf_len - (buf - pbuf)));
-                        if ((tmp >= 0) && ((word32)tmp <=
-                            (buf_len - (buf - pbuf)))) {
+                        if (tmp < 0) {
+                            rc = tmp;
+                        }
+                        else if ((word32)tmp <=
+                                 (buf_len - (buf - pbuf))) {
                             buf += tmp;
                             total += tmp;
                             prop_len -= (word32)tmp;
@@ -1464,12 +1486,13 @@ int MqttDecode_Publish(byte *rx_buf, int rx_buf_len, MqttPublish *publish)
     /* Decode variable header */
     variable_len = MqttDecode_String(rx_payload, &publish->topic_name,
         &publish->topic_name_len, (word32)(rx_buf_len - (rx_payload - rx_buf)));
-    if ((variable_len >= 0) && (variable_len + header_len <= rx_buf_len)) {
-        rx_payload += variable_len;
+    if (variable_len < 0) {
+        return variable_len;
     }
-    else {
+    if (variable_len + header_len > rx_buf_len) {
         return MQTT_TRACE_ERROR(MQTT_CODE_ERROR_OUT_OF_BUFFER);
     }
+    rx_payload += variable_len;
 
     /* If QoS > 0 then get packet Id */
     if (publish->qos > MQTT_QOS_0) {

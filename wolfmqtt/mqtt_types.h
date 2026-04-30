@@ -246,6 +246,9 @@ enum MqttPacketResponseCodes {
     #ifndef XMEMCMP
         #define XMEMCMP(s1,s2,n)    memcmp((s1),(s2),(n))
     #endif
+    #ifndef XMEMCHR
+        #define XMEMCHR(s,c,n)      memchr((s),(c),(n))
+    #endif
     #ifndef XATOI
         #define XATOI(s)            atoi((s))
     #endif

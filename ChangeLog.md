@@ -1,5 +1,33 @@
 ## Release Notes
 
+### v2.0.1 (Pending)
+
+* Security Hardening
+    - Reject MQTT UTF-8 encoded strings containing U+0000 in `MqttDecode_String`
+      per [MQTT-1.5.3-2] / [MQTT-1.5.4-2]. Closes an embedded-NUL truncation
+      attack that allowed broker-side auth bypass, ClientId collision, and
+      topic-routing confusion when the broker compared decoded strings with
+      C-string semantics. The check is also applied to the CONNECT Password
+      field (which the spec defines as Binary Data) because wolfMQTT compares
+      passwords with `XSTRLEN`/`XSTRCMP`.
+
+* API / Behavior Changes
+    - `MqttDecode_String` may now return `MQTT_CODE_ERROR_MALFORMED_DATA`
+      when the decoded string contains an embedded NUL byte. Previously only
+      `MQTT_CODE_ERROR_BAD_ARG` and `MQTT_CODE_ERROR_OUT_OF_BUFFER` were
+      possible negative returns.
+    - `MqttDecode_Publish` now propagates the underlying error from
+      `MqttDecode_String` (e.g. `MALFORMED_DATA`) instead of always returning
+      `MQTT_CODE_ERROR_OUT_OF_BUFFER` on topic decode failure.
+    - `MqttDecode_Props` similarly now propagates the underlying error from
+      `MqttDecode_String` for v5 STRING and STRING_PAIR property types
+      (Reason String, Content Type, User Property, etc.) instead of always
+      masking it as `MQTT_CODE_ERROR_PROPERTY`.
+    - New `XMEMCHR(s, c, n)` portability macro added to `mqtt_types.h`
+      (defaults to `memchr`). Builds using `WOLFMQTT_CUSTOM_STRING` must
+      provide their own mapping, matching the pattern used for `XSTRLEN`,
+      `XMEMCMP`, etc.
+
 ### v2.0.0 (03/20/2026)
 Release 2.0.0 has been developed according to wolfSSL's development and QA
 process (see link below) and successfully passed the quality criteria.
