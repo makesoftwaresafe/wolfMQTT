@@ -616,6 +616,77 @@ TEST(decode_publish_v5_content_type_property)
 
     MqttProps_Free(pub.props);
 }
+
+/* [MQTT-1.5.4-2]: an embedded NUL in a v5 STRING property must be
+ * rejected. Uses a PUBLISH packet with a Content Type property whose
+ * value contains 0x00. MqttDecode_Props propagates MALFORMED_DATA from
+ * MqttDecode_String distinctly from generic MQTT_CODE_ERROR_PROPERTY. */
+TEST(decode_publish_v5_rejects_nul_in_string_property)
+{
+    /* Wire: PUBLISH QoS 0, remain_len=13, topic "a/b", props_len=7,
+     *       prop 0x03 CONTENT_TYPE, str_len=4, "t\0xt". No payload. */
+    byte buf[] = {
+        0x30, 13,
+        0x00, 0x03, 'a', '/', 'b',
+        0x07,
+        0x03, 0x00, 0x04, 't', 0x00, 'x', 't'
+    };
+    MqttPublish pub;
+    int rc;
+
+    XMEMSET(&pub, 0, sizeof(pub));
+    pub.protocol_level = MQTT_CONNECT_PROTOCOL_LEVEL_5;
+    rc = MqttDecode_Publish(buf, (int)sizeof(buf), &pub);
+    ASSERT_EQ(MQTT_CODE_ERROR_MALFORMED_DATA, rc);
+    MqttProps_Free(pub.props);
+}
+
+/* STRING_PAIR (USER_PROPERTY) NUL rejection — first string of pair. The
+ * MqttDecode_Props path runs MqttDecode_String twice for STRING_PAIR;
+ * this pins coverage on the first sub-decode propagating MALFORMED_DATA. */
+TEST(decode_publish_v5_rejects_nul_in_user_prop_key)
+{
+    /* Wire: PUBLISH QoS 0, remain_len=14, topic "a/b", props_len=8,
+     *       prop 0x26 USER_PROPERTY, key_len=2 "k\0", val_len=1 "v". */
+    byte buf[] = {
+        0x30, 14,
+        0x00, 0x03, 'a', '/', 'b',
+        0x08,
+        0x26, 0x00, 0x02, 'k', 0x00,
+              0x00, 0x01, 'v'
+    };
+    MqttPublish pub;
+    int rc;
+
+    XMEMSET(&pub, 0, sizeof(pub));
+    pub.protocol_level = MQTT_CONNECT_PROTOCOL_LEVEL_5;
+    rc = MqttDecode_Publish(buf, (int)sizeof(buf), &pub);
+    ASSERT_EQ(MQTT_CODE_ERROR_MALFORMED_DATA, rc);
+    MqttProps_Free(pub.props);
+}
+
+/* STRING_PAIR (USER_PROPERTY) NUL rejection — second string of pair.
+ * Pins coverage on the second sub-decode propagating MALFORMED_DATA. */
+TEST(decode_publish_v5_rejects_nul_in_user_prop_value)
+{
+    /* Wire: PUBLISH QoS 0, remain_len=14, topic "a/b", props_len=8,
+     *       prop 0x26 USER_PROPERTY, key_len=1 "k", val_len=2 "v\0". */
+    byte buf[] = {
+        0x30, 14,
+        0x00, 0x03, 'a', '/', 'b',
+        0x08,
+        0x26, 0x00, 0x01, 'k',
+              0x00, 0x02, 'v', 0x00
+    };
+    MqttPublish pub;
+    int rc;
+
+    XMEMSET(&pub, 0, sizeof(pub));
+    pub.protocol_level = MQTT_CONNECT_PROTOCOL_LEVEL_5;
+    rc = MqttDecode_Publish(buf, (int)sizeof(buf), &pub);
+    ASSERT_EQ(MQTT_CODE_ERROR_MALFORMED_DATA, rc);
+    MqttProps_Free(pub.props);
+}
 #endif /* WOLFMQTT_V5 */
 
 /* ============================================================================
@@ -1610,6 +1681,34 @@ TEST(decode_connect_rejects_nul_in_will_topic)
     rc = MqttDecode_Connect(buf, (int)sizeof(buf), &dec);
     ASSERT_EQ(MQTT_CODE_ERROR_MALFORMED_DATA, rc);
 }
+
+#ifdef WOLFMQTT_V5
+/* MQTT v5 has a different decode path than v3.1.1 (properties walked
+ * before client_id, separate LWT properties), but the NUL rejection
+ * lives inside MqttDecode_String / MqttDecode_Password and so applies
+ * uniformly. This pins coverage on the v5 branch so a future refactor
+ * cannot quietly bypass the check on one protocol level. */
+TEST(decode_connect_v5_rejects_nul_in_client_id)
+{
+    byte buf[] = {
+        0x10, 0x13,                         /* CONNECT, remain_len = 19 */
+        0x00, 0x04, 'M', 'Q', 'T', 'T',
+        0x05,                               /* protocol level v5 */
+        0x02,                               /* flags: clean_session */
+        0x00, 0x3C,                         /* keep alive */
+        0x00,                               /* props_len = 0 (VBI) */
+        0x00, 0x06, 'a', 'd', 0x00, 'm', 'i', 'n'  /* client_id with NUL */
+    };
+    MqttConnect dec;
+    int rc;
+
+    XMEMSET(&dec, 0, sizeof(dec));
+    dec.protocol_level = MQTT_CONNECT_PROTOCOL_LEVEL_5;
+    rc = MqttDecode_Connect(buf, (int)sizeof(buf), &dec);
+    ASSERT_EQ(MQTT_CODE_ERROR_MALFORMED_DATA, rc);
+    MqttProps_Free(dec.props);
+}
+#endif /* WOLFMQTT_V5 */
 #endif /* WOLFMQTT_BROKER */
 
 /* ============================================================================
@@ -1725,31 +1824,6 @@ TEST(decode_subscribe_v5_options_byte_qos_extracted)
     ASSERT_EQ(1, sub.packet_id);
     ASSERT_EQ(1, sub.topic_count);
     ASSERT_EQ(MQTT_QOS_1, topic_arr[0].qos);
-}
-
-/* [MQTT-1.5.4-2]: an embedded NUL in a v5 STRING property must be
- * rejected. Uses a PUBLISH packet with a Content Type property whose
- * value contains 0x00. The MqttDecode_Props path now propagates the
- * underlying MALFORMED_DATA from MqttDecode_String instead of masking
- * it as MQTT_CODE_ERROR_PROPERTY. */
-TEST(decode_publish_v5_rejects_nul_in_string_property)
-{
-    /* Wire: PUBLISH QoS 0, remain_len=13, topic "a/b", props_len=7,
-     *       prop 0x03 CONTENT_TYPE, str_len=4, "t\0xt". No payload. */
-    byte buf[] = {
-        0x30, 13,
-        0x00, 0x03, 'a', '/', 'b',
-        0x07,
-        0x03, 0x00, 0x04, 't', 0x00, 'x', 't'
-    };
-    MqttPublish pub;
-    int rc;
-
-    XMEMSET(&pub, 0, sizeof(pub));
-    pub.protocol_level = MQTT_CONNECT_PROTOCOL_LEVEL_5;
-    rc = MqttDecode_Publish(buf, (int)sizeof(buf), &pub);
-    ASSERT_EQ(MQTT_CODE_ERROR_MALFORMED_DATA, rc);
-    MqttProps_Free(pub.props);
 }
 #endif /* WOLFMQTT_V5 */
 
@@ -2311,6 +2385,9 @@ void run_mqtt_packet_tests(void)
     RUN_TEST(decode_publish_rejects_nul_in_topic);
 #ifdef WOLFMQTT_V5
     RUN_TEST(decode_publish_v5_content_type_property);
+    RUN_TEST(decode_publish_v5_rejects_nul_in_string_property);
+    RUN_TEST(decode_publish_v5_rejects_nul_in_user_prop_key);
+    RUN_TEST(decode_publish_v5_rejects_nul_in_user_prop_value);
 #endif
 
     /* MqttDecode_ConnectAck */
@@ -2364,6 +2441,9 @@ void run_mqtt_packet_tests(void)
     RUN_TEST(decode_connect_rejects_nul_in_username);
     RUN_TEST(decode_connect_rejects_nul_in_password);
     RUN_TEST(decode_connect_rejects_nul_in_will_topic);
+#ifdef WOLFMQTT_V5
+    RUN_TEST(decode_connect_v5_rejects_nul_in_client_id);
+#endif
 
     /* MqttDecode_Subscribe */
     RUN_TEST(decode_subscribe_v311_single_topic);
@@ -2371,7 +2451,6 @@ void run_mqtt_packet_tests(void)
     RUN_TEST(decode_subscribe_rejects_nul_in_filter);
 #ifdef WOLFMQTT_V5
     RUN_TEST(decode_subscribe_v5_options_byte_qos_extracted);
-    RUN_TEST(decode_publish_v5_rejects_nul_in_string_property);
 #endif
 
     /* MqttDecode_Unsubscribe */

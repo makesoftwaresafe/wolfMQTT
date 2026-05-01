@@ -180,12 +180,18 @@ static int BrokerStrCompare(const char* a, const char* b, int cmp_len)
  *   unaffected by string contents.
  * Dynamic mode: frees old value, allocates new buffer, copies. The
  *   sensitive-wipe path uses XSTRLEN(buf)+1, which is correct only when
- *   stored values contain no embedded NUL. MqttDecode_String enforces
- *   [MQTT-1.5.3-2] / [MQTT-1.5.4-2] (rejects U+0000), so any string that
- *   reaches this function via the protocol path satisfies that invariant.
- *   Do not call the dynamic-mode sensitive path with src bytes that bypass
- *   that decoder without first capping src_len at the first NUL, or the
- *   wipe will leave trailing bytes uncleared. */
+ *   stored values contain no embedded NUL. The decode-side guards that
+ *   feed this function enforce that invariant:
+ *     - MqttDecode_String rejects U+0000 per [MQTT-1.5.3-2] /
+ *       [MQTT-1.5.4-2] for UTF-8 fields (client_id, username, topics).
+ *     - MqttDecode_Password applies the same NUL check to the CONNECT
+ *       Password field; that field is Binary Data per MQTT-3.1.3.5 and
+ *       the spec does not require it, but wolfMQTT compares passwords
+ *       with XSTRLEN/XSTRCMP, so the broker-side defensive check here
+ *       is what keeps the "no embedded NUL" assumption intact.
+ *   Do not call the dynamic-mode sensitive path with src bytes that
+ *   bypass those decoders without first capping src_len at the first
+ *   NUL, or the wipe will leave trailing bytes uncleared. */
 #ifdef WOLFMQTT_STATIC_MEMORY
 static void BrokerStore_String(char* dst, int max_len,
     const char* src, word16 src_len)

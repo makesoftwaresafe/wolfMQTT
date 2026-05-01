@@ -246,9 +246,6 @@ enum MqttPacketResponseCodes {
     #ifndef XMEMCMP
         #define XMEMCMP(s1,s2,n)    memcmp((s1),(s2),(n))
     #endif
-    #ifndef XMEMCHR
-        #define XMEMCHR(s,c,n)      memchr((s),(c),(n))
-    #endif
     #ifndef XATOI
         #define XATOI(s)            atoi((s))
     #endif
@@ -264,6 +261,19 @@ enum MqttPacketResponseCodes {
     #endif
     #ifndef XMEMMOVE
         #define XMEMMOVE(d,s,l)     memmove((d),(s),(l))
+    #endif
+#endif
+
+/* XMEMCHR backstop. Standard builds and existing custom-string ports
+ * (which already pull in <string.h> via other paths) keep building
+ * without changes. Custom-string ports that intentionally avoid
+ * <string.h> get an explicit #error directing them to define XMEMCHR
+ * themselves, instead of a confusing missing-header diagnostic. */
+#ifndef XMEMCHR
+    #ifdef WOLFMQTT_CUSTOM_STRING
+        #error "WOLFMQTT_CUSTOM_STRING set: please define XMEMCHR"
+    #else
+        #define XMEMCHR(s,c,n)      memchr((s),(c),(n))
     #endif
 #endif
 
