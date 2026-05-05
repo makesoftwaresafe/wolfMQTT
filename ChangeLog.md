@@ -1,5 +1,39 @@
 ## Release Notes
 
+### v2.0.1 (Pending)
+
+* Security Hardening
+    - Reject MQTT UTF-8 encoded strings containing U+0000 in `MqttDecode_String`
+      per [MQTT-1.5.3-2] / [MQTT-1.5.4-2]. Closes an embedded-NUL truncation
+      attack that allowed broker-side auth bypass, ClientId collision, and
+      topic-routing confusion when the broker compared decoded strings with
+      C-string semantics.
+    - The CONNECT Password field is decoded by a new internal helper
+      (`MqttDecode_Password`) that applies the same NUL rejection. Per
+      MQTT-3.1.3.5 the field is Binary Data so the spec does not require
+      this check, but wolfMQTT compares passwords with `XSTRLEN`/`XSTRCMP`,
+      so a binary password with an embedded NUL would be silently truncated
+      and could enable an auth bypass. Spec-compliant clients sending binary
+      passwords containing 0x00 will be rejected by the broker as a result.
+
+* API / Behavior Changes
+    - `MqttDecode_String` may now return `MQTT_CODE_ERROR_MALFORMED_DATA`
+      when the decoded string contains an embedded NUL byte. Previously
+      `MQTT_CODE_ERROR_OUT_OF_BUFFER` was the only possible negative return.
+    - `MqttDecode_Publish` now propagates the underlying error from
+      `MqttDecode_String` (e.g. `MALFORMED_DATA`) instead of always returning
+      `MQTT_CODE_ERROR_OUT_OF_BUFFER` on topic decode failure.
+    - `MqttDecode_Props` propagates `MQTT_CODE_ERROR_MALFORMED_DATA` from
+      `MqttDecode_String` for v5 STRING and STRING_PAIR property types
+      (Reason String, Content Type, User Property, etc.). Other negative
+      returns continue to be mapped to `MQTT_CODE_ERROR_PROPERTY` so client
+      code that branches on that error code is unaffected.
+    - New `XMEMCHR(s, c, n)` portability macro added to `mqtt_types.h`
+      (defaults to `memchr` for standard builds). Builds using
+      `WOLFMQTT_CUSTOM_STRING` must define `XMEMCHR` themselves, matching
+      the pattern used for `XSTRLEN`, `XMEMCMP`, etc.; the header emits
+      an explicit `#error` if it is missing.
+
 ### v2.0.0 (03/20/2026)
 Release 2.0.0 has been developed according to wolfSSL's development and QA
 process (see link below) and successfully passed the quality criteria.
