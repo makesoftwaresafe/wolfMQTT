@@ -275,7 +275,11 @@
 /* Default storage directory for the POSIX backend. Application can pass
  * a different path at MqttBrokerNet_PersistPosix_Init time. */
 #ifndef BROKER_PERSIST_DIR_DEFAULT
-    #define BROKER_PERSIST_DIR_DEFAULT  "/var/lib/wolfmqtt"
+    #ifdef __MACH__
+        #define BROKER_PERSIST_DIR_DEFAULT  "/private/var/lib/wolfmqtt"
+    #else
+        #define BROKER_PERSIST_DIR_DEFAULT  "/var/lib/wolfmqtt"
+    #endif
 #endif
 
 /* Persistence namespaces. One per logical record type. The backend

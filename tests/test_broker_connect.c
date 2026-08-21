@@ -41,6 +41,13 @@
 #include "wolfmqtt/mqtt_broker.h"
 #include "wolfmqtt/mqtt_packet.h"
 
+#ifdef WOLFMQTT_BROKER_PERSIST
+    #include <fcntl.h>
+    #include <sys/stat.h>
+    #include <sys/wait.h>
+    #include <unistd.h>
+#endif
+
 /* Provide storage for the unit-test framework's global counters. Must be
  * defined before unit_test.h is included. */
 #define UNIT_TEST_IMPLEMENTATION
@@ -5312,6 +5319,285 @@ TEST(will_qos1_routes_through_outq)
 }
 #endif /* WOLFMQTT_BROKER_WILL && !WOLFMQTT_STATIC_MEMORY */
 
+#ifdef WOLFMQTT_BROKER_PERSIST
+static int persist_test_write_file(const char* path, const byte* data,
+    word32 data_len)
+{
+    word32 written = 0;
+    int fd;
+
+    fd = open(path, O_WRONLY | O_CREAT | O_EXCL, 0600);
+    if (fd < 0) {
+        return -1;
+    }
+    while (written < data_len) {
+        ssize_t write_len = write(fd, data + written, data_len - written);
+        if (write_len <= 0) {
+            (void)close(fd);
+            return -1;
+        }
+        written += (word32)write_len;
+    }
+    return close(fd);
+}
+
+typedef struct PersistIterCapture {
+    byte key[8];
+    byte blob[32];
+    word16 key_len;
+    word32 blob_len;
+    int calls;
+} PersistIterCapture;
+
+static int persist_test_iter_cb(const byte* key, word16 key_len,
+    const byte* blob, word32 blob_len, void* ctx)
+{
+    PersistIterCapture* capture = (PersistIterCapture*)ctx;
+
+    if (key_len <= sizeof(capture->key) &&
+            blob_len <= sizeof(capture->blob)) {
+        XMEMCPY(capture->key, key, key_len);
+        XMEMCPY(capture->blob, blob, blob_len);
+        capture->key_len = key_len;
+        capture->blob_len = blob_len;
+    }
+    capture->calls++;
+    return 0;
+}
+
+TEST(persist_parent_component_rejected_as_bad_argument)
+{
+    MqttBrokerPersistHooks hooks;
+    int rc;
+
+    XMEMSET(&hooks, 0, sizeof(hooks));
+    rc = MqttBrokerNet_PersistPosix_Init(&hooks,
+        "../wolfmqtt-persist-invalid");
+    if (rc == MQTT_CODE_SUCCESS) {
+        MqttBrokerNet_PersistPosix_Free(&hooks);
+    }
+    ASSERT_EQ(MQTT_CODE_ERROR_BAD_ARG, rc);
+}
+
+TEST(persist_iter_skips_fifo_without_blocking)
+{
+    char root_template[] = "./wolfmqtt-persist-XXXXXX";
+    char ns_path[640];
+    char fifo_path[680];
+    MqttBrokerPersistHooks hooks;
+    PersistIterCapture capture;
+    char* root;
+    pid_t child;
+    pid_t waited;
+    int status = 0;
+    int paths_ok = 0;
+    int init_rc;
+
+    XMEMSET(&hooks, 0, sizeof(hooks));
+    XMEMSET(&capture, 0, sizeof(capture));
+    root = mkdtemp(root_template);
+    ASSERT_NOT_NULL(root);
+    if (snprintf(ns_path, sizeof(ns_path), "%s/7", root) > 0 &&
+            snprintf(fifo_path, sizeof(fifo_path), "%s/1234.bin",
+                ns_path) > 0) {
+        paths_ok = 1;
+    }
+    ASSERT_TRUE(paths_ok);
+    ASSERT_EQ(0, mkdir(ns_path, 0700));
+    ASSERT_EQ(0, mkfifo(fifo_path, 0600));
+
+    init_rc = MqttBrokerNet_PersistPosix_Init(&hooks, root);
+    ASSERT_EQ(MQTT_CODE_SUCCESS, init_rc);
+    child = fork();
+    ASSERT_TRUE(child >= 0);
+    if (child == 0) {
+        int iter_rc;
+
+        (void)alarm(2);
+        iter_rc = hooks.kv_iter(hooks.ctx, 7, persist_test_iter_cb, &capture);
+        _exit((iter_rc == MQTT_CODE_SUCCESS && capture.calls == 0) ? 0 : 1);
+    }
+    waited = waitpid(child, &status, 0);
+
+    MqttBrokerNet_PersistPosix_Free(&hooks);
+    (void)unlink(fifo_path);
+    (void)rmdir(ns_path);
+    (void)rmdir(root);
+
+    ASSERT_EQ((int)child, (int)waited);
+    ASSERT_TRUE(WIFEXITED(status));
+    ASSERT_EQ(0, WEXITSTATUS(status));
+}
+
+#ifdef __MACH__
+/* macOS exposes /tmp as a trusted operating-system symlink to /private/tmp.
+ * A persistence root below that standard alias must initialize without
+ * weakening the no-follow checks on namespaces or record files. */
+TEST(persist_root_below_macos_tmp_alias_accepted)
+{
+    char root_template[] = "/tmp/wolfmqtt-persist-XXXXXX";
+    MqttBrokerPersistHooks hooks;
+    char* root;
+    int rc;
+
+    XMEMSET(&hooks, 0, sizeof(hooks));
+    root = mkdtemp(root_template);
+    ASSERT_NOT_NULL(root);
+
+    rc = MqttBrokerNet_PersistPosix_Init(&hooks, root);
+    if (rc == MQTT_CODE_SUCCESS) {
+        MqttBrokerNet_PersistPosix_Free(&hooks);
+    }
+    ASSERT_EQ(0, rmdir(root));
+    ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
+}
+#endif
+
+static int persist_test_init_root_mode(mode_t mode)
+{
+    char root_template[] = "./wolfmqtt-persist-XXXXXX";
+    MqttBrokerPersistHooks hooks;
+    char* root;
+    int rc;
+
+    XMEMSET(&hooks, 0, sizeof(hooks));
+    root = mkdtemp(root_template);
+    if (root == NULL) {
+        return MQTT_CODE_ERROR_SYSTEM;
+    }
+    if (chmod(root, mode) != 0) {
+        (void)rmdir(root);
+        return MQTT_CODE_ERROR_SYSTEM;
+    }
+    rc = MqttBrokerNet_PersistPosix_Init(&hooks, root);
+    if (rc == MQTT_CODE_SUCCESS) {
+        MqttBrokerNet_PersistPosix_Free(&hooks);
+    }
+    (void)rmdir(root);
+    return rc;
+}
+
+TEST(persist_root_readable_permissions_accepted)
+{
+    ASSERT_EQ(MQTT_CODE_SUCCESS, persist_test_init_root_mode(0755));
+}
+
+TEST(persist_root_writable_permissions_rejected)
+{
+    ASSERT_EQ(MQTT_CODE_ERROR_SYSTEM, persist_test_init_root_mode(0777));
+}
+
+TEST(persist_put_rejects_existing_temp_symlink)
+{
+    static const byte key[] = { 0x12, 0x34 };
+    static const byte original[] = "original";
+    static const byte replacement[] = "replacement";
+    char root_template[] = "./wolfmqtt-persist-XXXXXX";
+    char ns_path[640];
+    char victim_path[640];
+    char temp_path[680];
+    char final_path[680];
+    byte actual[sizeof(replacement)] = { 0 };
+    byte stored[sizeof(replacement)] = { 0 };
+    PersistIterCapture capture;
+    MqttBrokerPersistHooks hooks;
+    char* root;
+    word32 stored_len = (word32)sizeof(stored);
+    word32 retrieved_len = 0;
+    ssize_t read_len = -1;
+    int fd = -1;
+    int put_rc = MQTT_CODE_SUCCESS;
+    int stale_create_rc = -1;
+    int clean_put_rc = MQTT_CODE_ERROR_SYSTEM;
+    int get_rc = MQTT_CODE_ERROR_SYSTEM;
+    int iter_rc = MQTT_CODE_ERROR_SYSTEM;
+    int sync_rc = MQTT_CODE_ERROR_SYSTEM;
+    int del_rc = MQTT_CODE_ERROR_SYSTEM;
+    int missing_rc = MQTT_CODE_ERROR_SYSTEM;
+    int init_rc = MQTT_CODE_ERROR_SYSTEM;
+    int paths_ok = 0;
+
+    XMEMSET(&hooks, 0, sizeof(hooks));
+    XMEMSET(&capture, 0, sizeof(capture));
+    root = mkdtemp(root_template);
+    ASSERT_NOT_NULL(root);
+
+    if (snprintf(ns_path, sizeof(ns_path), "%s/7", root) > 0 &&
+            snprintf(victim_path, sizeof(victim_path), "%s/victim.bin",
+                root) > 0 &&
+            snprintf(temp_path, sizeof(temp_path), "%s/1234.bin.tmp",
+                ns_path) > 0 &&
+            snprintf(final_path, sizeof(final_path), "%s/1234.bin",
+                ns_path) > 0) {
+        paths_ok = 1;
+    }
+    ASSERT_TRUE(paths_ok);
+    ASSERT_EQ(0, mkdir(ns_path, 0700));
+    ASSERT_EQ(0, persist_test_write_file(victim_path, original,
+        (word32)sizeof(original)));
+    ASSERT_EQ(0, symlink("../victim.bin", temp_path));
+
+    init_rc = MqttBrokerNet_PersistPosix_Init(&hooks, root);
+    if (init_rc == MQTT_CODE_SUCCESS) {
+        put_rc = hooks.kv_put(hooks.ctx, 7, key, (word16)sizeof(key),
+            replacement, (word32)sizeof(replacement));
+    }
+
+    fd = open(victim_path, O_RDONLY);
+    if (fd >= 0) {
+        read_len = read(fd, actual, sizeof(actual));
+        (void)close(fd);
+    }
+
+    /* Remove either the rejected temp symlink or the vulnerable backend's
+     * renamed final symlink, then verify normal descriptor-relative storage. */
+    (void)unlink(temp_path);
+    (void)unlink(final_path);
+    if (init_rc == MQTT_CODE_SUCCESS) {
+        stale_create_rc = persist_test_write_file(temp_path, original,
+            (word32)sizeof(original));
+        clean_put_rc = hooks.kv_put(hooks.ctx, 7, key,
+            (word16)sizeof(key), replacement, (word32)sizeof(replacement));
+        get_rc = hooks.kv_get(hooks.ctx, 7, key, (word16)sizeof(key),
+            stored, &stored_len);
+        retrieved_len = stored_len;
+        iter_rc = hooks.kv_iter(hooks.ctx, 7, persist_test_iter_cb,
+            &capture);
+        sync_rc = hooks.sync(hooks.ctx);
+        del_rc = hooks.kv_del(hooks.ctx, 7, key, (word16)sizeof(key));
+        stored_len = (word32)sizeof(stored);
+        missing_rc = hooks.kv_get(hooks.ctx, 7, key, (word16)sizeof(key),
+            stored, &stored_len);
+    }
+
+    MqttBrokerNet_PersistPosix_Free(&hooks);
+    (void)unlink(temp_path);
+    (void)unlink(final_path);
+    (void)unlink(victim_path);
+    (void)rmdir(ns_path);
+    (void)rmdir(root);
+
+    ASSERT_EQ(MQTT_CODE_SUCCESS, init_rc);
+    ASSERT_NE(MQTT_CODE_SUCCESS, put_rc);
+    ASSERT_EQ((int)sizeof(original), (int)read_len);
+    ASSERT_MEM_EQ(original, actual, sizeof(original));
+    ASSERT_EQ(0, stale_create_rc);
+    ASSERT_EQ(MQTT_CODE_SUCCESS, clean_put_rc);
+    ASSERT_EQ(MQTT_CODE_SUCCESS, get_rc);
+    ASSERT_EQ((int)sizeof(replacement), (int)retrieved_len);
+    ASSERT_MEM_EQ(replacement, stored, sizeof(replacement));
+    ASSERT_EQ(MQTT_CODE_SUCCESS, iter_rc);
+    ASSERT_EQ(1, capture.calls);
+    ASSERT_EQ((int)sizeof(key), (int)capture.key_len);
+    ASSERT_MEM_EQ(key, capture.key, sizeof(key));
+    ASSERT_EQ((int)sizeof(replacement), (int)capture.blob_len);
+    ASSERT_MEM_EQ(replacement, capture.blob, sizeof(replacement));
+    ASSERT_EQ(MQTT_CODE_SUCCESS, sync_rc);
+    ASSERT_EQ(MQTT_CODE_SUCCESS, del_rc);
+    ASSERT_EQ(MQTT_CODE_ERROR_NOT_FOUND, missing_rc);
+}
+#endif /* WOLFMQTT_BROKER_PERSIST */
+
 /* -------------------------------------------------------------------------- */
 /* Runner                                                                      */
 /* -------------------------------------------------------------------------- */
@@ -5513,6 +5799,16 @@ int main(int argc, char** argv)
 #ifndef WOLFMQTT_STATIC_MEMORY
     RUN_TEST(connect_v5_max_packet_size_zero_protocol_error);
 #endif
+#endif
+#ifdef WOLFMQTT_BROKER_PERSIST
+    RUN_TEST(persist_parent_component_rejected_as_bad_argument);
+    RUN_TEST(persist_iter_skips_fifo_without_blocking);
+    #ifdef __MACH__
+    RUN_TEST(persist_root_below_macos_tmp_alias_accepted);
+    #endif
+    RUN_TEST(persist_root_readable_permissions_accepted);
+    RUN_TEST(persist_root_writable_permissions_rejected);
+    RUN_TEST(persist_put_rejects_existing_temp_symlink);
 #endif
     TEST_SUITE_END();
 
