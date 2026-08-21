@@ -221,6 +221,9 @@
 #ifndef BROKER_MAX_OFFLINE_MSGS_PER_SUB
     #define BROKER_MAX_OFFLINE_MSGS_PER_SUB 32
 #endif
+#if BROKER_MAX_OFFLINE_MSGS_PER_SUB >= 65535
+    #error BROKER_MAX_OFFLINE_MSGS_PER_SUB must leave a free packet identifier
+#endif
 
 /* BROKER_MAX_QUEUED_MSGS_PER_SUB bounds the total depth of a *connected*
  * subscriber's outbound queue (out_q_count) in dynamic-memory mode.
@@ -246,6 +249,9 @@
     #define BROKER_MAX_QUEUED_MSGS_PER_SUB \
         (BROKER_MAX_INFLIGHT_PER_SUB + BROKER_MAX_OFFLINE_MSGS_PER_SUB)
 #endif
+#if BROKER_MAX_QUEUED_MSGS_PER_SUB >= 65535
+    #error BROKER_MAX_QUEUED_MSGS_PER_SUB must leave a free packet identifier
+#endif
 
 /* Schema version stamped on every persisted record. Bump when the
  * encoding of any namespace changes incompatibly; a startup with stored
@@ -254,11 +260,10 @@
 #ifndef WOLFMQTT_BROKER_PERSIST_SCHEMA_VER
     /* Bumped from 1 -> 2 when the header layout split a dedicated
      * wrap_mode byte out of the schema-version field. Bumped 2 -> 3 when
-     * the NS_SESSION record gained an orphan_since timestamp so the v5
-     * Session Expiry timer survives a broker restart. Any existing dev
-     * directory written by an older build mismatches and is wiped via the
-     * schema-mismatch path on first restart. */
-    #define WOLFMQTT_BROKER_PERSIST_SCHEMA_VER 3
+     * the NS_SESSION record gained an orphan_since timestamp. Bumped 3 -> 4
+     * when NS_OUTQ gained an explicit enqueue sequence, then 4 -> 5 when it
+     * gained retransmission state. */
+    #define WOLFMQTT_BROKER_PERSIST_SCHEMA_VER 5
 #endif
 
 /* Header wrap_mode byte values (record body framing on disk). */
@@ -512,6 +517,7 @@ typedef struct BrokerOutPub {
      * MQTT-4.4.0-1, then clears the flag. */
     byte    retransmit_dup; /* 0 or 1 */
     WOLFMQTT_BROKER_TIME_T enq_time;
+    word64  enqueue_seq;    /* persistent FIFO order within this session */
     word32  expiry_sec;     /* v5 Message Expiry Interval, 0 = no expiry */
     byte    protocol_level; /* echoed back to subscriber on send */
 #ifdef WOLFMQTT_V5
@@ -944,7 +950,6 @@ WOLFMQTT_LOCAL int BrokerPersist_DelOutPub(MqttBroker* broker,
     const char* client_id, word16 packet_id);
 WOLFMQTT_LOCAL int BrokerPersist_DelOutQueue(MqttBroker* broker,
     const char* client_id);
-
 /* Startup-time restore on a freshly initialized, empty broker. Rebuilds the
  * in-memory tables before the first MqttBroker_Start accepts clients. Wipes
  * and re-stamps META when the persisted schema version does not match. */

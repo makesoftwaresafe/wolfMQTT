@@ -177,6 +177,9 @@
     #ifndef word32
         typedef unsigned int   word32;
     #endif
+    #ifndef word64
+        typedef unsigned long long word64;
+    #endif
     #define WOLFSSL_TYPES /* make sure wolfSSL knows we defined these types */
 #endif
 

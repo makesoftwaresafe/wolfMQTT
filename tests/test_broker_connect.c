@@ -113,6 +113,7 @@ static void broker_test_disable_alloc_failure(void)
     g_alloc_fail_after = -1;
 }
 
+#ifdef WOLFMQTT_BROKER_PERSIST_ENCRYPT
 static void broker_test_capture_free(size_t allocation_size)
 {
     g_capture_alloc_size = allocation_size;
@@ -127,6 +128,7 @@ static void broker_test_disable_free_capture(void)
     g_capture_alloc_size = 0;
     g_capture_alloc_ptr = NULL;
 }
+#endif
 
 /* Mock socket constants */
 #define MOCK_LISTEN_SOCK       100
@@ -2430,6 +2432,85 @@ TEST(online_qos1_at_cap_keeps_subscriber)
     ASSERT_EQ(BROKER_MAX_QUEUED_MSGS_PER_SUB, sub_bc->out_q_count);
     ASSERT_TRUE(sub_bc->connected);
     ASSERT_FALSE(g_clients[0].closed);
+
+    MqttBroker_Stop(&broker);
+    MqttBroker_Free(&broker);
+}
+
+/* Packet Identifiers are scoped to one client session [MQTT-2.2.1-4].
+ * A value held by one slow subscriber must remain available to another. */
+TEST(outbound_packet_ids_are_scoped_per_session)
+{
+    MqttBroker broker;
+    MqttBrokerNet net;
+    BrokerClient* sub_a;
+    BrokerClient* sub_b;
+    int i;
+    static const byte connect_a[] = {
+        0x10, 0x0D,
+        0x00, 0x04, 'M', 'Q', 'T', 'T',
+        0x04, 0x02, 0x00, 0x3C,
+        0x00, 0x01, 'A'
+    };
+    static const byte connect_b[] = {
+        0x10, 0x0D,
+        0x00, 0x04, 'M', 'Q', 'T', 'T',
+        0x04, 0x02, 0x00, 0x3C,
+        0x00, 0x01, 'B'
+    };
+    static const byte connect_pub[] = {
+        0x10, 0x0D,
+        0x00, 0x04, 'M', 'Q', 'T', 'T',
+        0x04, 0x02, 0x00, 0x3C,
+        0x00, 0x01, 'P'
+    };
+    static const byte subscribe_a[] = {
+        0x82, 0x06, 0x00, 0x01, 0x00, 0x01, 'a', 0x01
+    };
+    static const byte subscribe_b[] = {
+        0x82, 0x06, 0x00, 0x01, 0x00, 0x01, 'b', 0x01
+    };
+    static const byte publish_a[] = {
+        0x32, 0x06, 0x00, 0x01, 'a', 0x00, 0x01, 'p'
+    };
+    static const byte publish_b[] = {
+        0x32, 0x06, 0x00, 0x01, 'b', 0x00, 0x02, 'p'
+    };
+
+    install_mock_net(&net);
+    XMEMSET(&broker, 0, sizeof(broker));
+    ASSERT_EQ(MQTT_CODE_SUCCESS, MqttBroker_Init(&broker, &net));
+    ASSERT_EQ(MQTT_CODE_SUCCESS, MqttBroker_Start(&broker));
+
+    reset_mock_clients(3);
+    mock_client_input_append(0, connect_a, sizeof(connect_a));
+    mock_client_input_append(0, subscribe_a, sizeof(subscribe_a));
+    mock_client_input_append(1, connect_b, sizeof(connect_b));
+    mock_client_input_append(1, subscribe_b, sizeof(subscribe_b));
+    mock_client_input_append(2, connect_pub, sizeof(connect_pub));
+    for (i = 0; i < 24; i++) {
+        MqttBroker_Step(&broker);
+    }
+
+    sub_a = find_broker_client(&broker, "A");
+    sub_b = find_broker_client(&broker, "B");
+    ASSERT_NOT_NULL(sub_a);
+    ASSERT_NOT_NULL(sub_b);
+
+    mock_client_input_append(2, publish_a, sizeof(publish_a));
+    for (i = 0; i < 8; i++) {
+        MqttBroker_Step(&broker);
+    }
+    ASSERT_NOT_NULL(sub_a->out_q_head);
+    ASSERT_EQ(1, sub_a->out_q_head->packet_id);
+
+    broker.next_packet_id = 1;
+    mock_client_input_append(2, publish_b, sizeof(publish_b));
+    for (i = 0; i < 8; i++) {
+        MqttBroker_Step(&broker);
+    }
+    ASSERT_NOT_NULL(sub_b->out_q_head);
+    ASSERT_EQ(1, sub_b->out_q_head->packet_id);
 
     MqttBroker_Stop(&broker);
     MqttBroker_Free(&broker);
@@ -6000,6 +6081,461 @@ typedef struct PersistIterCapture {
     int calls;
 } PersistIterCapture;
 
+#ifndef WOLFMQTT_STATIC_MEMORY
+#define PERSIST_ORDER_KEY_MAX   16
+#define PERSIST_ORDER_BLOB_MAX  128
+
+typedef struct PersistOrderRecord {
+    byte key[PERSIST_ORDER_KEY_MAX];
+    byte blob[PERSIST_ORDER_BLOB_MAX];
+    word16 key_len;
+    word32 blob_len;
+} PersistOrderRecord;
+
+typedef struct PersistOrderStore {
+    PersistOrderRecord meta;
+    PersistOrderRecord session;
+    PersistOrderRecord subs;
+    PersistOrderRecord outq[3];
+    int outq_count;
+    int reverse_outq;
+} PersistOrderStore;
+
+#ifdef WOLFMQTT_BROKER_PERSIST_ENCRYPT
+static int persist_order_derive_key(void* ctx, byte* out_key, word32 key_len)
+{
+    (void)ctx;
+    XMEMSET(out_key, 0x11, key_len);
+    return MQTT_CODE_SUCCESS;
+}
+#endif
+
+static int persist_order_put(void* ctx, byte ns, const byte* key,
+    word16 key_len, const byte* blob, word32 blob_len)
+{
+    PersistOrderStore* store = (PersistOrderStore*)ctx;
+    PersistOrderRecord* record = NULL;
+
+    if (ns == BROKER_PERSIST_NS_META) {
+        record = &store->meta;
+    }
+    else if (ns == BROKER_PERSIST_NS_SESSION) {
+        record = &store->session;
+    }
+    else if (ns == BROKER_PERSIST_NS_SUBS) {
+        record = &store->subs;
+    }
+    else if (ns == BROKER_PERSIST_NS_OUTQ && store->outq_count < 3) {
+        record = &store->outq[store->outq_count++];
+    }
+    if (record == NULL || key_len > sizeof(record->key) ||
+            blob_len > sizeof(record->blob)) {
+        return MQTT_CODE_ERROR_OUT_OF_BUFFER;
+    }
+    XMEMCPY(record->key, key, key_len);
+    XMEMCPY(record->blob, blob, blob_len);
+    record->key_len = key_len;
+    record->blob_len = blob_len;
+    return MQTT_CODE_SUCCESS;
+}
+
+static int persist_order_get(void* ctx, byte ns, const byte* key,
+    word16 key_len, byte* out, word32* inout_len)
+{
+    PersistOrderStore* store = (PersistOrderStore*)ctx;
+    PersistOrderRecord* record = &store->meta;
+
+    if (ns != BROKER_PERSIST_NS_META || record->blob_len == 0 ||
+            key_len != record->key_len ||
+            XMEMCMP(key, record->key, key_len) != 0) {
+        return MQTT_CODE_ERROR_NOT_FOUND;
+    }
+    if (out == NULL || inout_len == NULL || *inout_len < record->blob_len) {
+        return MQTT_CODE_ERROR_OUT_OF_BUFFER;
+    }
+    XMEMCPY(out, record->blob, record->blob_len);
+    *inout_len = record->blob_len;
+    return MQTT_CODE_SUCCESS;
+}
+
+static int persist_order_iter(void* ctx, byte ns,
+    MqttBrokerPersist_IterCb cb, void* cb_ctx)
+{
+    PersistOrderStore* store = (PersistOrderStore*)ctx;
+    int i;
+    int rc;
+
+    if (ns == BROKER_PERSIST_NS_SESSION && store->session.blob_len > 0) {
+        return cb(store->session.key, store->session.key_len,
+            store->session.blob, store->session.blob_len, cb_ctx);
+    }
+    if (ns == BROKER_PERSIST_NS_SUBS && store->subs.blob_len > 0) {
+        return cb(store->subs.key, store->subs.key_len,
+            store->subs.blob, store->subs.blob_len, cb_ctx);
+    }
+    if (ns == BROKER_PERSIST_NS_OUTQ) {
+        for (i = 0; i < store->outq_count; i++) {
+            int index = store->reverse_outq ? store->outq_count - 1 - i : i;
+
+            rc = cb(store->outq[index].key, store->outq[index].key_len,
+                store->outq[index].blob, store->outq[index].blob_len, cb_ctx);
+            if (rc != 0) {
+                return rc;
+            }
+        }
+    }
+    return MQTT_CODE_SUCCESS;
+}
+
+static BrokerOutPub* persist_order_make_out(const char* topic, MqttQoS qos,
+    word16 packet_id)
+{
+    BrokerOutPub* out = (BrokerOutPub*)WOLFMQTT_MALLOC(sizeof(*out));
+    size_t topic_len;
+
+    if (out == NULL) {
+        return NULL;
+    }
+    XMEMSET(out, 0, sizeof(*out));
+    topic_len = XSTRLEN(topic);
+    out->topic = (char*)WOLFMQTT_MALLOC(topic_len + 1);
+    if (out->topic == NULL) {
+        WOLFMQTT_FREE(out);
+        return NULL;
+    }
+    XMEMCPY(out->topic, topic, topic_len + 1);
+    out->qos = qos;
+    out->packet_id = packet_id;
+    out->state = BROKER_OUTQ_QUEUED;
+    out->protocol_level = MQTT_CONNECT_PROTOCOL_LEVEL_4;
+    return out;
+}
+
+#ifdef WOLFMQTT_NONBLOCK
+/* A partially transmitted QoS 1 PUBLISH is a retransmission after a broker
+ * restart, so its replay must carry DUP=1 [MQTT-3.3.1-1]. */
+TEST(persist_partial_publish_restart_keeps_dup)
+{
+    MqttBroker source;
+    MqttBroker restored;
+    MqttBrokerNet net;
+    MqttBrokerPersistHooks hooks;
+    PersistOrderStore store;
+    BrokerClient* sub_bc;
+    PublishInfo info;
+    word16 packet_id;
+    int i;
+    static const byte connect_pub[] = {
+        0x10, 0x0D,
+        0x00, 0x04, 'M', 'Q', 'T', 'T',
+        0x04, 0x02, 0x00, 0x3C,
+        0x00, 0x01, 'P'
+    };
+    static const byte connect_sub[] = {
+        0x10, 0x0D,
+        0x00, 0x04, 'M', 'Q', 'T', 'T',
+        0x04, 0x00, 0x00, 0x3C,
+        0x00, 0x01, 'S'
+    };
+    static const byte subscribe_x[] = {
+        0x82, 0x06, 0x00, 0x01, 0x00, 0x01, 'x', 0x01
+    };
+    static const byte publish_x[] = {
+        0x32, 0x08,
+        0x00, 0x01, 'x', 0x00, 0x07, 'A', 'B', 'C'
+    };
+
+    install_mock_net(&net);
+    XMEMSET(&source, 0, sizeof(source));
+    XMEMSET(&restored, 0, sizeof(restored));
+    XMEMSET(&hooks, 0, sizeof(hooks));
+    XMEMSET(&store, 0, sizeof(store));
+    hooks.kv_put = persist_order_put;
+    hooks.kv_get = persist_order_get;
+    hooks.kv_iter = persist_order_iter;
+    hooks.ctx = &store;
+#ifdef WOLFMQTT_BROKER_PERSIST_ENCRYPT
+    hooks.derive_key = persist_order_derive_key;
+#endif
+
+    ASSERT_EQ(MQTT_CODE_SUCCESS, MqttBroker_Init(&source, &net));
+    ASSERT_EQ(MQTT_CODE_SUCCESS, MqttBroker_SetPersistHooks(&source, &hooks));
+    ASSERT_EQ(MQTT_CODE_SUCCESS, BrokerPersist_Restore(&source));
+    ASSERT_EQ(MQTT_CODE_SUCCESS, MqttBroker_Start(&source));
+    reset_mock_clients(2);
+    mock_client_input_append(0, connect_pub, sizeof(connect_pub));
+    mock_client_input_append(1, connect_sub, sizeof(connect_sub));
+    mock_client_input_append(1, subscribe_x, sizeof(subscribe_x));
+    for (i = 0; i < 16; i++) {
+        (void)MqttBroker_Step(&source);
+    }
+    sub_bc = find_broker_client(&source, "S");
+    ASSERT_NOT_NULL(sub_bc);
+
+    g_clients[1].write_limit_once = 1;
+    mock_client_input_append(0, publish_x, sizeof(publish_x));
+    (void)MqttBroker_Step(&source);
+    ASSERT_NOT_NULL(sub_bc->out_q_head);
+    ASSERT_EQ(1, sub_bc->out_q_head->retransmit_dup);
+    packet_id = sub_bc->out_q_head->packet_id;
+
+    g_clients[1].write_err = 1;
+    (void)MqttBroker_Step(&source);
+    ASSERT_TRUE(g_clients[1].closed);
+    ASSERT_EQ(1, store.outq_count);
+
+    MqttBroker_Stop(&source);
+    MqttBroker_Free(&source);
+
+    ASSERT_EQ(MQTT_CODE_SUCCESS, MqttBroker_Init(&restored, &net));
+    ASSERT_EQ(MQTT_CODE_SUCCESS,
+        MqttBroker_SetPersistHooks(&restored, &hooks));
+    ASSERT_EQ(MQTT_CODE_SUCCESS, BrokerPersist_Restore(&restored));
+    ASSERT_EQ(MQTT_CODE_SUCCESS, MqttBroker_Start(&restored));
+    reset_mock_clients(1);
+    mock_client_input_append(0, connect_sub, sizeof(connect_sub));
+    for (i = 0; i < 16; i++) {
+        (void)MqttBroker_Step(&restored);
+    }
+
+    info = first_publish_info(g_clients[0].out_buf, g_clients[0].out_len);
+    ASSERT_TRUE(info.found);
+    ASSERT_EQ(0x3A, info.first_byte);
+    ASSERT_EQ(packet_id, info.packet_id);
+
+    MqttBroker_Stop(&restored);
+    MqttBroker_Free(&restored);
+}
+#endif
+
+/* Non-persisted QoS 0 nodes still occupy FIFO positions. Assigning sequence
+ * numbers only to durable nodes can make a later offline QoS 1 enqueue reuse
+ * an earlier sequence and restore ahead of older messages. */
+TEST(persist_mixed_qos_queue_preserves_fifo)
+{
+    MqttBroker source;
+    MqttBroker restored;
+    MqttBrokerNet net;
+    MqttBrokerPersistHooks hooks;
+    PersistOrderStore store;
+    BrokerClient* sub_bc;
+    BrokerOrphanSession* orphan;
+    BrokerOutPub* first;
+    BrokerOutPub* second;
+    BrokerOutPub* volatile_tail;
+    int i;
+    static const byte connect_sub[] = {
+        0x10, 0x0D,
+        0x00, 0x04, 'M', 'Q', 'T', 'T',
+        0x04, 0x00, 0x00, 0x3C,
+        0x00, 0x01, 'S'
+    };
+    static const byte subscribe_t[] = {
+        0x82, 0x06, 0x00, 0x01, 0x00, 0x01, 't', 0x01
+    };
+    static const byte connect_pub[] = {
+        0x10, 0x0D,
+        0x00, 0x04, 'M', 'Q', 'T', 'T',
+        0x04, 0x02, 0x00, 0x3C,
+        0x00, 0x01, 'P'
+    };
+    static const byte publish_t[] = {
+        0x32, 0x06, 0x00, 0x01, 't', 0x00, 0x07, 'p'
+    };
+
+    install_mock_net(&net);
+    XMEMSET(&source, 0, sizeof(source));
+    XMEMSET(&restored, 0, sizeof(restored));
+    XMEMSET(&hooks, 0, sizeof(hooks));
+    XMEMSET(&store, 0, sizeof(store));
+    hooks.kv_put = persist_order_put;
+    hooks.kv_get = persist_order_get;
+    hooks.kv_iter = persist_order_iter;
+    hooks.ctx = &store;
+#ifdef WOLFMQTT_BROKER_PERSIST_ENCRYPT
+    hooks.derive_key = persist_order_derive_key;
+#endif
+
+    ASSERT_EQ(MQTT_CODE_SUCCESS, MqttBroker_Init(&source, &net));
+    ASSERT_EQ(MQTT_CODE_SUCCESS, MqttBroker_SetPersistHooks(&source, &hooks));
+    ASSERT_EQ(MQTT_CODE_SUCCESS, BrokerPersist_Restore(&source));
+    ASSERT_EQ(MQTT_CODE_SUCCESS, MqttBroker_Start(&source));
+    reset_mock_clients(2);
+    mock_client_input_append(0, connect_sub, sizeof(connect_sub));
+    mock_client_input_append(0, subscribe_t, sizeof(subscribe_t));
+    for (i = 0; i < 12; i++) {
+        (void)MqttBroker_Step(&source);
+    }
+    sub_bc = find_broker_client(&source, "S");
+    ASSERT_NOT_NULL(sub_bc);
+
+    first = persist_order_make_out("first", MQTT_QOS_1, 10);
+    second = persist_order_make_out("second", MQTT_QOS_1, 11);
+    volatile_tail = persist_order_make_out("volatile", MQTT_QOS_0, 0);
+    ASSERT_NOT_NULL(first);
+    ASSERT_NOT_NULL(second);
+    ASSERT_NOT_NULL(volatile_tail);
+    first->next = second;
+    second->next = volatile_tail;
+    sub_bc->out_q_head = first;
+    sub_bc->out_q_tail = volatile_tail;
+    sub_bc->out_q_count = 3;
+
+    sub_bc->connected = 0;
+    g_clients[0].read_err = 1;
+    (void)MqttBroker_Step(&source);
+    ASSERT_EQ(1, source.orphan_session_count);
+    orphan = source.orphan_sessions;
+    ASSERT_NOT_NULL(orphan);
+
+    mock_client_input_append(1, connect_pub, sizeof(connect_pub));
+    mock_client_input_append(1, publish_t, sizeof(publish_t));
+    for (i = 0; i < 12; i++) {
+        (void)MqttBroker_Step(&source);
+    }
+    ASSERT_EQ(4, orphan->out_q_count);
+    ASSERT_NOT_NULL(orphan->out_q_tail);
+    ASSERT_EQ(4, orphan->out_q_tail->enqueue_seq);
+    ASSERT_EQ(3, store.outq_count);
+
+    MqttBroker_Stop(&source);
+    MqttBroker_Free(&source);
+
+    /* Storage iteration order is not defined. Restore must sort by the durable
+     * enqueue sequence rather than trusting backend insertion order. */
+    store.reverse_outq = 1;
+    ASSERT_EQ(MQTT_CODE_SUCCESS, MqttBroker_Init(&restored, &net));
+    ASSERT_EQ(MQTT_CODE_SUCCESS,
+        MqttBroker_SetPersistHooks(&restored, &hooks));
+    ASSERT_EQ(MQTT_CODE_SUCCESS, BrokerPersist_Restore(&restored));
+    orphan = restored.orphan_sessions;
+    ASSERT_NOT_NULL(orphan);
+    ASSERT_EQ(3, orphan->out_q_count);
+    ASSERT_NOT_NULL(orphan->out_q_head);
+    ASSERT_TRUE(XSTRCMP("first", orphan->out_q_head->topic) == 0);
+    ASSERT_NOT_NULL(orphan->out_q_head->next);
+    ASSERT_TRUE(XSTRCMP("second", orphan->out_q_head->next->topic) == 0);
+    ASSERT_NOT_NULL(orphan->out_q_tail);
+    ASSERT_TRUE(XSTRCMP("t", orphan->out_q_tail->topic) == 0);
+
+    MqttBroker_Free(&restored);
+}
+
+TEST(persist_restore_packet_id_wrap_preserves_fifo)
+{
+    MqttBroker source;
+    MqttBroker restored;
+    MqttBroker restored_again;
+    MqttBrokerNet net;
+    MqttBrokerPersistHooks hooks;
+    PersistOrderStore store;
+    BrokerOutPub out;
+    BrokerOrphanSession* orphan;
+    BrokerSub* sub;
+    int i;
+    char topic[] = "t";
+    static const byte connect_pub[] = {
+        0x10, 0x0D,
+        0x00, 0x04, 'M', 'Q', 'T', 'T',
+        0x04, 0x02, 0x00, 0x3C,
+        0x00, 0x01, 'P'
+    };
+    static const byte publish[] = {
+        0x32, 0x06, 0x00, 0x01, 't', 0x00, 0x07, 'p'
+    };
+
+    install_mock_net(&net);
+    XMEMSET(&source, 0, sizeof(source));
+    XMEMSET(&restored, 0, sizeof(restored));
+    XMEMSET(&restored_again, 0, sizeof(restored_again));
+    XMEMSET(&hooks, 0, sizeof(hooks));
+    XMEMSET(&store, 0, sizeof(store));
+    hooks.kv_put = persist_order_put;
+    hooks.kv_get = persist_order_get;
+    hooks.kv_iter = persist_order_iter;
+    hooks.ctx = &store;
+#ifdef WOLFMQTT_BROKER_PERSIST_ENCRYPT
+    hooks.derive_key = persist_order_derive_key;
+#endif
+
+    ASSERT_EQ(MQTT_CODE_SUCCESS, MqttBroker_Init(&source, &net));
+    ASSERT_EQ(MQTT_CODE_SUCCESS, MqttBroker_SetPersistHooks(&source, &hooks));
+    ASSERT_EQ(MQTT_CODE_SUCCESS, BrokerPersist_Restore(&source));
+    ASSERT_EQ(MQTT_CODE_SUCCESS, BrokerPersist_PutOrphanSession(&source,
+        "cid", MQTT_CONNECT_PROTOCOL_LEVEL_4, 0xFFFFFFFFu,
+        (WOLFMQTT_BROKER_TIME_T)1));
+    sub = (BrokerSub*)WOLFMQTT_MALLOC(sizeof(*sub));
+    ASSERT_NOT_NULL(sub);
+    XMEMSET(sub, 0, sizeof(*sub));
+    sub->filter = (char*)WOLFMQTT_MALLOC(2);
+    sub->client_id = (char*)WOLFMQTT_MALLOC(4);
+    ASSERT_NOT_NULL(sub->filter);
+    ASSERT_NOT_NULL(sub->client_id);
+    XMEMCPY(sub->filter, "t", 2);
+    XMEMCPY(sub->client_id, "cid", 4);
+    sub->qos = MQTT_QOS_1;
+    source.subs = sub;
+    ASSERT_EQ(MQTT_CODE_SUCCESS, BrokerPersist_PutSubs(&source, "cid"));
+
+    XMEMSET(&out, 0, sizeof(out));
+    out.topic = topic;
+    out.qos = MQTT_QOS_1;
+    out.state = BROKER_OUTQ_QUEUED;
+    out.protocol_level = MQTT_CONNECT_PROTOCOL_LEVEL_4;
+    out.enq_time = (WOLFMQTT_BROKER_TIME_T)1;
+    out.enqueue_seq = 1;
+    out.packet_id = 1;
+    ASSERT_EQ(MQTT_CODE_SUCCESS,
+        BrokerPersist_PutOutPub(&source, "cid", &out));
+    out.enqueue_seq = 2;
+    out.packet_id = 0xFFFF;
+    ASSERT_EQ(MQTT_CODE_SUCCESS,
+        BrokerPersist_PutOutPub(&source, "cid", &out));
+
+    store.reverse_outq = 1;
+    ASSERT_EQ(MQTT_CODE_SUCCESS, MqttBroker_Init(&restored, &net));
+    ASSERT_EQ(MQTT_CODE_SUCCESS,
+        MqttBroker_SetPersistHooks(&restored, &hooks));
+    ASSERT_EQ(MQTT_CODE_SUCCESS, BrokerPersist_Restore(&restored));
+    ASSERT_EQ(MQTT_CODE_SUCCESS, MqttBroker_Start(&restored));
+
+    g_broker_time_s = 1;
+    reset_mock_clients(1);
+    mock_client_input_append(0, connect_pub, sizeof(connect_pub));
+    mock_client_input_append(0, publish, sizeof(publish));
+    for (i = 0; i < 16; i++) {
+        MqttBroker_Step(&restored);
+    }
+
+    orphan = restored.orphan_sessions;
+    ASSERT_NOT_NULL(orphan);
+    ASSERT_EQ(3, orphan->out_q_count);
+    ASSERT_NOT_NULL(orphan->out_q_tail);
+    ASSERT_EQ(2, orphan->out_q_tail->packet_id);
+
+    MqttBroker_Stop(&restored);
+    MqttBroker_Free(&restored);
+
+    ASSERT_EQ(MQTT_CODE_SUCCESS, MqttBroker_Init(&restored_again, &net));
+    ASSERT_EQ(MQTT_CODE_SUCCESS,
+        MqttBroker_SetPersistHooks(&restored_again, &hooks));
+    ASSERT_EQ(MQTT_CODE_SUCCESS, BrokerPersist_Restore(&restored_again));
+
+    orphan = restored_again.orphan_sessions;
+    ASSERT_NOT_NULL(orphan);
+    ASSERT_EQ(3, orphan->out_q_count);
+    ASSERT_NOT_NULL(orphan->out_q_head);
+    ASSERT_EQ(1, orphan->out_q_head->packet_id);
+    ASSERT_NOT_NULL(orphan->out_q_head->next);
+    ASSERT_EQ(0xFFFF, orphan->out_q_head->next->packet_id);
+    ASSERT_NOT_NULL(orphan->out_q_tail);
+    ASSERT_EQ(2, orphan->out_q_tail->packet_id);
+
+    MqttBroker_Free(&restored_again);
+    MqttBroker_Free(&source);
+}
+#endif
+
 static int persist_test_stream_open(void* ctx, byte ns, const byte* key,
     word16 key_len, int mode, void** handle)
 {
@@ -6547,6 +7083,7 @@ int main(int argc, char** argv)
 #endif /* WOLFMQTT_V5 */
     RUN_TEST(online_qos1_flood_disconnects_slow_v311_subscriber);
     RUN_TEST(online_qos1_at_cap_keeps_subscriber);
+    RUN_TEST(outbound_packet_ids_are_scoped_per_session);
 #ifdef WOLFMQTT_NONBLOCK
     RUN_TEST(outbound_queue_short_write_resumes_on_next_step);
 #ifdef WOLFMQTT_BROKER_RETAINED
@@ -6710,6 +7247,13 @@ int main(int argc, char** argv)
 #ifdef WOLFMQTT_BROKER_PERSIST
     RUN_TEST(persist_parent_component_rejected_as_bad_argument);
     RUN_TEST(persist_iter_skips_fifo_without_blocking);
+#ifndef WOLFMQTT_STATIC_MEMORY
+    RUN_TEST(persist_restore_packet_id_wrap_preserves_fifo);
+    #ifdef WOLFMQTT_NONBLOCK
+    RUN_TEST(persist_partial_publish_restart_keeps_dup);
+    #endif
+    RUN_TEST(persist_mixed_qos_queue_preserves_fifo);
+#endif
     RUN_TEST(persist_stream_only_hooks_rejected);
     RUN_TEST(persist_mixed_kv_and_stream_hooks_accepted);
     #ifdef __MACH__

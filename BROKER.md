@@ -144,7 +144,7 @@ through `MqttBroker_SetPersistHooks()`.
 |---|---|---|
 | `BROKER_MAX_PERSIST_SESSIONS` | 64 | Dynamic-memory persistent sessions retained across restarts |
 | `BROKER_MAX_OFFLINE_MSGS_PER_SUB` | 32 | Offline queue depth per session |
-| `WOLFMQTT_BROKER_PERSIST_SCHEMA_VER` | 3 | On-disk record schema version |
+| `WOLFMQTT_BROKER_PERSIST_SCHEMA_VER` | 5 | On-disk record schema version |
 
 ### Encryption at rest
 

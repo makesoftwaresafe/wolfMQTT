@@ -938,14 +938,16 @@ static int wmqb_outq_build_key(const char* client_id, word16 packet_id,
  *     1    1    qos
  *     2    1    retain
  *     3    1    protocol_level
- *     4    2    _reserved
+ *     4    1    retransmit_dup
+ *     5    1    _reserved
  *     6    2    packet_id      (redundant with key, simplifies decode)
  *     8    8    enq_time
- *    16    4    expiry_sec
- *    20    2    topic_len
- *    22    N    topic
- *  22+N    4    payload_len
- *  26+N    M    payload                                                       */
+ *    16    8    enqueue_seq
+ *    24    4    expiry_sec
+ *    28    2    topic_len
+ *    30    N    topic
+ *  30+N    4    payload_len
+ *  34+N    M    payload                                                       */
 int BrokerPersist_PutOutPub(MqttBroker* broker, const char* client_id,
     const struct BrokerOutPub* e)
 {
@@ -977,7 +979,10 @@ int BrokerPersist_PutOutPub(MqttBroker* broker, const char* client_id,
     if (p_e->qos == MQTT_QOS_0) {
         return 0;
     }
-    if (p_e->topic == NULL) {
+    if (p_e->topic == NULL || p_e->enqueue_seq == 0) {
+        return MQTT_CODE_ERROR_BAD_ARG;
+    }
+    if (p_e->retransmit_dup > 1) {
         return MQTT_CODE_ERROR_BAD_ARG;
     }
     topic_len = (word16)XSTRLEN(p_e->topic);
@@ -988,7 +993,7 @@ int BrokerPersist_PutOutPub(MqttBroker* broker, const char* client_id,
     if (rc != 0) {
         return rc;
     }
-    body_len = 1 + 1 + 1 + 1 + 2 + 2 + 8 + 4 + 2 + topic_len + 4
+    body_len = 1 + 1 + 1 + 1 + 2 + 2 + 8 + 8 + 4 + 2 + topic_len + 4
                 + payload_len;
     total_len = WMQB_HDR_LEN + body_len;
     buf = (byte*)WOLFMQTT_MALLOC(total_len);
@@ -1001,9 +1006,11 @@ int BrokerPersist_PutOutPub(MqttBroker* broker, const char* client_id,
     *bp++ = (byte)p_e->qos;
     *bp++ = p_e->retain;
     *bp++ = p_e->protocol_level;
-    *bp++ = 0; *bp++ = 0;  /* _reserved */
+    *bp++ = p_e->retransmit_dup;
+    *bp++ = 0;  /* _reserved */
     wmqb_w_u16(bp, p_e->packet_id); bp += 2;
     wmqb_w_u64(bp, (word64)p_e->enq_time); bp += 8;
+    wmqb_w_u64(bp, p_e->enqueue_seq); bp += 8;
     wmqb_w_u32(bp, p_e->expiry_sec); bp += 4;
     wmqb_w_u16(bp, topic_len); bp += 2;
     XMEMCPY(bp, p_e->topic, topic_len); bp += topic_len;
@@ -2147,8 +2154,7 @@ static void wmqb_restore_drop_ended(MqttBroker* broker,
 #endif /* !WOLFMQTT_STATIC_MEMORY */
 
 #ifndef WOLFMQTT_STATIC_MEMORY
-/* Decode NS_OUTQ record and append to the matching orphan's queue.
- * Insertion is sorted by enq_time so replay preserves publish order. */
+/* Decode NS_OUTQ record and insert it in persistent FIFO order. */
 static int wmqb_decode_and_insert_outq(MqttBroker* broker,
     const byte* key, word16 key_len, const byte* blob, word32 blob_len)
 {
@@ -2165,8 +2171,10 @@ static int wmqb_decode_and_insert_outq(MqttBroker* broker,
     byte   qos;
     byte   retain;
     byte   protocol_level;
+    byte   retransmit_dup;
     word16 packet_id;
     word64 enq_time;
+    word64 enqueue_seq;
     word32 expiry_sec;
     BrokerOutPub** prev_link;
     BrokerOutPub*  iter;
@@ -2183,7 +2191,7 @@ static int wmqb_decode_and_insert_outq(MqttBroker* broker,
     if (rc != 0) {
         return rc;
     }
-    if (body_len < 22) {
+    if (body_len < 30) {
         return MQTT_CODE_ERROR_MALFORMED_DATA;
     }
     p = &blob[WMQB_HDR_LEN];
@@ -2192,9 +2200,17 @@ static int wmqb_decode_and_insert_outq(MqttBroker* broker,
     qos = *p++;
     retain = *p++;
     protocol_level = *p++;
-    p += 2; /* _reserved */
+    retransmit_dup = *p++;
+    p++; /* _reserved */
+    if (retransmit_dup > 1) {
+        return MQTT_CODE_ERROR_MALFORMED_DATA;
+    }
     packet_id = wmqb_r_u16(p); p += 2;
     enq_time = wmqb_r_u64(p); p += 8;
+    enqueue_seq = wmqb_r_u64(p); p += 8;
+    if (enqueue_seq == 0) {
+        return MQTT_CODE_ERROR_MALFORMED_DATA;
+    }
     expiry_sec = wmqb_r_u32(p); p += 4;
     topic_len = wmqb_r_u16(p); p += 2;
     if ((word32)(end - p) < (word32)topic_len + 4) {
@@ -2244,37 +2260,16 @@ static int wmqb_decode_and_insert_outq(MqttBroker* broker,
     e->retain = retain;
     e->state = state;
     e->enq_time = (WOLFMQTT_BROKER_TIME_T)enq_time;
+    e->enqueue_seq = enqueue_seq;
     e->expiry_sec = expiry_sec;
     e->protocol_level = protocol_level;
+    e->retransmit_dup = retransmit_dup;
 
-    /* Advance the broker packet-id counter past this restored id so a fresh
-     * BrokerNextPacketId() cannot reissue an id that is still queued, which
-     * would corrupt ack correlation and overwrite NS_OUTQ records (the key
-     * is derived from packet_id). */
-    if (packet_id >= broker->next_packet_id) {
-        broker->next_packet_id = (word16)(packet_id + 1);
-        if (broker->next_packet_id == 0) {
-            broker->next_packet_id = 1;
-        }
-    }
-
-    /* Insertion-sort by (enq_time, packet_id) so replay preserves
-     * publish order. Two messages enqueued within the same second
-     * (broker time granularity is 1s) tie-break on packet_id, which
-     * the broker hands out monotonically for the lifetime of a
-     * process. Across a restart packet_id resets but ordering is
-     * still preserved within each window since the saved enq_time
-     * advances between windows. */
+    /* Packet Identifiers can wrap and timestamps can tie or move backward. */
     prev_link = &o->out_q_head;
     iter = o->out_q_head;
     while (iter != NULL) {
-        if (iter->enq_time < e->enq_time) {
-            prev_link = &iter->next;
-            iter = iter->next;
-            continue;
-        }
-        if (iter->enq_time == e->enq_time &&
-                iter->packet_id < e->packet_id) {
+        if (iter->enqueue_seq < e->enqueue_seq) {
             prev_link = &iter->next;
             iter = iter->next;
             continue;

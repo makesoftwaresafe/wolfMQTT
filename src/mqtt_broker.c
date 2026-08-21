@@ -1439,7 +1439,12 @@ static void BrokerWs_Free(MqttBroker* broker)
  * core section below. Used by both the WebSocket branch and the orphan
  * enqueue helpers earlier in the file, so the forward decl is hoisted
  * out of the ENABLE_MQTT_WEBSOCKET guard. */
+#ifdef WOLFMQTT_STATIC_MEMORY
 static word16 BrokerNextPacketId(MqttBroker* broker);
+#else
+static word16 BrokerNextPacketIdForQueue(MqttBroker* broker,
+    const BrokerOutPub* out_q);
+#endif
 
 /* -------------------------------------------------------------------------- */
 /* Per-client MqttNet callbacks (route through MqttBrokerNet)                  */
@@ -3588,7 +3593,10 @@ static BrokerOrphanSession* BrokerOrphan_Take(MqttBroker* broker,
      * the queue) are skipped by PutOutPub. */
     {
         BrokerOutPub* cur;
+        word64 enqueue_seq = 1;
+
         for (cur = o->out_q_head; cur != NULL; cur = cur->next) {
+            cur->enqueue_seq = enqueue_seq++;
             if (cur->qos > MQTT_QOS_0) {
                 (void)BrokerPersist_PutOutPub(broker, o->client_id, cur);
             }
@@ -3739,10 +3747,32 @@ static void BrokerOrphan_Enqueue(MqttBroker* broker, BrokerOrphanSession* o,
         return;
     }
     e->qos = qos;
-    e->packet_id = BrokerNextPacketId(broker);
+    e->packet_id = BrokerNextPacketIdForQueue(broker, o->out_q_head);
+    if (e->packet_id == 0) {
+        WBLOG_ERR(broker,
+            "broker: orphan packet IDs exhausted client_id=%s",
+            BrokerLog_Sanitize(
+                BROKER_STR_VALID(o->client_id) ? o->client_id : "(null)"));
+        BrokerOutPub_Free(e);
+        return;
+    }
     e->retain = retain;
     e->state = BROKER_OUTQ_QUEUED;
     e->enq_time = WOLFMQTT_BROKER_GET_TIME_S();
+    if (o->out_q_tail == NULL) {
+        e->enqueue_seq = 1;
+    }
+    else if (o->out_q_tail->enqueue_seq == ~(word64)0) {
+        WBLOG_ERR(broker,
+            "broker: orphan enqueue sequence exhausted client_id=%s",
+            BrokerLog_Sanitize(
+                BROKER_STR_VALID(o->client_id) ? o->client_id : "(null)"));
+        BrokerOutPub_Free(e);
+        return;
+    }
+    else {
+        e->enqueue_seq = o->out_q_tail->enqueue_seq + 1;
+    }
     e->protocol_level = o->protocol_level;
     e->next = NULL;
     if (o->out_q_tail != NULL) {
@@ -4309,15 +4339,62 @@ static void BrokerSubs_Remove(MqttBroker* broker, BrokerClient* bc,
 /* -------------------------------------------------------------------------- */
 /* Packet ID generation                                                        */
 /* -------------------------------------------------------------------------- */
+#ifdef WOLFMQTT_STATIC_MEMORY
 static word16 BrokerNextPacketId(MqttBroker* broker)
 {
     word16 id = broker->next_packet_id;
-    broker->next_packet_id++;
+
+    if (id == 0) {
+        id = 1;
+    }
+    broker->next_packet_id = (word16)(id + 1);
     if (broker->next_packet_id == 0) {
-        broker->next_packet_id = 1; /* wrap: skip 0 */
+        broker->next_packet_id = 1;
     }
     return id;
 }
+#else
+static int BrokerPacketIdInQueue(const BrokerOutPub* out_q, word16 packet_id)
+{
+    const BrokerOutPub* out;
+
+    for (out = out_q; out != NULL; out = out->next) {
+        if (out->packet_id == packet_id) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static word16 BrokerNextPacketIdForQueue(MqttBroker* broker,
+    const BrokerOutPub* out_q)
+{
+    word16 candidate = broker->next_packet_id;
+    word16 first;
+
+    if (candidate == 0) {
+        candidate = 1;
+    }
+    first = candidate;
+    do {
+        if (!BrokerPacketIdInQueue(out_q, candidate)) {
+            /* Packet Identifiers are scoped to one client session
+             * [MQTT-2.2.1-4]. */
+            broker->next_packet_id = (word16)(candidate + 1);
+            if (broker->next_packet_id == 0) {
+                broker->next_packet_id = 1;
+            }
+            return candidate;
+        }
+        candidate++;
+        if (candidate == 0) {
+            candidate = 1;
+        }
+    } while (candidate != first);
+
+    return 0;
+}
+#endif /* WOLFMQTT_STATIC_MEMORY */
 
 /* -------------------------------------------------------------------------- */
 /* Client lookup by ID                                                         */
@@ -5420,7 +5497,16 @@ static int BrokerRetained_DeliverToClient(MqttBroker* broker,
                 else {
                     e->qos = eff_qos;
                     if (eff_qos >= MQTT_QOS_1) {
-                        e->packet_id = BrokerNextPacketId(broker);
+                        e->packet_id = BrokerNextPacketIdForQueue(broker,
+                            bc->out_q_head);
+                        if (e->packet_id == 0) {
+                            WBLOG_ERR(broker,
+                                "broker: retained packet IDs exhausted "
+                                "sock=%d", (int)bc->sock);
+                            BrokerOutPub_Free(e);
+                            deliver_rc = MQTT_CODE_ERROR_PACKET_ID;
+                            break;
+                        }
                     }
                     e->retain = 1;
                     e->state = BROKER_OUTQ_QUEUED;
@@ -5736,15 +5822,25 @@ static void BrokerClient_PublishWillImmediate(MqttBroker* broker,
                 else {
                     e->qos = eff_qos;
                     if (eff_qos >= MQTT_QOS_1) {
-                        e->packet_id = BrokerNextPacketId(broker);
+                        e->packet_id = BrokerNextPacketIdForQueue(broker,
+                            wc->out_q_head);
+                        if (e->packet_id == 0) {
+                            WBLOG_ERR(broker,
+                                "broker: will packet IDs exhausted sock=%d",
+                                (int)wc->sock);
+                            BrokerOutPub_Free(e);
+                            e = NULL;
+                        }
                     }
-                    e->retain = 0;
-                    e->state = BROKER_OUTQ_QUEUED;
+                    if (e != NULL) {
+                        e->retain = 0;
+                        e->state = BROKER_OUTQ_QUEUED;
                 #ifdef WOLFMQTT_V5
-                    e->protocol_level = wc->protocol_level;
+                        e->protocol_level = wc->protocol_level;
                 #endif
-                    BrokerClient_EnqueueOutPub(wc, e);
-                    BrokerClient_DrainOutQueue(wc);
+                        BrokerClient_EnqueueOutPub(wc, e);
+                        BrokerClient_DrainOutQueue(wc);
+                    }
                 }
             }
         }
@@ -7617,25 +7713,35 @@ static int BrokerHandle_Publish(BrokerClient* bc, int rx_len,
                 else {
                     e->qos = eff_qos;
                     if (eff_qos >= MQTT_QOS_1) {
-                        e->packet_id = BrokerNextPacketId(broker);
+                        e->packet_id = BrokerNextPacketIdForQueue(broker,
+                            wc->out_q_head);
+                        if (e->packet_id == 0) {
+                            WBLOG_ERR(broker,
+                                "broker: PUBLISH packet IDs exhausted "
+                                "sock=%d", (int)wc->sock);
+                            BrokerOutPub_Free(e);
+                            e = NULL;
+                        }
                     }
-                    e->retain = 0;
-                    e->state = BROKER_OUTQ_QUEUED;
+                    if (e != NULL) {
+                        e->retain = 0;
+                        e->state = BROKER_OUTQ_QUEUED;
                 #ifdef WOLFMQTT_V5
-                    e->protocol_level = wc->protocol_level;
+                        e->protocol_level = wc->protocol_level;
                 #endif
-                    BrokerClient_EnqueueOutPub(wc, e);
-                    WBLOG_DBG(broker,
-                        "broker: PUBLISH enq sock=%d -> sock=%d "
-                        "topic=%s qos=%d len=%u",
-                        (int)bc->sock, (int)wc->sock,
-                        BrokerLog_Sanitize(topic), eff_qos,
-                        (unsigned)pub.total_len);
-                    /* A self-publish still needs PUBACK or PUBREC from this
-                     * handler, so defer its delivery until that response has
-                     * finished using tx_buf. */
-                    if (wc != bc) {
-                        BrokerClient_DrainOutQueue(wc);
+                        BrokerClient_EnqueueOutPub(wc, e);
+                        WBLOG_DBG(broker,
+                            "broker: PUBLISH enq sock=%d -> sock=%d "
+                            "topic=%s qos=%d len=%u",
+                            (int)bc->sock, (int)wc->sock,
+                            BrokerLog_Sanitize(topic), eff_qos,
+                            (unsigned)pub.total_len);
+                        /* A self-publish still needs PUBACK or PUBREC from
+                         * this handler, so defer its delivery until that
+                         * response has finished using tx_buf. */
+                        if (wc != bc) {
+                            BrokerClient_DrainOutQueue(wc);
+                        }
                     }
                 }
             }
