@@ -1824,6 +1824,93 @@ TEST(unsubscribe_broker_rejection_returns_unsubscribe_rejected)
 
     ASSERT_EQ(MQTT_CODE_ERROR_UNSUBSCRIBE_REJECTED, rc);
 }
+
+/* [MQTT-3.11.3-1] A v5 UNSUBACK must contain exactly one Reason Code for
+ * each Topic Filter in the matching UNSUBSCRIBE. Missing codes must not be
+ * interpreted as successful removals. */
+TEST(unsubscribe_too_few_reason_codes_is_malformed)
+{
+    int rc;
+    int i;
+    MqttUnsubscribe unsub;
+    MqttTopic topics[2];
+    /* Hand-built v5 UNSUBACK: one reason code for two requested filters. */
+    static const byte unsuback[] = {
+        0xB0, 0x04, 0x00, 0x2C, 0x00, 0x00
+    };
+
+    rc = test_init_client();
+    ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
+    test_client.protocol_level = MQTT_CONNECT_PROTOCOL_LEVEL_5;
+    (void)MqttClient_Flags(&test_client, 0,
+        MQTT_CLIENT_FLAG_IS_CONNECTED);
+
+    test_net.write = mock_net_write_accept;
+    test_net.read = mock_net_read_canned;
+    XMEMCPY(g_canned_buf, unsuback, sizeof(unsuback));
+    g_canned_len = (int)sizeof(unsuback);
+    g_canned_pos = 0;
+
+    XMEMSET(&unsub, 0, sizeof(unsub));
+    XMEMSET(topics, 0, sizeof(topics));
+    topics[0].topic_filter = "test/one";
+    topics[1].topic_filter = "test/two";
+    unsub.packet_id = 44;
+    unsub.topic_count = 2;
+    unsub.topics = topics;
+
+    rc = MQTT_CODE_CONTINUE;
+    for (i = 0; i < 10 && rc == MQTT_CODE_CONTINUE; i++) {
+        rc = MqttClient_Unsubscribe(&test_client, &unsub);
+    }
+
+    ASSERT_EQ(MQTT_CODE_ERROR_MALFORMED_DATA, rc);
+    ASSERT_EQ(0, (int)(MqttClient_Flags(&test_client, 0, 0) &
+                       MQTT_CLIENT_FLAG_IS_CONNECTED));
+}
+
+/* [MQTT-3.11.3-1] Extra Reason Codes are also malformed because they cannot
+ * correspond one-for-one with the Topic Filters in the request. */
+TEST(unsubscribe_too_many_reason_codes_is_malformed)
+{
+    int rc;
+    int i;
+    MqttUnsubscribe unsub;
+    MqttTopic topics[2];
+    /* Hand-built v5 UNSUBACK: three reason codes for two requested filters. */
+    static const byte unsuback[] = {
+        0xB0, 0x06, 0x00, 0x2D, 0x00, 0x00, 0x00, 0x00
+    };
+
+    rc = test_init_client();
+    ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
+    test_client.protocol_level = MQTT_CONNECT_PROTOCOL_LEVEL_5;
+    (void)MqttClient_Flags(&test_client, 0,
+        MQTT_CLIENT_FLAG_IS_CONNECTED);
+
+    test_net.write = mock_net_write_accept;
+    test_net.read = mock_net_read_canned;
+    XMEMCPY(g_canned_buf, unsuback, sizeof(unsuback));
+    g_canned_len = (int)sizeof(unsuback);
+    g_canned_pos = 0;
+
+    XMEMSET(&unsub, 0, sizeof(unsub));
+    XMEMSET(topics, 0, sizeof(topics));
+    topics[0].topic_filter = "test/one";
+    topics[1].topic_filter = "test/two";
+    unsub.packet_id = 45;
+    unsub.topic_count = 2;
+    unsub.topics = topics;
+
+    rc = MQTT_CODE_CONTINUE;
+    for (i = 0; i < 10 && rc == MQTT_CODE_CONTINUE; i++) {
+        rc = MqttClient_Unsubscribe(&test_client, &unsub);
+    }
+
+    ASSERT_EQ(MQTT_CODE_ERROR_MALFORMED_DATA, rc);
+    ASSERT_EQ(0, (int)(MqttClient_Flags(&test_client, 0, 0) &
+                       MQTT_CLIENT_FLAG_IS_CONNECTED));
+}
 #endif /* WOLFMQTT_V5 */
 
 /* ============================================================================
@@ -4744,6 +4831,8 @@ void run_mqtt_client_tests(void)
     RUN_TEST(subscribe_broker_rejection_returns_subscribe_rejected);
 #ifdef WOLFMQTT_V5
     RUN_TEST(unsubscribe_broker_rejection_returns_unsubscribe_rejected);
+    RUN_TEST(unsubscribe_too_few_reason_codes_is_malformed);
+    RUN_TEST(unsubscribe_too_many_reason_codes_is_malformed);
 #endif
 
     /* MqttClient_Unsubscribe tests */

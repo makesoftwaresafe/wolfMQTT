@@ -3347,7 +3347,6 @@ int MqttClient_Unsubscribe(MqttClient *client, MqttUnsubscribe *unsubscribe)
     int rc;
 #ifdef WOLFMQTT_V5
     int i;
-    word16 reason_count;
 #endif
 
     /* Validate required arguments */
@@ -3438,21 +3437,25 @@ int MqttClient_Unsubscribe(MqttClient *client, MqttUnsubscribe *unsubscribe)
 #endif
 
 #ifdef WOLFMQTT_V5
-    /* Detect broker rejection. A v5 UNSUBACK carries one reason code per
-     * topic filter; any code with the high bit set (>= 0x80) means the
-     * broker refused to remove that subscription, so the caller must not
-     * assume the filter is gone. Mirrors the SUBSCRIBE rejection path. */
+    /* [MQTT-3.11.3-1] A v5 UNSUBACK carries exactly one reason code per
+     * topic filter. Any code with the high bit set (>= 0x80) means the
+     * broker refused to remove that subscription. */
     if (rc == MQTT_CODE_SUCCESS &&
-        unsubscribe->protocol_level >= MQTT_CONNECT_PROTOCOL_LEVEL_5 &&
-        unsubscribe->ack.reason_codes != NULL) {
-        reason_count = unsubscribe->ack.reason_code_count;
-        if (reason_count > (word16)unsubscribe->topic_count) {
-            reason_count = (word16)unsubscribe->topic_count;
+        unsubscribe->protocol_level >= MQTT_CONNECT_PROTOCOL_LEVEL_5) {
+        if (unsubscribe->ack.reason_code_count != unsubscribe->topic_count ||
+                (unsubscribe->ack.reason_code_count > 0 &&
+                 unsubscribe->ack.reason_codes == NULL)) {
+            rc = MQTT_TRACE_ERROR(MQTT_CODE_ERROR_MALFORMED_DATA);
+            (void)MqttClient_Flags(client,
+                MQTT_CLIENT_FLAG_IS_CONNECTED, 0);
         }
-        for (i = 0; i < (int)reason_count; i++) {
-            if (unsubscribe->ack.reason_codes[i] & 0x80) {
-                rc = MQTT_TRACE_ERROR(MQTT_CODE_ERROR_UNSUBSCRIBE_REJECTED);
-                break;
+        else {
+            for (i = 0; i < unsubscribe->ack.reason_code_count; i++) {
+                if (unsubscribe->ack.reason_codes[i] & 0x80) {
+                    rc = MQTT_TRACE_ERROR(
+                        MQTT_CODE_ERROR_UNSUBSCRIBE_REJECTED);
+                    break;
+                }
             }
         }
     }
