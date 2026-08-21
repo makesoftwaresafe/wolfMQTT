@@ -587,6 +587,11 @@ int MqttBroker_SetPersistHooks(MqttBroker* broker,
     if (hooks != NULL && (broker->running || broker->persist_restored)) {
         return MQTT_CODE_ERROR_BAD_ARG;
     }
+#ifdef WOLFMQTT_BROKER_PERSIST_ENCRYPT
+    wmqb_force_zero(broker->persist_key_cache,
+        (word32)sizeof(broker->persist_key_cache));
+    broker->persist_key_loaded = 0;
+#endif
     broker->persist = hooks;
     return MQTT_CODE_SUCCESS;
 }

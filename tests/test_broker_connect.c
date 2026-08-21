@@ -6810,6 +6810,21 @@ static int persist_test_derive_success(void* ctx, byte* out_key,
     return MQTT_CODE_SUCCESS;
 }
 
+typedef struct PersistKeyDeriveCtx {
+    byte fill;
+    int calls;
+} PersistKeyDeriveCtx;
+
+static int persist_test_derive_from_ctx(void* ctx, byte* out_key,
+    word32 key_len)
+{
+    PersistKeyDeriveCtx* derive = (PersistKeyDeriveCtx*)ctx;
+
+    derive->calls++;
+    XMEMSET(out_key, derive->fill, key_len);
+    return MQTT_CODE_SUCCESS;
+}
+
 static int persist_test_get_bad_tag(void* ctx, byte ns, const byte* key,
     word16 key_len, byte* out, word32* inout_len)
 {
@@ -6875,6 +6890,58 @@ TEST(persist_bad_tag_scrubs_plaintext_before_free)
     ASSERT_EQ(16, g_capture_freed_len);
     for (i = 0; i < g_capture_freed_len; i++) {
         ASSERT_EQ(0, g_capture_freed[i]);
+    }
+}
+
+TEST(persist_hook_replacement_rekeys_cache)
+{
+    MqttBroker broker;
+    MqttBrokerPersistHooks first_hooks;
+    MqttBrokerPersistHooks second_hooks;
+    PersistKeyDeriveCtx first_ctx;
+    PersistKeyDeriveCtx second_ctx;
+    word32 i;
+
+    XMEMSET(&broker, 0, sizeof(broker));
+    XMEMSET(&first_hooks, 0, sizeof(first_hooks));
+    XMEMSET(&second_hooks, 0, sizeof(second_hooks));
+    XMEMSET(&first_ctx, 0, sizeof(first_ctx));
+    XMEMSET(&second_ctx, 0, sizeof(second_ctx));
+    first_ctx.fill = 0x11;
+    second_ctx.fill = 0x22;
+    first_hooks.kv_put = persist_test_put_noop;
+    first_hooks.derive_key = persist_test_derive_from_ctx;
+    first_hooks.ctx = &first_ctx;
+    second_hooks.kv_put = persist_test_put_noop;
+    second_hooks.derive_key = persist_test_derive_from_ctx;
+    second_hooks.ctx = &second_ctx;
+
+    ASSERT_EQ(MQTT_CODE_SUCCESS,
+        MqttBroker_SetPersistHooks(&broker, &first_hooks));
+    ASSERT_EQ(MQTT_CODE_SUCCESS, BrokerPersist_PutOrphanSession(&broker,
+        "first", MQTT_CONNECT_PROTOCOL_LEVEL_4, 60,
+        (WOLFMQTT_BROKER_TIME_T)1));
+    ASSERT_EQ(1, first_ctx.calls);
+    ASSERT_EQ(1, broker.persist_key_loaded);
+    for (i = 0; i < (word32)sizeof(broker.persist_key_cache); i++) {
+        ASSERT_EQ(0x11, broker.persist_key_cache[i]);
+    }
+
+    ASSERT_EQ(MQTT_CODE_SUCCESS,
+        MqttBroker_SetPersistHooks(&broker, &second_hooks));
+    ASSERT_EQ(0, broker.persist_key_loaded);
+    for (i = 0; i < (word32)sizeof(broker.persist_key_cache); i++) {
+        ASSERT_EQ(0, broker.persist_key_cache[i]);
+    }
+
+    ASSERT_EQ(MQTT_CODE_SUCCESS, BrokerPersist_PutOrphanSession(&broker,
+        "second", MQTT_CONNECT_PROTOCOL_LEVEL_4, 60,
+        (WOLFMQTT_BROKER_TIME_T)2));
+    ASSERT_EQ(1, first_ctx.calls);
+    ASSERT_EQ(1, second_ctx.calls);
+    ASSERT_EQ(1, broker.persist_key_loaded);
+    for (i = 0; i < (word32)sizeof(broker.persist_key_cache); i++) {
+        ASSERT_EQ(0x22, broker.persist_key_cache[i]);
     }
 }
 #endif /* WOLFMQTT_BROKER_PERSIST_ENCRYPT */
@@ -7378,6 +7445,7 @@ int main(int argc, char** argv)
 #ifdef WOLFMQTT_BROKER_PERSIST_ENCRYPT
     RUN_TEST(persist_failed_key_derivation_scrubs_cache);
     RUN_TEST(persist_bad_tag_scrubs_plaintext_before_free);
+    RUN_TEST(persist_hook_replacement_rekeys_cache);
 #endif
 #endif
     TEST_SUITE_END();
