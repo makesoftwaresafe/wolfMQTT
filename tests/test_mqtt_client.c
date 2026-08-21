@@ -1567,12 +1567,10 @@ TEST(publish_v5_within_max_packet_size_allowed)
     ASSERT_TRUE(g_frames_written > 0);
 }
 
-/* MQTT v5 [3.1.2.11.6]: only Max QoS 0 or 1 are legal. A non-conforming or
- * malicious broker that advertises a larger value (2 here) must be clamped to
- * MQTT_QOS_1 before being narrowed against this build's WOLFMQTT_MAX_QOS, so the
- * client-side publish guard cannot be tricked into permitting QoS 2. Exercises
- * the clamp branch that the in-spec acceptance test above does not reach. */
-TEST(connect_accepted_connack_clamps_illegal_max_qos)
+/* MQTT 5.0 section 3.2.2.3.4: Maximum QoS can only be 0 or 1. Feed an
+ * independently constructed CONNACK containing 2 and require the client to
+ * reject the connection instead of normalizing the invalid wire value. */
+TEST(connect_accepted_connack_rejects_illegal_max_qos)
 {
     int rc;
     int i;
@@ -1604,11 +1602,50 @@ TEST(connect_accepted_connack_clamps_illegal_max_qos)
         rc = MqttClient_Connect(&test_client, &connect);
     }
 
-    ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
+    ASSERT_EQ(MQTT_CODE_ERROR_SERVER_PROP, rc);
     ASSERT_EQ(MQTT_CONNECT_ACK_CODE_ACCEPTED, connect.ack.return_code);
-    /* Illegal QoS 2 is clamped to 1, then narrowed against WOLFMQTT_MAX_QOS. */
-    ASSERT_EQ((WOLFMQTT_MAX_QOS < MQTT_QOS_1) ? (byte)WOLFMQTT_MAX_QOS :
-              MQTT_QOS_1, test_client.max_qos);
+    ASSERT_EQ(WOLFMQTT_MAX_QOS, test_client.max_qos);
+}
+
+/* MQTT 5.0 section 3.2.2.3.5: Retain Available can only be 0 or 1. Feed an
+ * independently constructed CONNACK containing 2 and require a protocol
+ * failure rather than accepting it as Retain Available=1. */
+TEST(connect_accepted_connack_rejects_illegal_retain_available)
+{
+    int rc;
+    int i;
+    MqttConnect connect;
+    /* CONNACK v5 with an out-of-spec Retain Available of 2: type=0x20,
+     * remain=0x05, flags=0x00, return_code=0x00, prop_len=0x02,
+     * [0x25 0x02]=Retain Available 2. */
+    static const byte connack[] = {
+        0x20, 0x05, 0x00, 0x00, 0x02,
+        0x25, 0x02
+    };
+
+    rc = test_init_client();
+    ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
+    test_client.protocol_level = MQTT_CONNECT_PROTOCOL_LEVEL_5;
+
+    test_net.write = mock_net_write_accept;
+    test_net.read = mock_net_read_canned;
+    XMEMCPY(g_canned_buf, connack, sizeof(connack));
+    g_canned_len = (int)sizeof(connack);
+    g_canned_pos = 0;
+
+    XMEMSET(&connect, 0, sizeof(connect));
+    connect.keep_alive_sec = 60;
+    connect.clean_session = 1;
+    connect.client_id = "test_client";
+
+    rc = MQTT_CODE_CONTINUE;
+    for (i = 0; i < 10 && rc == MQTT_CODE_CONTINUE; i++) {
+        rc = MqttClient_Connect(&test_client, &connect);
+    }
+
+    ASSERT_EQ(MQTT_CODE_ERROR_SERVER_PROP, rc);
+    ASSERT_EQ(MQTT_CONNECT_ACK_CODE_ACCEPTED, connect.ack.return_code);
+    ASSERT_EQ(1, test_client.retain_avail);
 }
 #endif /* WOLFMQTT_V5 */
 
@@ -4269,7 +4306,8 @@ void run_mqtt_client_tests(void)
     RUN_TEST(auth_without_connect_method_rejected);
     RUN_TEST(auth_with_connect_method_allowed);
     RUN_TEST(connect_refused_connack_preserves_v5_defaults);
-    RUN_TEST(connect_accepted_connack_clamps_illegal_max_qos);
+    RUN_TEST(connect_accepted_connack_rejects_illegal_max_qos);
+    RUN_TEST(connect_accepted_connack_rejects_illegal_retain_available);
     RUN_TEST(connect_accepted_connack_latches_topic_alias_max);
     RUN_TEST(connect_accepted_connack_rejects_zero_receive_max);
     RUN_TEST(connect_accepted_connack_latches_receive_max);

@@ -701,22 +701,27 @@ static int Handle_ConnectAck_Props(MqttClient* client, MqttProp* props)
     MqttProp* prop;
 
     for (prop = props; prop != NULL; prop = prop->next) {
+        /* MQTT 5.0 sections 3.2.2.3.4 and 3.2.2.3.5: these byte
+         * properties can only contain 0 or 1. Reject the complete CONNACK
+         * before applying any of its server limits. */
+        if (((prop->type == MQTT_PROP_MAX_QOS) &&
+                (prop->data_byte > MQTT_QOS_1)) ||
+            ((prop->type == MQTT_PROP_RETAIN_AVAIL) &&
+                (prop->data_byte > 1))) {
+            return MQTT_TRACE_ERROR(MQTT_CODE_ERROR_SERVER_PROP);
+        }
+    }
+
+    for (prop = props; prop != NULL; prop = prop->next) {
         if (prop->type == MQTT_PROP_MAX_QOS) {
-            /* MQTT v5 [3.1.2.11.6]: only 0 or 1 are legal. Clamp a
-             * non-conforming broker value, then narrow against this
-             * build's WOLFMQTT_MAX_QOS so client-side publish guards
-             * remain meaningful. */
-            byte adv = (prop->data_byte <= MQTT_QOS_1) ?
-                    prop->data_byte : MQTT_QOS_1;
+            byte adv = prop->data_byte;
             if (adv > WOLFMQTT_MAX_QOS) {
                 adv = (byte)WOLFMQTT_MAX_QOS;
             }
             client->max_qos = adv;
         }
         else if (prop->type == MQTT_PROP_RETAIN_AVAIL) {
-            /* MQTT v5 [3.1.2.11.5]: only 0 or 1 are legal. */
-            client->retain_avail = (prop->data_byte <= 1) ?
-                    prop->data_byte : 1;
+            client->retain_avail = prop->data_byte;
         }
         else if (prop->type == MQTT_PROP_MAX_PACKET_SZ) {
             if ((prop->data_int > 0) &&
