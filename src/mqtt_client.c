@@ -1678,6 +1678,18 @@ wait_again:
         {
             MqttPublishResp resp;
             MqttPacketType use_packet_type;
+        #ifdef WOLFMQTT_V5
+            int pubrec_tracked = 0;
+
+            /* A synchronous QoS 2 publish waits for PUBCOMP while processing
+             * the intermediate PUBREC for the same Packet Identifier. */
+            if (packet_type == MQTT_PACKET_TYPE_PUBLISH_REC &&
+                    client->protocol_level >= MQTT_CONNECT_PROTOCOL_LEVEL_5 &&
+                    wait_type == MQTT_PACKET_TYPE_PUBLISH_COMP &&
+                    wait_packet_id != 0 && wait_packet_id == packet_id) {
+                pubrec_tracked = 1;
+            }
+        #endif
 
             /* Determine if we received data for this request */
             if ((wait_type == MQTT_PACKET_TYPE_ANY ||
@@ -1738,6 +1750,30 @@ wait_again:
                         waitMatchFound = 0;
                     }
                 }
+            #ifdef WOLFMQTT_V5
+                /* A reader thread receives the intermediate PUBREC while the
+                 * publisher's pending entry is keyed by the final PUBCOMP. */
+                if (!pubrec_tracked &&
+                        packet_type == MQTT_PACKET_TYPE_PUBLISH_REC &&
+                        client->protocol_level >=
+                            MQTT_CONNECT_PROTOCOL_LEVEL_5) {
+                    MqttPendResp* qos2Resp;
+
+                    for (qos2Resp = client->firstPendResp;
+                         qos2Resp != NULL; qos2Resp = qos2Resp->next) {
+                        if (qos2Resp->packet_type ==
+                                MQTT_PACKET_TYPE_PUBLISH_COMP &&
+                                qos2Resp->packet_id == packet_id &&
+                                !qos2Resp->packetDone) {
+                            pubrec_tracked = 1;
+                            /* This belongs to the publisher's flow, not the
+                             * generic WaitMessage caller. */
+                            waitMatchFound = 0;
+                            break;
+                        }
+                    }
+                }
+            #endif
                 wm_SemUnlock(&client->lockClient);
             }
             else {
@@ -1765,6 +1801,18 @@ wait_again:
             XMEMSET(&resp, 0, sizeof(resp));
             rc = MqttClient_HandlePacket(client, use_packet_type,
                 use_packet_obj, &resp, timeout_ms);
+
+        #ifdef WOLFMQTT_V5
+            /* [MQTT-3.6.2.1] An unsolicited PUBREC is answered with PUBREL
+             * reason 0x92 instead of falsely advancing an unknown flow. */
+            if (rc >= 0 &&
+                    packet_type == MQTT_PACKET_TYPE_PUBLISH_REC &&
+                    client->protocol_level >= MQTT_CONNECT_PROTOCOL_LEVEL_5 &&
+                    resp.packet_type == MQTT_PACKET_TYPE_PUBLISH_REL &&
+                    !pubrec_tracked) {
+                resp.reason_code = MQTT_REASON_PACKET_ID_NOT_FOUND;
+            }
+        #endif
 
             /* if using the shared packet object, make sure the original
              * state is correct for publish payload 2 (continued) */

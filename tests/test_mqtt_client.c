@@ -2667,6 +2667,7 @@ TEST(publish_qos2_v5_broker_rejection_returns_publish_rejected)
 TEST(publish_qos2_v5_success_returns_success)
 {
     int rc;
+    int i;
     MqttPublish publish;
     static byte payload[] = "hello";
     /* PUBREC success (no reason byte): type=0x50, remain=2, packet_id=14.
@@ -2674,6 +2675,11 @@ TEST(publish_qos2_v5_success_returns_success)
     static const byte resp[] = {
         0x50, 0x02, 0x00, 0x0E,
         0x70, 0x02, 0x00, 0x0E
+    };
+    static const byte success_pubrel[] = { 0x62, 0x02, 0x00, 0x0E };
+    static const byte stray_pubrec[] = { 0x50, 0x02, 0x00, 0x0E };
+    static const byte unknown_pubrel[] = {
+        0x62, 0x03, 0x00, 0x0E, MQTT_REASON_PACKET_ID_NOT_FOUND
     };
 
     XMEMSET(&publish, 0, sizeof(publish));
@@ -2690,6 +2696,25 @@ TEST(publish_qos2_v5_success_returns_success)
     ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
     ASSERT_EQ(MQTT_REASON_SUCCESS, publish.resp.reason_code);
     ASSERT_TRUE(g_pubrel_written);
+    ASSERT_EQ((int)sizeof(success_pubrel), connect_mock_xfer);
+    ASSERT_MEM_EQ(success_pubrel, connect_mock_sent, sizeof(success_pubrel));
+
+    /* The matching PUBCOMP completed the tracked flow. Repeating its PUBREC
+     * through the generic receive path must now report the ID as unknown. */
+    XMEMCPY(g_canned_buf, stray_pubrec, sizeof(stray_pubrec));
+    g_canned_len = (int)sizeof(stray_pubrec);
+    g_canned_pos = 0;
+    connect_mock_xfer = 0;
+    XMEMSET(connect_mock_sent, 0, sizeof(connect_mock_sent));
+
+    rc = MQTT_CODE_CONTINUE;
+    for (i = 0; i < 20 && rc == MQTT_CODE_CONTINUE; i++) {
+        rc = MqttClient_WaitMessage(&test_client, TEST_CMD_TIMEOUT_MS);
+    }
+
+    ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
+    ASSERT_EQ((int)sizeof(unknown_pubrel), connect_mock_xfer);
+    ASSERT_MEM_EQ(unknown_pubrel, connect_mock_sent, sizeof(unknown_pubrel));
 }
 
 /* The primary QoS 2 rejection point is the PUBREC: a v5 broker reports
@@ -3115,6 +3140,72 @@ TEST(publish_qos2_v5_pubrec_rejection_multithread_reader)
     ASSERT_FALSE(g_pubrel_written);
     /* The publisher's own struct is NOT updated on this path. */
     ASSERT_EQ(MQTT_REASON_SUCCESS, publish.resp.reason_code);
+}
+
+/* A reader thread must recognize the PUBCOMP-keyed pending entry as the
+ * outbound state for an intermediate PUBREC, then stop recognizing it after
+ * the matching PUBCOMP completes and the publisher consumes that response. */
+TEST(publish_qos2_v5_pubrec_state_multithread_reader)
+{
+    int rc;
+    int i;
+    static MqttPublish publish;
+    static byte payload[] = "hello";
+    static const byte pubrec[] = { 0x50, 0x02, 0x00, 0x0F };
+    static const byte pubcomp[] = { 0x70, 0x02, 0x00, 0x0F };
+    static const byte success_pubrel[] = { 0x62, 0x02, 0x00, 0x0F };
+    static const byte unknown_pubrel[] = {
+        0x62, 0x03, 0x00, 0x0F, MQTT_REASON_PACKET_ID_NOT_FOUND
+    };
+
+    rc = test_init_client();
+    ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
+    test_client.protocol_level = MQTT_CONNECT_PROTOCOL_LEVEL_5;
+    test_net.write = mock_net_write_accept;
+    test_net.read = mock_net_read_canned;
+
+    XMEMSET(&publish, 0, sizeof(publish));
+    publish.qos = MQTT_QOS_2;
+    publish.packet_id = 15;
+    publish.topic_name = "test/topic";
+    publish.buffer = payload;
+    publish.total_len = (word32)(sizeof(payload) - 1);
+    publish.buffer_len = publish.total_len;
+
+    rc = MqttClient_Publish_WriteOnly(&test_client, &publish, NULL);
+    ASSERT_EQ(MQTT_CODE_CONTINUE, rc);
+
+    XMEMCPY(g_canned_buf, pubrec, sizeof(pubrec));
+    g_canned_len = (int)sizeof(pubrec);
+    g_canned_pos = 0;
+    connect_mock_xfer = 0;
+    rc = MqttClient_WaitMessage(&test_client, TEST_CMD_TIMEOUT_MS);
+    ASSERT_EQ(MQTT_CODE_CONTINUE, rc);
+    ASSERT_EQ((int)sizeof(success_pubrel), connect_mock_xfer);
+    ASSERT_MEM_EQ(success_pubrel, connect_mock_sent, sizeof(success_pubrel));
+
+    XMEMCPY(g_canned_buf, pubcomp, sizeof(pubcomp));
+    g_canned_len = (int)sizeof(pubcomp);
+    g_canned_pos = 0;
+    rc = MqttClient_WaitMessage(&test_client, TEST_CMD_TIMEOUT_MS);
+    ASSERT_EQ(MQTT_CODE_CONTINUE, rc);
+    ASSERT_EQ((int)sizeof(pubcomp), g_canned_pos);
+
+    for (i = 0; i < 20 && rc == MQTT_CODE_CONTINUE; i++) {
+        rc = MqttClient_Publish_WriteOnly(&test_client, &publish, NULL);
+    }
+    ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
+    ASSERT_NULL(test_client.firstPendResp);
+
+    XMEMCPY(g_canned_buf, pubrec, sizeof(pubrec));
+    g_canned_len = (int)sizeof(pubrec);
+    g_canned_pos = 0;
+    connect_mock_xfer = 0;
+    XMEMSET(connect_mock_sent, 0, sizeof(connect_mock_sent));
+    rc = MqttClient_WaitMessage(&test_client, TEST_CMD_TIMEOUT_MS);
+    ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
+    ASSERT_EQ((int)sizeof(unknown_pubrel), connect_mock_xfer);
+    ASSERT_MEM_EQ(unknown_pubrel, connect_mock_sent, sizeof(unknown_pubrel));
 }
 #endif /* WOLFMQTT_MULTITHREAD && WOLFMQTT_NONBLOCK && WOLFMQTT_MAX_QOS >= 2 */
 
@@ -4160,6 +4251,42 @@ TEST(wait_message_pubrec_emits_pubrel)
     ASSERT_EQ(MQTT_PACKET_TYPE_PUBLISH_REL, g_last_ack_written);
 }
 
+#ifdef WOLFMQTT_V5
+/* [MQTT-3.6.2.1] permits 0x92 in PUBREL when the receiver has no matching
+ * outbound QoS 2 flow. This fixed wire fixture is an unsolicited successful
+ * PUBREC; the exact response must report that its Packet Identifier is unknown. */
+TEST(wait_message_v5_unmatched_pubrec_reports_unknown_id)
+{
+    int rc;
+    int i;
+    static const byte pubrec[] = { 0x50, 0x02, 0x12, 0x34 };
+    static const byte expected_pubrel[] = {
+        0x62, 0x03, 0x12, 0x34, MQTT_REASON_PACKET_ID_NOT_FOUND
+    };
+
+    rc = test_init_client();
+    ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
+    test_client.protocol_level = MQTT_CONNECT_PROTOCOL_LEVEL_5;
+    test_net.write = mock_net_write_accept;
+    test_net.read = mock_net_read_canned;
+    XMEMCPY(g_canned_buf, pubrec, sizeof(pubrec));
+    g_canned_len = (int)sizeof(pubrec);
+    g_canned_pos = 0;
+    connect_mock_xfer = 0;
+    XMEMSET(connect_mock_sent, 0, sizeof(connect_mock_sent));
+
+    rc = MQTT_CODE_CONTINUE;
+    for (i = 0; i < 20 && rc == MQTT_CODE_CONTINUE; i++) {
+        rc = MqttClient_WaitMessage(&test_client, TEST_CMD_TIMEOUT_MS);
+    }
+
+    ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
+    ASSERT_EQ((int)sizeof(expected_pubrel), connect_mock_xfer);
+    ASSERT_MEM_EQ(expected_pubrel, connect_mock_sent,
+        sizeof(expected_pubrel));
+}
+#endif /* WOLFMQTT_V5 */
+
 TEST(wait_message_pubrel_emits_pubcomp)
 {
     int rc;
@@ -4917,6 +5044,7 @@ void run_mqtt_client_tests(void)
 #if defined(WOLFMQTT_MULTITHREAD) && defined(WOLFMQTT_NONBLOCK) && \
     WOLFMQTT_MAX_QOS >= 2
     RUN_TEST(publish_qos2_v5_pubrec_rejection_multithread_reader);
+    RUN_TEST(publish_qos2_v5_pubrec_state_multithread_reader);
 #endif
 #ifdef WOLFMQTT_MULTITHREAD
 #ifdef WOLFMQTT_NONBLOCK
@@ -4960,6 +5088,9 @@ void run_mqtt_client_tests(void)
 #endif
 #endif
     RUN_TEST(wait_message_pubrec_emits_pubrel);
+#ifdef WOLFMQTT_V5
+    RUN_TEST(wait_message_v5_unmatched_pubrec_reports_unknown_id);
+#endif
     RUN_TEST(wait_message_pubrel_emits_pubcomp);
     RUN_TEST(wait_message_puback_emits_no_ack);
     RUN_TEST(wait_message_pubcomp_emits_no_ack);
