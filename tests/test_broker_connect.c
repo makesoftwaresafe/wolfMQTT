@@ -162,6 +162,9 @@ typedef struct MockClient {
 static MockClient g_clients[MOCK_MAX_CLIENTS];
 static int g_clients_active;   /* how many clients accept() will hand out */
 static int g_accept_count;     /* incremented per successful accept() */
+static int g_listen_count;
+static int g_listen_close_count;
+static int g_listen_fail_on_call;
 
 /* Legacy single-client tests use g_in_buf / g_out_buf / g_client_closed
  * directly. Map them to client 0 so existing code keeps working. */
@@ -189,6 +192,10 @@ static int mock_listen(void* ctx, BROKER_SOCKET_T* sock,
     word16 port, int backlog)
 {
     (void)ctx; (void)port; (void)backlog;
+    g_listen_count++;
+    if (g_listen_count == g_listen_fail_on_call) {
+        return MQTT_CODE_ERROR_NETWORK;
+    }
     *sock = MOCK_LISTEN_SOCK;
     return MQTT_CODE_SUCCESS;
 }
@@ -288,6 +295,9 @@ static int mock_close(void* ctx, BROKER_SOCKET_T sock)
     if (idx >= 0) {
         g_clients[idx].closed = 1;
     }
+    else if (sock == MOCK_LISTEN_SOCK) {
+        g_listen_close_count++;
+    }
     return MQTT_CODE_SUCCESS;
 }
 
@@ -350,7 +360,13 @@ static void run_broker_one_connect(MqttBroker* broker)
     }
 }
 
-static void setup(void)    { g_broker_time_s = 0; }
+static void setup(void)
+{
+    g_broker_time_s = 0;
+    g_listen_count = 0;
+    g_listen_close_count = 0;
+    g_listen_fail_on_call = 0;
+}
 static void teardown(void) { }
 
 /* -------------------------------------------------------------------------- */
@@ -1026,6 +1042,12 @@ TEST(connect_auth_user_only_start_rejected)
     broker.auth_user = "user";
     broker.auth_pass = NULL;
     ASSERT_EQ(MQTT_CODE_ERROR_BAD_ARG, MqttBroker_Start(&broker));
+    ASSERT_EQ(0, g_listen_count);
+    ASSERT_EQ(BROKER_SOCKET_INVALID, broker.listen_sock);
+
+    broker.auth_pass = "pass";
+    ASSERT_EQ(MQTT_CODE_SUCCESS, MqttBroker_Start(&broker));
+    ASSERT_EQ(1, g_listen_count);
 
     MqttBroker_Free(&broker);
 }
@@ -1045,6 +1067,38 @@ TEST(connect_auth_pass_only_start_rejected)
 
     MqttBroker_Free(&broker);
 }
+
+#ifdef ENABLE_MQTT_TLS
+TEST(broker_start_partial_listener_failure_cleans_up)
+{
+    MqttBroker broker;
+    MqttBrokerNet net;
+    WOLFSSL_CTX* external_tls_ctx;
+
+    install_mock_net(&net);
+    XMEMSET(&broker, 0, sizeof(broker));
+    ASSERT_EQ(MQTT_CODE_SUCCESS, MqttBroker_Init(&broker, &net));
+    external_tls_ctx = (WOLFSSL_CTX*)&broker;
+    broker.tls_ctx = external_tls_ctx;
+    broker.use_tls = 1;
+    broker.port_tls = (word16)(broker.port + 1);
+    g_listen_fail_on_call = 2;
+
+    ASSERT_EQ(MQTT_CODE_ERROR_NETWORK, MqttBroker_Start(&broker));
+    ASSERT_EQ(2, g_listen_count);
+    ASSERT_EQ(1, g_listen_close_count);
+    ASSERT_EQ(BROKER_SOCKET_INVALID, broker.listen_sock);
+    ASSERT_EQ(BROKER_SOCKET_INVALID, broker.listen_sock_tls);
+    ASSERT_TRUE(broker.tls_ctx == external_tls_ctx);
+
+    g_listen_fail_on_call = 0;
+    ASSERT_EQ(MQTT_CODE_SUCCESS, MqttBroker_Start(&broker));
+    ASSERT_EQ(4, g_listen_count);
+
+    broker.tls_ctx = NULL;
+    MqttBroker_Free(&broker);
+}
+#endif
 
 /* Defense in depth: the MqttBroker struct is public, so a caller can set
  * auth_user after a successful no-auth start (or ignore the start error),
@@ -7365,6 +7419,9 @@ int main(int argc, char** argv)
 #ifndef WOLFMQTT_STATIC_MEMORY
     RUN_TEST(connect_credentials_scrubbed_after_accept);
 #endif
+#endif
+#ifdef ENABLE_MQTT_TLS
+    RUN_TEST(broker_start_partial_listener_failure_cleans_up);
 #endif
 #ifdef WOLFMQTT_V5
     RUN_TEST(connect_v5_emptyid_assigned_id_emitted);

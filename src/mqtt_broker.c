@@ -8762,6 +8762,29 @@ int MqttBroker_Step(MqttBroker* broker)
     return activity ? MQTT_CODE_SUCCESS : MQTT_CODE_CONTINUE;
 }
 
+static void BrokerStart_Cleanup(MqttBroker* broker)
+{
+#ifdef ENABLE_MQTT_WEBSOCKET
+    BrokerWs_Free(broker);
+#endif
+    if (broker->listen_sock != BROKER_SOCKET_INVALID) {
+        broker->net.close(broker->net.ctx, broker->listen_sock);
+        broker->listen_sock = BROKER_SOCKET_INVALID;
+    }
+#ifdef ENABLE_MQTT_TLS
+    if (broker->listen_sock_tls != BROKER_SOCKET_INVALID) {
+        broker->net.close(broker->net.ctx, broker->listen_sock_tls);
+        broker->listen_sock_tls = BROKER_SOCKET_INVALID;
+    }
+  #if !defined(WOLFMQTT_BROKER_CUSTOM_NET)
+    if (broker->tls_ctx != NULL && broker->tls_ctx_owned) {
+        BrokerTls_Free(broker);
+        broker->tls_ctx_owned = 0;
+    }
+  #endif
+#endif
+}
+
 int MqttBroker_Start(MqttBroker* broker)
 {
     int rc;
@@ -8769,6 +8792,65 @@ int MqttBroker_Start(MqttBroker* broker)
     if (broker == NULL) {
         return MQTT_CODE_ERROR_BAD_ARG;
     }
+
+#ifdef WOLFMQTT_BROKER_AUTH
+    if (broker->auth_user || broker->auth_pass) {
+        /* Username and password are a credential pair: configuring only one
+         * silently downgrades to single-factor auth, because the unconfigured
+         * side is never checked and any client-supplied value for it is
+         * accepted. Reject the partial config at startup so the operator sees
+         * the mistake instead of shipping a bypassable broker. */
+        if (broker->auth_user == NULL || broker->auth_pass == NULL) {
+            WBLOG_ERR(broker,
+                "broker: auth requires both auth_user and auth_pass "
+                "(user=%s pass=%s)",
+                broker->auth_user ? "set" : "(null)",
+                broker->auth_pass ? "set" : "(null)");
+            return MQTT_CODE_ERROR_BAD_ARG;
+        }
+        /* Reject configured credentials that would be silently rejected
+         * by BrokerStrCompare's cmp_len guard. Catching this at startup
+         * avoids a confusing state where every client auth fails. */
+        if (XSTRLEN(broker->auth_user) >= BROKER_MAX_USERNAME_LEN) {
+            WBLOG_ERR(broker,
+                "broker: auth_user length %u >= BROKER_MAX_USERNAME_LEN (%d)",
+                (unsigned)XSTRLEN(broker->auth_user),
+                BROKER_MAX_USERNAME_LEN);
+            return MQTT_CODE_ERROR_BAD_ARG;
+        }
+        if (XSTRLEN(broker->auth_pass) >= BROKER_MAX_PASSWORD_LEN) {
+            WBLOG_ERR(broker,
+                "broker: auth_pass length %u >= BROKER_MAX_PASSWORD_LEN (%d)",
+                (unsigned)XSTRLEN(broker->auth_pass),
+                BROKER_MAX_PASSWORD_LEN);
+            return MQTT_CODE_ERROR_BAD_ARG;
+        }
+        WBLOG_INFO(broker, "broker: auth enabled (user+password) user=%s",
+            broker->auth_user);
+    #ifdef ENABLE_MQTT_TLS
+    #ifndef WOLFMQTT_BROKER_NO_INSECURE
+        if (broker->use_tls && broker->port != broker->port_tls) {
+            WBLOG_ERR(broker,
+                "broker: WARNING: auth credentials exposed on plaintext "
+                "port %d. Rebuild with ./configure --disable-broker-insecure "
+                "for TLS-only",
+                broker->port);
+        }
+    #endif
+    #endif
+    }
+#endif
+
+#if defined(ENABLE_MQTT_WEBSOCKET) && \
+    defined(WOLFMQTT_BROKER_NO_INSECURE)
+    /* TLS-only builds require WSS when WebSocket support is enabled. */
+    if (broker->use_websocket && broker->ws_tls_cert == NULL) {
+        WBLOG_ERR(broker, "broker: plaintext WebSocket listener refused in "
+            "TLS-only build (WOLFMQTT_BROKER_NO_INSECURE); set ws_tls_cert "
+            "for WSS");
+        return MQTT_CODE_ERROR_BAD_ARG;
+    }
+#endif
 
 #ifdef WOLFMQTT_BROKER_PERSIST
     /* Restore persisted state (orphan subs, retained messages) before
@@ -8807,7 +8889,7 @@ int MqttBroker_Start(MqttBroker* broker)
             broker->port, BROKER_LISTEN_BACKLOG);
         if (rc != MQTT_CODE_SUCCESS) {
             WBLOG_ERR(broker, "broker: listen (plain) failed rc=%d", rc);
-            return rc;
+            goto startup_cleanup;
         }
         WBLOG_INFO(broker, "broker: listening on port %d (plain)",
             broker->port);
@@ -8825,7 +8907,7 @@ int MqttBroker_Start(MqttBroker* broker)
             broker->port_tls, BROKER_LISTEN_BACKLOG);
         if (rc != MQTT_CODE_SUCCESS) {
             WBLOG_ERR(broker, "broker: listen (TLS) failed rc=%d", rc);
-            return rc;
+            goto startup_cleanup;
         }
         WBLOG_INFO(broker, "broker: listening on port %d (TLS)",
             broker->port_tls);
@@ -8836,60 +8918,9 @@ int MqttBroker_Start(MqttBroker* broker)
         broker->port, BROKER_LISTEN_BACKLOG);
     if (rc != MQTT_CODE_SUCCESS) {
         WBLOG_ERR(broker, "broker: listen failed rc=%d", rc);
-        return rc;
+        goto startup_cleanup;
     }
     WBLOG_INFO(broker, "broker: listening on port %d (no TLS)", broker->port);
-#endif
-
-#ifdef WOLFMQTT_BROKER_AUTH
-    if (broker->auth_user || broker->auth_pass) {
-        /* Username and password are a credential pair: configuring only one
-         * silently downgrades to single-factor auth, because the unconfigured
-         * side is never checked and any client-supplied value for it is
-         * accepted. Reject the partial config at startup so the operator sees
-         * the mistake instead of shipping a bypassable broker. */
-        if (broker->auth_user == NULL || broker->auth_pass == NULL) {
-            WBLOG_ERR(broker,
-                "broker: auth requires both auth_user and auth_pass "
-                "(user=%s pass=%s)",
-                broker->auth_user ? "set" : "(null)",
-                broker->auth_pass ? "set" : "(null)");
-            return MQTT_CODE_ERROR_BAD_ARG;
-        }
-        /* Reject configured credentials that would be silently rejected
-         * by BrokerStrCompare's cmp_len guard. Catching this at startup
-         * avoids a confusing state where every client auth fails. */
-        if (broker->auth_user &&
-                XSTRLEN(broker->auth_user) >= BROKER_MAX_USERNAME_LEN) {
-            WBLOG_ERR(broker,
-                "broker: auth_user length %u >= BROKER_MAX_USERNAME_LEN (%d)",
-                (unsigned)XSTRLEN(broker->auth_user),
-                BROKER_MAX_USERNAME_LEN);
-            return MQTT_CODE_ERROR_BAD_ARG;
-        }
-        if (broker->auth_pass &&
-                XSTRLEN(broker->auth_pass) >= BROKER_MAX_PASSWORD_LEN) {
-            WBLOG_ERR(broker,
-                "broker: auth_pass length %u >= BROKER_MAX_PASSWORD_LEN (%d)",
-                (unsigned)XSTRLEN(broker->auth_pass),
-                BROKER_MAX_PASSWORD_LEN);
-            return MQTT_CODE_ERROR_BAD_ARG;
-        }
-        WBLOG_INFO(broker, "broker: auth enabled (user+password) user=%s",
-            broker->auth_user);
-    #ifdef ENABLE_MQTT_TLS
-    #ifndef WOLFMQTT_BROKER_NO_INSECURE
-        if (broker->use_tls &&
-            broker->port != broker->port_tls) {
-            WBLOG_ERR(broker,
-                "broker: WARNING: auth credentials exposed on plaintext "
-                "port %d. Rebuild with ./configure --disable-broker-insecure "
-                "for TLS-only",
-                broker->port);
-        }
-    #endif
-    #endif
-    }
 #endif
 
     /* Ensure at least one listener is active */
@@ -8899,31 +8930,26 @@ int MqttBroker_Start(MqttBroker* broker)
 #endif
     ) {
         WBLOG_ERR(broker, "broker: no listeners configured");
-        return MQTT_CODE_ERROR_BAD_ARG;
+        rc = MQTT_CODE_ERROR_BAD_ARG;
+        goto startup_cleanup;
     }
 
 #ifdef ENABLE_MQTT_WEBSOCKET
     if (broker->use_websocket) {
-    #ifdef WOLFMQTT_BROKER_NO_INSECURE
-        /* TLS-only build: a plaintext WebSocket listener would silently bypass
-         * the policy the plain-TCP listener enforces. Require WSS. */
-        if (broker->ws_tls_cert == NULL) {
-            WBLOG_ERR(broker, "broker: plaintext WebSocket listener refused in "
-                "TLS-only build (WOLFMQTT_BROKER_NO_INSECURE); set ws_tls_cert "
-                "for WSS");
-            return MQTT_CODE_ERROR_BAD_ARG;
-        }
-    #endif
         rc = BrokerWs_Init(broker);
         if (rc != MQTT_CODE_SUCCESS) {
             WBLOG_ERR(broker, "broker: WebSocket init failed rc=%d", rc);
-            return rc;
+            goto startup_cleanup;
         }
     }
 #endif
 
     broker->running = 1;
     return MQTT_CODE_SUCCESS;
+
+startup_cleanup:
+    BrokerStart_Cleanup(broker);
+    return rc;
 }
 
 int MqttBroker_Run(MqttBroker* broker)
