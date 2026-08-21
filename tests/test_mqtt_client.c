@@ -3822,6 +3822,41 @@ TEST(wait_message_timeout_preserves_partial_vbi)
     ASSERT_EQ(1, g_msg_cb_calls);
 }
 #endif /* WOLFMQTT_NONBLOCK */
+
+#ifdef WOLFMQTT_V5
+/* MQTT v5 section 3.3.2.3.4 permits an empty Topic Name when a nonzero Topic
+ * Alias property supplies the topic. This fixed wire fixture reaches the
+ * preliminary packet decode used by MqttClient_WaitMessage. */
+TEST(wait_message_v5_empty_topic_with_alias_delivered)
+{
+    int rc;
+    int i;
+    static const byte publish_v5[] = {
+        0x30, 0x07, 0x00, 0x00, 0x03, 0x23, 0x00, 0x01, 'x'
+    };
+
+    rc = test_init_client();
+    ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
+    test_client.protocol_level = MQTT_CONNECT_PROTOCOL_LEVEL_5;
+    test_client.msg_cb = test_accept_message_cb;
+    g_msg_cb_calls = 0;
+
+    test_net.write = mock_net_write_accept;
+    test_net.read = mock_net_read_canned;
+    XMEMCPY(g_canned_buf, publish_v5, sizeof(publish_v5));
+    g_canned_len = (int)sizeof(publish_v5);
+    g_canned_pos = 0;
+
+    rc = MQTT_CODE_CONTINUE;
+    for (i = 0; i < 20 && rc == MQTT_CODE_CONTINUE; i++) {
+        rc = MqttClient_WaitMessage(&test_client, TEST_CMD_TIMEOUT_MS);
+    }
+
+    ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
+    ASSERT_TRUE(g_msg_cb_calls > 0);
+}
+#endif /* WOLFMQTT_V5 */
+
 /* Positive control for #6217: with a real msg_cb registered, an incoming QoS 1
  * PUBLISH must still be delivered to the callback AND acknowledged with a
  * PUBACK. The no-callback error is gated on msg_cb == NULL, so the normal
@@ -4909,6 +4944,7 @@ void run_mqtt_client_tests(void)
     RUN_TEST(wait_message_qos2_null_msg_cb_errors_no_ack);
 #ifdef WOLFMQTT_V5
     RUN_TEST(wait_message_v5_props_null_msg_cb_frees_props);
+    RUN_TEST(wait_message_v5_empty_topic_with_alias_delivered);
 #endif
     RUN_TEST(wait_message_qos1_with_msg_cb_delivers_and_acks);
 #ifdef WOLFMQTT_NONBLOCK

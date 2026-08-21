@@ -883,26 +883,27 @@ static int MqttClient_DecodePacket(MqttClient* client, byte* rx_buf,
             MqttPublish publish, *p_publish;
             if (packet_obj) {
                 p_publish = (MqttPublish*)packet_obj;
-            #ifdef WOLFMQTT_V5
-                /* setting the protocol level will enable parsing of the
-                 * properties. The properties are allocated from a list,
-                 * so only parse if we are using a return packet object */
-                p_publish->protocol_level = client->protocol_level;
-            #endif
             }
             else {
                 p_publish = &publish;
                 XMEMSET(p_publish, 0, sizeof(MqttPublish));
             }
+        #ifdef WOLFMQTT_V5
+            /* The preliminary decode must use the negotiated wire format. */
+            p_publish->protocol_level = client->protocol_level;
+        #endif
             rc = MqttDecode_Publish(rx_buf, rx_len, p_publish);
             if (rc >= 0) {
                 packet_id = p_publish->packet_id;
             #ifdef WOLFMQTT_V5
                 if (doProps) {
-                    /* Do not free property list here. It will be freed
-                       after the message callback. */
+                    /* Retain returned properties until the message callback. */
                     int tmp = Handle_Props(client, p_publish->props,
-                                           (packet_obj != NULL), 0);
+                                           (packet_obj != NULL),
+                                           (packet_obj == NULL));
+                    if (packet_obj == NULL) {
+                        p_publish->props = NULL;
+                    }
                     if (tmp != MQTT_CODE_SUCCESS) {
                         rc = tmp;
                     }
