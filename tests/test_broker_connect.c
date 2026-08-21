@@ -46,6 +46,49 @@
 #define UNIT_TEST_IMPLEMENTATION
 #include "tests/unit_test.h"
 
+static int g_alloc_fail_after = -1;
+static int g_alloc_failure_count;
+static int g_alloc_success_count;
+static int g_alloc_free_count;
+
+void* wolfmqtt_test_broker_malloc(size_t size)
+{
+    void* ptr;
+
+    if (g_alloc_fail_after == 0) {
+        g_alloc_fail_after = -1;
+        g_alloc_failure_count++;
+        return NULL;
+    }
+    if (g_alloc_fail_after > 0) {
+        g_alloc_fail_after--;
+    }
+    ptr = malloc(size);
+    if (ptr != NULL) {
+        g_alloc_success_count++;
+    }
+    return ptr;
+}
+
+void wolfmqtt_test_broker_free(void* ptr)
+{
+    if (ptr != NULL) {
+        g_alloc_free_count++;
+    }
+    free(ptr);
+}
+
+static void broker_test_fail_alloc_after(int successful_allocations)
+{
+    g_alloc_fail_after = successful_allocations;
+    g_alloc_failure_count = 0;
+}
+
+static void broker_test_disable_alloc_failure(void)
+{
+    g_alloc_fail_after = -1;
+}
+
 /* Mock socket constants */
 #define MOCK_LISTEN_SOCK       100
 #define MOCK_CLIENT_SOCK_BASE  101 /* sock = base + index */
@@ -2932,6 +2975,62 @@ TEST(broker_retained_clock_rollback_not_expired)
 #endif /* WOLFMQTT_BROKER_RETAINED && !WOLFMQTT_STATIC_MEMORY */
 
 #ifndef WOLFMQTT_STATIC_MEMORY
+/* Subscription state is committed only after its filter and persistent
+ * client identifier have both been stored successfully. */
+TEST(broker_subscription_client_id_alloc_failure_atomic)
+{
+    MqttBroker broker;
+    MqttBrokerNet net;
+    int alloc_balance;
+    int i;
+    static const byte connect[] = {
+        0x10, 0x0F,
+        0x00, 0x04, 'M', 'Q', 'T', 'T',
+        0x04, 0x02, 0x00, 0x3C,
+        0x00, 0x03, 's', 'u', 'b'
+    };
+    /* MQTT v3.1.1 sections 3.8.2 and 3.8.3: packet id 1, filter "x",
+     * requested QoS 0. */
+    static const byte subscribe[] = {
+        0x82, 0x06,
+        0x00, 0x01,
+        0x00, 0x01, 'x',
+        0x00
+    };
+
+    install_mock_net(&net);
+    XMEMSET(&broker, 0, sizeof(broker));
+    ASSERT_EQ(MQTT_CODE_SUCCESS, MqttBroker_Init(&broker, &net));
+    ASSERT_EQ(MQTT_CODE_SUCCESS, MqttBroker_Start(&broker));
+
+    reset_mock_clients(1);
+    mock_client_input_append(0, connect, sizeof(connect));
+    run_broker_one_connect(&broker);
+    ASSERT_TRUE(broker.clients != NULL);
+    ASSERT_EQ(0, broker.clients->sub_count);
+
+    /* BrokerSubs_Add allocates the node and filter before the client id. */
+    alloc_balance = g_alloc_success_count - g_alloc_free_count;
+    broker_test_fail_alloc_after(2);
+    mock_client_input_append(0, subscribe, sizeof(subscribe));
+    for (i = 0; i < 4; i++) {
+        MqttBroker_Step(&broker);
+    }
+    broker_test_disable_alloc_failure();
+
+    ASSERT_EQ(1, g_alloc_failure_count);
+    ASSERT_EQ(alloc_balance, g_alloc_success_count - g_alloc_free_count);
+    ASSERT_EQ(0, broker.clients->sub_count);
+    ASSERT_TRUE(broker.subs == NULL);
+    ASSERT_EQ(1, count_packets_of_type(g_clients[0].out_buf,
+        g_clients[0].out_len, MQTT_PACKET_TYPE_SUBSCRIBE_ACK));
+    ASSERT_EQ(MQTT_SUBSCRIBE_ACK_CODE_FAILURE,
+        g_clients[0].out_buf[g_clients[0].out_len - 1]);
+
+    MqttBroker_Stop(&broker);
+    MqttBroker_Free(&broker);
+}
+
 /* A single client cannot occupy more than BROKER_MAX_SUBS_PER_CLIENT
  * slots in the shared subscription table; excess SUBSCRIBEs are refused so
  * other clients are not denied service. */
@@ -5295,6 +5394,7 @@ int main(int argc, char** argv)
     RUN_TEST(broker_retained_scrub_after_completed_write);
 #endif
 #ifndef WOLFMQTT_STATIC_MEMORY
+    RUN_TEST(broker_subscription_client_id_alloc_failure_atomic);
     RUN_TEST(broker_per_client_subscription_cap);
 #endif
 #ifdef WOLFMQTT_V5

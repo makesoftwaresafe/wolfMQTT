@@ -12,8 +12,8 @@ tests_unit_tests_CPPFLAGS     = -I$(top_srcdir) $(AM_CPPFLAGS)
 tests_unit_tests_LDADD        = src/libwolfmqtt.la
 tests_unit_tests_DEPENDENCIES = src/libwolfmqtt.la
 
-# Test framework header
-noinst_HEADERS += tests/unit_test.h
+# Test framework headers
+noinst_HEADERS += tests/unit_test.h tests/test_broker_alloc.h
 
 # MQTT-SN packet decoder tests. The SN_Decode_* routines are WOLFMQTT_LOCAL
 # (hidden) so they cannot be linked from libwolfmqtt; src/mqtt_sn_packet.c is
@@ -58,7 +58,8 @@ tests_test_broker_connect_CFLAGS   = -DWOLFMQTT_BROKER -DWOLFMQTT_BROKER_CUSTOM_
     '-DWOLFMQTT_BROKER_GET_TIME_S()=((WOLFMQTT_BROKER_TIME_T)0)' \
     '-DBROKER_SLEEP_MS(ms)=do{}while(0)' \
     $(AM_CFLAGS)
-tests_test_broker_connect_CPPFLAGS = -I$(top_srcdir) $(AM_CPPFLAGS)
+tests_test_broker_connect_CPPFLAGS = -I$(top_srcdir) \
+    -include $(top_srcdir)/tests/test_broker_alloc.h $(AM_CPPFLAGS)
 tests_test_broker_connect_LDADD    = src/libwolfmqtt.la $(LIB_STATIC_ADD)
 tests_test_broker_connect_DEPENDENCIES = src/libwolfmqtt.la
 endif

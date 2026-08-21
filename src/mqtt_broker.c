@@ -4131,16 +4131,6 @@ static int BrokerSubs_Add(MqttBroker* broker, BrokerClient* bc,
     if (rc == MQTT_CODE_SUCCESS) {
         XMEMCPY(sub->filter, filter, filter_len);
         sub->filter[filter_len] = '\0';
-        sub->next = broker->subs;
-        broker->subs = sub;
-        /* Bump on add too so subs_gen reflects every structural change to the
-         * list, not only removals. Also narrows the ABA window where a free and
-         * a same-address add in one fan-out iteration could otherwise pass the
-         * successor-still-linked check. */
-        broker->subs_gen++;
-    }
-    else if (sub != NULL) {
-        WOLFMQTT_FREE(sub);
     }
 #endif
 
@@ -4164,8 +4154,27 @@ static int BrokerSubs_Add(MqttBroker* broker, BrokerClient* bc,
             if (sub->client_id != NULL) {
                 XMEMCPY(sub->client_id, bc->client_id, (size_t)id_len + 1);
             }
+            else {
+                rc = MQTT_CODE_ERROR_MEMORY;
+            }
         }
 #endif
+    }
+#ifndef WOLFMQTT_STATIC_MEMORY
+    if (rc == MQTT_CODE_SUCCESS) {
+        sub->next = broker->subs;
+        broker->subs = sub;
+        broker->subs_gen++;
+    }
+    else if (sub != NULL) {
+        if (sub->filter != NULL) {
+            BROKER_FORCE_ZERO(sub->filter, (size_t)filter_len + 1);
+            WOLFMQTT_FREE(sub->filter);
+        }
+        WOLFMQTT_FREE(sub);
+    }
+#endif
+    if (rc == MQTT_CODE_SUCCESS) {
         bc->sub_count++;
         WBLOG_INFO(broker, "broker: sub add sock=%d filter=%s qos=%d",
             (int)bc->sock, BrokerLog_Sanitize(sub->filter), qos);
