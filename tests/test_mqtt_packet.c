@@ -2941,6 +2941,98 @@ TEST(encode_connect_lwt_topic_oversized_rejected)
     ASSERT_TRUE(rc < 0);
 }
 
+#ifdef WOLFMQTT_V5
+/* [MQTT-3.1.3.2] Session Expiry Interval is a CONNECT property, not a Will
+ * Property, so the encoder must reject it before writing the packet. */
+TEST(encode_connect_v5_invalid_will_property_rejected)
+{
+    byte buf[256];
+    MqttConnect connect;
+    MqttMessage lwt;
+    MqttProp will_prop;
+    int rc;
+
+    XMEMSET(&connect, 0, sizeof(connect));
+    XMEMSET(&lwt, 0, sizeof(lwt));
+    XMEMSET(&will_prop, 0, sizeof(will_prop));
+    XMEMSET(buf, 0xA5, sizeof(buf));
+    connect.protocol_level = MQTT_CONNECT_PROTOCOL_LEVEL_5;
+    connect.client_id = "cid";
+    connect.enable_lwt = 1;
+    connect.lwt_msg = &lwt;
+    lwt.topic_name = "will/topic";
+    will_prop.type = MQTT_PROP_SESSION_EXPIRY_INTERVAL;
+    will_prop.data_int = 30;
+    lwt.props = &will_prop;
+
+    rc = MqttEncode_Connect(buf, (int)sizeof(buf), &connect);
+    ASSERT_EQ(MQTT_CODE_ERROR_PROPERTY, rc);
+    ASSERT_EQ(0xA5, buf[0]);
+}
+
+TEST(encode_connect_v5_cyclic_will_properties_rejected)
+{
+    byte buf[256];
+    MqttConnect connect;
+    MqttMessage lwt;
+    MqttProp will_prop;
+    int rc;
+
+    XMEMSET(&connect, 0, sizeof(connect));
+    XMEMSET(&lwt, 0, sizeof(lwt));
+    XMEMSET(&will_prop, 0, sizeof(will_prop));
+    connect.protocol_level = MQTT_CONNECT_PROTOCOL_LEVEL_5;
+    connect.client_id = "cid";
+    connect.enable_lwt = 1;
+    connect.lwt_msg = &lwt;
+    lwt.topic_name = "will/topic";
+    will_prop.type = MQTT_PROP_USER_PROP;
+    will_prop.data_str.str = (char*)"key";
+    will_prop.data_str.len = 3;
+    will_prop.data_str2.str = (char*)"value";
+    will_prop.data_str2.len = 5;
+    will_prop.next = &will_prop;
+    lwt.props = &will_prop;
+
+    rc = MqttEncode_Connect(buf, (int)sizeof(buf), &connect);
+    ASSERT_EQ(MQTT_CODE_ERROR_PROPERTY, rc);
+}
+
+TEST(encode_connect_v5_excess_will_properties_rejected)
+{
+    enum { prop_count = 40 };
+    byte buf[512];
+    MqttConnect connect;
+    MqttMessage lwt;
+    MqttProp will_props[prop_count];
+    int i;
+    int rc;
+
+    XMEMSET(&connect, 0, sizeof(connect));
+    XMEMSET(&lwt, 0, sizeof(lwt));
+    XMEMSET(will_props, 0, sizeof(will_props));
+    connect.protocol_level = MQTT_CONNECT_PROTOCOL_LEVEL_5;
+    connect.client_id = "cid";
+    connect.enable_lwt = 1;
+    connect.lwt_msg = &lwt;
+    lwt.topic_name = "will/topic";
+    for (i = 0; i < prop_count; i++) {
+        will_props[i].type = MQTT_PROP_USER_PROP;
+        will_props[i].data_str.str = (char*)"k";
+        will_props[i].data_str.len = 1;
+        will_props[i].data_str2.str = (char*)"v";
+        will_props[i].data_str2.len = 1;
+        if (i + 1 < prop_count) {
+            will_props[i].next = &will_props[i + 1];
+        }
+    }
+    lwt.props = will_props;
+
+    rc = MqttEncode_Connect(buf, (int)sizeof(buf), &connect);
+    ASSERT_EQ(MQTT_CODE_ERROR_PROPERTY, rc);
+}
+#endif /* WOLFMQTT_V5 */
+
 /* ============================================================================
  * MqttDecode_Connect (broker-side)
  * ============================================================================ */
@@ -5935,32 +6027,26 @@ TEST(decode_subscribe_v5_duplicate_subscription_id_rejected)
 /* [MQTT-3.1.3.2]: a CONNECT-only property in Will Properties is rejected. */
 TEST(decode_connect_v5_will_props_session_expiry_rejected)
 {
-    byte buf[256];
-    MqttConnect enc, dec;
-    MqttMessage enc_lwt, dec_lwt;
-    MqttProp will_prop;
-    int enc_len, rc;
-
-    XMEMSET(&enc, 0, sizeof(enc));
-    XMEMSET(&enc_lwt, 0, sizeof(enc_lwt));
-    XMEMSET(&will_prop, 0, sizeof(will_prop));
-    enc.protocol_level = MQTT_CONNECT_PROTOCOL_LEVEL_5;
-    enc.client_id       = "cid";
-    enc.enable_lwt       = 1;
-    enc.lwt_msg          = &enc_lwt;
-    enc_lwt.topic_name   = "will/topic";
-    enc_lwt.qos          = MQTT_QOS_0;
-    will_prop.type       = MQTT_PROP_SESSION_EXPIRY_INTERVAL;
-    will_prop.data_int   = 30;
-    enc_lwt.props        = &will_prop;
-
-    enc_len = MqttEncode_Connect(buf, (int)sizeof(buf), &enc);
-    ASSERT_TRUE(enc_len > 0);
+    /* Hand-built v5 CONNECT: Will Properties contains Session Expiry Interval
+     * (0x11, four-byte value 30), which is legal only in CONNECT Properties. */
+    byte buf[] = {
+        0x10, 0x24,                         /* CONNECT, Remaining Length 36 */
+        0x00, 0x04, 'M', 'Q', 'T', 'T',    /* Protocol Name */
+        0x05, 0x04, 0x00, 0x00,            /* v5, Will Flag, Keep Alive */
+        0x00,                               /* CONNECT Properties length */
+        0x00, 0x03, 'c', 'i', 'd',         /* Client Identifier */
+        0x05, 0x11, 0x00, 0x00, 0x00, 0x1E, /* invalid Will Property */
+        0x00, 0x0A, 'w', 'i', 'l', 'l', '/', 't', 'o', 'p', 'i', 'c',
+        0x00, 0x00                          /* empty Will Payload */
+    };
+    MqttConnect dec;
+    MqttMessage dec_lwt;
+    int rc;
 
     XMEMSET(&dec, 0, sizeof(dec));
     XMEMSET(&dec_lwt, 0, sizeof(dec_lwt));
     dec.lwt_msg = &dec_lwt;
-    rc = MqttDecode_Connect(buf, enc_len, &dec);
+    rc = MqttDecode_Connect(buf, (int)sizeof(buf), &dec);
     ASSERT_EQ(MQTT_CODE_ERROR_PROPERTY, rc);
 }
 #endif /* WOLFMQTT_BROKER && WOLFMQTT_V5 */
@@ -6351,6 +6437,11 @@ void run_mqtt_packet_tests(void)
     RUN_TEST(encode_connect_username_oversized_rejected);
     RUN_TEST(encode_connect_password_oversized_rejected);
     RUN_TEST(encode_connect_lwt_topic_oversized_rejected);
+#ifdef WOLFMQTT_V5
+    RUN_TEST(encode_connect_v5_invalid_will_property_rejected);
+    RUN_TEST(encode_connect_v5_cyclic_will_properties_rejected);
+    RUN_TEST(encode_connect_v5_excess_will_properties_rejected);
+#endif
 
 #ifdef WOLFMQTT_BROKER
     /* MqttDecode_Connect */

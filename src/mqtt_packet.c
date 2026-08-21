@@ -1405,6 +1405,20 @@ int MqttDecode_Props(MqttPacketType packet, MqttProp** props, byte* pbuf,
 }
 #endif
 
+#ifdef WOLFMQTT_V5
+/* [MQTT-3.1.3.2] Will Properties allow-list, tighter than CONNECT's. */
+static int MqttWillProps_ValidateType(MqttPropertyType type)
+{
+    return (type == MQTT_PROP_WILL_DELAY_INTERVAL) ||
+           (type == MQTT_PROP_PAYLOAD_FORMAT_IND) ||
+           (type == MQTT_PROP_MSG_EXPIRY_INTERVAL) ||
+           (type == MQTT_PROP_CONTENT_TYPE) ||
+           (type == MQTT_PROP_RESP_TOPIC) ||
+           (type == MQTT_PROP_CORRELATION_DATA) ||
+           (type == MQTT_PROP_USER_PROP);
+}
+#endif /* WOLFMQTT_V5 */
+
 /* Packet Type Encoders/Decoders */
 int MqttEncode_Connect(byte *tx_buf, int tx_buf_len, MqttConnect *mc_connect)
 {
@@ -1521,6 +1535,19 @@ int MqttEncode_Connect(byte *tx_buf, int tx_buf_len, MqttConnect *mc_connect)
         remain_len += MQTT_DATA_LEN_SIZE;
 #ifdef WOLFMQTT_V5
     if (mc_connect->protocol_level >= MQTT_CONNECT_PROTOCOL_LEVEL_5) {
+        MqttProp* will_prop;
+        int will_prop_count = 0;
+
+        /* CONNECT and Will Properties have distinct allow-lists. Validate the
+         * Will context before the generic CONNECT property encoder writes. */
+        for (will_prop = mc_connect->lwt_msg->props; will_prop != NULL;
+                will_prop = will_prop->next) {
+            if (++will_prop_count > MQTT_MAX_PROPS ||
+                    !MqttWillProps_ValidateType(will_prop->type)) {
+                return MQTT_TRACE_ERROR(MQTT_CODE_ERROR_PROPERTY);
+            }
+        }
+
         /* Determine length of properties */
         lwt_props_len = MqttEncode_Props(MQTT_PACKET_TYPE_CONNECT,
                 mc_connect->lwt_msg->props, NULL);
@@ -1665,20 +1692,6 @@ int MqttEncode_Connect(byte *tx_buf, int tx_buf_len, MqttConnect *mc_connect)
     /* Return total length of packet */
     return header_len + remain_len;
 }
-
-#if defined(WOLFMQTT_BROKER) && defined(WOLFMQTT_V5)
-/* [MQTT-3.1.3.2] Will Properties allow-list, tighter than CONNECT's. */
-static int MqttWillProps_ValidateType(MqttPropertyType type)
-{
-    return (type == MQTT_PROP_WILL_DELAY_INTERVAL) ||
-           (type == MQTT_PROP_PAYLOAD_FORMAT_IND) ||
-           (type == MQTT_PROP_MSG_EXPIRY_INTERVAL) ||
-           (type == MQTT_PROP_CONTENT_TYPE) ||
-           (type == MQTT_PROP_RESP_TOPIC) ||
-           (type == MQTT_PROP_CORRELATION_DATA) ||
-           (type == MQTT_PROP_USER_PROP);
-}
-#endif /* WOLFMQTT_BROKER && WOLFMQTT_V5 */
 
 #ifdef WOLFMQTT_BROKER
 int MqttDecode_Connect(byte *rx_buf, int rx_buf_len, MqttConnect *mc_connect)
