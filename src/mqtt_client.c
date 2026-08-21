@@ -2683,6 +2683,7 @@ static int MqttClient_Publish_WritePayload(MqttClient *client,
 
     if (pubCb) { /* use publish callback to get data */
         word32 tmp_len;
+        word32 remaining;
 
         do {
             /* use the client->write.len to handle non-blocking re-entry when
@@ -2700,9 +2701,14 @@ static int MqttClient_Publish_WritePayload(MqttClient *client,
                  * return marks the last read). Persisting it means a
                  * non-blocking resume does not mistake the in-progress chunk
                  * length for the fill length and drop the tail. */
-                publish->intBuf_cb_len =
-                    ((word32)client->write.len < publish->buffer_len) ?
-                        (word32)client->write.len : publish->buffer_len;
+                publish->intBuf_cb_len = (word32)client->write.len;
+                if (publish->intBuf_cb_len > publish->buffer_len) {
+                    publish->intBuf_cb_len = publish->buffer_len;
+                }
+                remaining = publish->total_len - publish->buffer_pos;
+                if (publish->intBuf_cb_len > remaining) {
+                    publish->intBuf_cb_len = remaining;
+                }
             }
 
             tmp_len = publish->intBuf_cb_len;

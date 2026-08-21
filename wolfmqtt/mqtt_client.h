@@ -141,8 +141,9 @@ typedef int (*MqttMsgCb)(struct _MqttClient *client, MqttMessage *message,
 /*! \brief      Mqtt Publish Callback.
  *  If the publish payload is larger than the maximum TX buffer
     then this callback is called multiple times. This callback is executed from
-    within a call to MqttPublish. It is expected to provide a buffer and it's
-    size and return >=0 for success.
+    within a call to MqttPublish. It is expected to provide a buffer and its
+    size and return the number of valid bytes written. The library limits the
+    final callback result to the remaining MqttPublish.total_len.
     Each callback populates the payload in MqttPublish.buffer.
     The MqttPublish.buffer_len is the size of the buffer payload.
     The MqttPublish.total_len is the length of the complete payload message.

@@ -2131,6 +2131,12 @@ static int pub_multifill_cb(MqttPublish* publish)
     return (int)n;
 }
 
+static int pub_full_buffer_cb(MqttPublish* publish)
+{
+    XMEMSET(publish->buffer, PUB_STREAM_FILL, publish->buffer_len);
+    return (int)publish->buffer_len;
+}
+
 /* Fills only the valid region of the callback buffer, leaving the guard bytes
  * that follow it untouched. */
 static int pub_stream_cb(MqttPublish* publish)
@@ -2223,6 +2229,40 @@ TEST(publish_stream_cb_multifill_full_payload)
     }
     ASSERT_EQ(PUB_MULTI_TOTAL_LEN, fill_seen);
     ASSERT_EQ(0, guard_seen);
+}
+
+/* A callback may fill its whole buffer on every invocation. The library must
+ * limit the final fill to the remaining declared payload length. */
+TEST(publish_stream_cb_overreturn_clamped_to_total)
+{
+    int rc;
+    int i;
+    MqttPublish publish;
+
+    rc = test_init_client();
+    ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
+
+    pub_stream_wire_len = 0;
+    pub_stream_hdr_len = 0;
+    XMEMSET(pub_stream_wire, 0, sizeof(pub_stream_wire));
+    XMEMSET(pub_stream_backing, 0, sizeof(pub_stream_backing));
+    test_net.write = mock_net_write_accum;
+
+    XMEMSET(&publish, 0, sizeof(publish));
+    publish.qos = MQTT_QOS_0;
+    publish.topic_name = "t";
+    publish.buffer = pub_stream_backing;
+    publish.buffer_len = PUB_STREAM_VALID_LEN;
+    publish.total_len = PUB_MULTI_TOTAL_LEN;
+
+    rc = MQTT_CODE_CONTINUE;
+    for (i = 0; i < 40 && rc == MQTT_CODE_CONTINUE; i++) {
+        rc = MqttClient_Publish_ex(&test_client, &publish,
+            pub_full_buffer_cb);
+    }
+    ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
+    ASSERT_EQ(PUB_MULTI_TOTAL_LEN,
+        pub_stream_wire_len - pub_stream_hdr_len);
 }
 
 #ifdef WOLFMQTT_NONBLOCK
@@ -4555,6 +4595,7 @@ void run_mqtt_client_tests(void)
     RUN_TEST(publish_null_publish);
     RUN_TEST(publish_stream_cb_final_chunk_no_overrun);
     RUN_TEST(publish_stream_cb_multifill_full_payload);
+    RUN_TEST(publish_stream_cb_overreturn_clamped_to_total);
 #ifdef WOLFMQTT_NONBLOCK
     RUN_TEST(publish_stream_cb_nonblock_resume_no_tail_drop);
 #endif
