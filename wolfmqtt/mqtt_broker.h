@@ -648,6 +648,11 @@ typedef struct BrokerClient {
     BrokerOutPub* out_q_tail;
     int           out_q_count;
     int           out_q_inflight;
+    /* Encoded length of an out_q packet whose nonblocking/TLS-async write is
+     * still in progress. While nonzero, tx_buf remains owned by that write. */
+    int           out_q_pending_len;
+    /* Encoded length of a direct broker response still being written. */
+    int           direct_pending_len;
     /* v5 Receive Maximum advertised by this client in CONNECT, or 65535
      * (per MQTT v5 sec 3.1.2.11.3) when the client did not include the
      * property. For v3.1.1 clients this is left at 65535 - the cap
