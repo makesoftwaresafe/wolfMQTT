@@ -1474,6 +1474,7 @@ int SN_Client_WillMsgUpdate(MqttClient *client, SN_Will *will)
             return rc;
         }
         client->write.len = rc;
+        xfer = client->write.len;
 
     #ifdef WOLFMQTT_MULTITHREAD
         rc = wm_SemLock(&client->lockClient);
@@ -1485,6 +1486,7 @@ int SN_Client_WillMsgUpdate(MqttClient *client, SN_Will *will)
             wm_SemUnlock(&client->lockClient);
         }
         if (rc != 0) {
+            CLIENT_FORCE_ZERO(client->tx_buf, xfer);
             wm_SemUnlock(&client->lockSend);
             return rc; /* Error locking client */
         }
@@ -1504,7 +1506,6 @@ int SN_Client_WillMsgUpdate(MqttClient *client, SN_Will *will)
          * and therefore lands in the error branch below; scrubbing there is safe
          * because the next call re-encodes the identical bytes before the write
          * resumes. */
-        xfer = client->write.len;
         rc = MqttPacket_Write(client, client->tx_buf, xfer);
         if (rc != xfer) {
             /* Send failed (or returned MQTT_CODE_CONTINUE): scrub the will

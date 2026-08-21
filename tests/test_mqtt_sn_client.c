@@ -755,6 +755,45 @@ TEST(sn_willmsgupd_payload_scrubbed_on_write_error)
     ASSERT_NO_PENDRESP();
 }
 
+#ifdef WOLFMQTT_MULTITHREAD
+TEST(sn_willmsgupd_scrubbed_on_response_registration_error)
+{
+    SN_Will will;
+    int rc;
+    int i;
+    static const byte secret[] = "pending-response-will-secret";
+    const int secret_len = (int)sizeof(secret) - 1;
+    const int packet_len = 2 + secret_len;
+
+    ASSERT_EQ(MQTT_CODE_SUCCESS, sn_client_init(0));
+    XMEMSET(&will, 0, sizeof(will));
+    will.willMsg = (byte*)secret;
+    will.willMsgLen = (word16)secret_len;
+
+    ASSERT_EQ(0, wm_SemLock(&g_client.lockClient));
+    rc = MqttClient_RespList_Add(&g_client,
+        (MqttPacketType)SN_MSG_TYPE_WILLMSGRESP, 0, &will.pendResp,
+        &will.resp.msgResp);
+    ASSERT_EQ(0, wm_SemUnlock(&g_client.lockClient));
+    ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
+
+    rc = SN_Client_WillMsgUpdate(&g_client, &will);
+    ASSERT_EQ(MQTT_CODE_ERROR_BAD_ARG, rc);
+    ASSERT_FALSE(sn_buf_contains(g_client.tx_buf, g_client.tx_buf_len,
+        secret, secret_len));
+    for (i = 0; i < packet_len; i++) {
+        if (g_client.tx_buf[i] != 0) {
+            FAIL("tx_buf within WILLMSGUPD range is non-zero after add error");
+        }
+    }
+
+    ASSERT_EQ(0, wm_SemLock(&g_client.lockClient));
+    MqttClient_RespList_Remove(&g_client, &will.pendResp);
+    ASSERT_EQ(0, wm_SemUnlock(&g_client.lockClient));
+    ASSERT_NO_PENDRESP();
+}
+#endif /* WOLFMQTT_MULTITHREAD */
+
 /* ============================================================================
  * SN subscribe pending-response lifecycle tests
  *
@@ -1566,6 +1605,9 @@ int main(int argc, char** argv)
     RUN_TEST(sn_will_payload_scrubbed_after_send);
     RUN_TEST(sn_willmsgupd_payload_scrubbed_after_send);
     RUN_TEST(sn_willmsgupd_payload_scrubbed_on_write_error);
+#ifdef WOLFMQTT_MULTITHREAD
+    RUN_TEST(sn_willmsgupd_scrubbed_on_response_registration_error);
+#endif
     RUN_TEST(sn_subscribe_no_continue);
     RUN_TEST(sn_subscribe_rejected);
     RUN_TEST(sn_publish_qos1_no_continue);
