@@ -3776,6 +3776,32 @@ TEST(decode_subscribe_v5_props_freed_on_bad_filter)
     ASSERT_EQ(MQTT_CODE_ERROR_MALFORMED_DATA, rc);
     ASSERT_NULL(sub.props);
 }
+
+TEST(decode_subscribe_null_topics_allocates_no_props)
+{
+    byte rx_buf[] = {
+        0x82, 0x0E,                        /* SUBSCRIBE, remain_len = 14 */
+        0x00, 0x01,                        /* packet_id */
+        0x07,                              /* props_len VBI = 7 */
+        0x26, 0x00, 0x01, 'k', 0x00, 0x01, 'v', /* User Property k=v */
+        0x00, 0x01, 'a',                   /* topic filter "a" */
+        0x00                               /* options */
+    };
+    MqttSubscribe sub;
+    MqttProp* leaked;
+    int rc;
+
+    XMEMSET(&sub, 0, sizeof(sub));
+    sub.protocol_level = MQTT_CONNECT_PROTOCOL_LEVEL_5;
+    rc = MqttDecode_Subscribe(rx_buf, (int)sizeof(rx_buf), &sub);
+    leaked = sub.props;
+    if (sub.props != NULL) {
+        MqttProps_Free(sub.props);
+        sub.props = NULL;
+    }
+    ASSERT_EQ(MQTT_CODE_ERROR_BAD_ARG, rc);
+    ASSERT_NULL(leaked);
+}
 #endif /* WOLFMQTT_V5 */
 
 /* [MQTT-4.7.3-1] / [MQTT-4.7.1-2] / [MQTT-4.7.1-3] Topic Filter syntax
@@ -4317,6 +4343,31 @@ TEST(decode_unsubscribe_v5_props_freed_on_bad_filter)
     rc = MqttDecode_Unsubscribe(rx_buf, (int)sizeof(rx_buf), &unsub);
     ASSERT_EQ(MQTT_CODE_ERROR_MALFORMED_DATA, rc);
     ASSERT_NULL(unsub.props);
+}
+
+TEST(decode_unsubscribe_null_topics_allocates_no_props)
+{
+    byte rx_buf[] = {
+        0xA2, 0x0D,                        /* UNSUBSCRIBE, remain_len = 13 */
+        0x00, 0x01,                        /* packet_id */
+        0x07,                              /* props_len VBI = 7 */
+        0x26, 0x00, 0x01, 'k', 0x00, 0x01, 'v', /* User Property k=v */
+        0x00, 0x01, 'a'                    /* topic filter "a" */
+    };
+    MqttUnsubscribe unsub;
+    MqttProp* leaked;
+    int rc;
+
+    XMEMSET(&unsub, 0, sizeof(unsub));
+    unsub.protocol_level = MQTT_CONNECT_PROTOCOL_LEVEL_5;
+    rc = MqttDecode_Unsubscribe(rx_buf, (int)sizeof(rx_buf), &unsub);
+    leaked = unsub.props;
+    if (unsub.props != NULL) {
+        MqttProps_Free(unsub.props);
+        unsub.props = NULL;
+    }
+    ASSERT_EQ(MQTT_CODE_ERROR_BAD_ARG, rc);
+    ASSERT_NULL(leaked);
 }
 #endif /* WOLFMQTT_V5 */
 
@@ -6309,6 +6360,7 @@ void run_mqtt_packet_tests(void)
 #ifdef WOLFMQTT_V5
     RUN_TEST(decode_subscribe_v5_empty_payload_rejected);
     RUN_TEST(decode_subscribe_v5_props_freed_on_bad_filter);
+    RUN_TEST(decode_subscribe_null_topics_allocates_no_props);
     RUN_TEST(decode_subscribe_v5_duplicate_subscription_id_rejected);
 #endif
 #ifdef WOLFMQTT_V5
@@ -6328,6 +6380,7 @@ void run_mqtt_packet_tests(void)
 #ifdef WOLFMQTT_V5
     RUN_TEST(decode_unsubscribe_v5_empty_payload_rejected);
     RUN_TEST(decode_unsubscribe_v5_props_freed_on_bad_filter);
+    RUN_TEST(decode_unsubscribe_null_topics_allocates_no_props);
 #endif
 #endif
 

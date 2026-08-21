@@ -2974,7 +2974,8 @@ int MqttDecode_Subscribe(byte *rx_buf, int rx_buf_len, MqttSubscribe *subscribe)
     byte *rx_end;
 
     /* Validate required arguments */
-    if (rx_buf == NULL || rx_buf_len <= 0 || subscribe == NULL) {
+    if (rx_buf == NULL || rx_buf_len <= 0 || subscribe == NULL ||
+            subscribe->topics == NULL) {
         return MQTT_TRACE_ERROR(MQTT_CODE_ERROR_BAD_ARG);
     }
 
@@ -3036,9 +3037,6 @@ int MqttDecode_Subscribe(byte *rx_buf, int rx_buf_len, MqttSubscribe *subscribe)
 #endif
 
         subscribe->topic_count = 0;
-        if (subscribe->topics == NULL) {
-            return MQTT_TRACE_ERROR(MQTT_CODE_ERROR_BAD_ARG);
-        }
 
         while (rx_payload < rx_end) {
             MqttTopic *topic;
@@ -3407,7 +3405,8 @@ int MqttDecode_Unsubscribe(byte *rx_buf, int rx_buf_len, MqttUnsubscribe *unsubs
     byte *rx_end;
 
     /* Validate required arguments */
-    if (rx_buf == NULL || rx_buf_len <= 0 || unsubscribe == NULL) {
+    if (rx_buf == NULL || rx_buf_len <= 0 || unsubscribe == NULL ||
+            unsubscribe->topics == NULL) {
         return MQTT_TRACE_ERROR(MQTT_CODE_ERROR_BAD_ARG);
     }
 
@@ -3469,9 +3468,6 @@ int MqttDecode_Unsubscribe(byte *rx_buf, int rx_buf_len, MqttUnsubscribe *unsubs
 #endif
 
         unsubscribe->topic_count = 0;
-        if (unsubscribe->topics == NULL) {
-            return MQTT_TRACE_ERROR(MQTT_CODE_ERROR_BAD_ARG);
-        }
 
         while (rx_payload < rx_end) {
             MqttTopic *topic;
