@@ -3661,6 +3661,11 @@ int MqttEncode_UnsubscribeAck(byte *tx_buf, int tx_buf_len, MqttUnsubscribeAck *
         return MQTT_TRACE_ERROR(MQTT_CODE_ERROR_BAD_ARG);
     }
 
+    /* [MQTT-2.3.1-1] UNSUBACK requires a non-zero Packet Identifier. */
+    if (unsubscribe_ack->packet_id == 0) {
+        return MQTT_TRACE_ERROR(MQTT_CODE_ERROR_PACKET_ID);
+    }
+
     /* Determine packet length */
     remain_len = MQTT_DATA_LEN_SIZE; /* For packet_id */
 #ifdef WOLFMQTT_V5

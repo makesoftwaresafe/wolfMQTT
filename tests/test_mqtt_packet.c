@@ -5064,6 +5064,22 @@ TEST(decode_unsuback_v5_props_past_remain_len_rejected)
 }
 #endif /* WOLFMQTT_V5 */
 
+#ifdef WOLFMQTT_BROKER
+/* [MQTT-2.3.1-1] An UNSUBACK Packet Identifier must be non-zero. */
+TEST(encode_unsuback_packet_id_zero_rejected)
+{
+    byte buf[16];
+    MqttUnsubscribeAck ack;
+    int rc;
+
+    XMEMSET(&ack, 0, sizeof(ack));
+    XMEMSET(buf, 0xA5, sizeof(buf));
+    rc = MqttEncode_UnsubscribeAck(buf, (int)sizeof(buf), &ack);
+    ASSERT_EQ(MQTT_CODE_ERROR_PACKET_ID, rc);
+    ASSERT_EQ(0xA5, buf[0]);
+}
+#endif /* WOLFMQTT_BROKER */
+
 #if defined(WOLFMQTT_BROKER) && defined(WOLFMQTT_V5)
 /* [MQTT-4.8.0-1] An UNSUBACK Reason Code outside the set in MQTT 5.0
  * section 3.11.3 must not be serialized. */
@@ -6467,6 +6483,9 @@ void run_mqtt_packet_tests(void)
 #ifdef WOLFMQTT_V5
     RUN_TEST(decode_unsuback_v5_reason_codes);
     RUN_TEST(decode_unsuback_v5_props_past_remain_len_rejected);
+#endif
+#ifdef WOLFMQTT_BROKER
+    RUN_TEST(encode_unsuback_packet_id_zero_rejected);
 #endif
 #if defined(WOLFMQTT_BROKER) && defined(WOLFMQTT_V5)
     RUN_TEST(encode_unsuback_v5_reserved_reason_code_rejected);
