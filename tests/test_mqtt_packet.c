@@ -4924,6 +4924,94 @@ TEST(decode_disconnect_v5_reason_code_past_buf_rejected)
     rc = MqttDecode_Disconnect(buf, (int)sizeof(buf), &disc);
     ASSERT_EQ(MQTT_CODE_ERROR_OUT_OF_BUFFER, rc);
 }
+
+/* [MQTT-3.14.2-1] Table 3-10 is the complete DISCONNECT Reason Code
+ * allow-list. Each nonzero code is encoded as the sole variable-header byte. */
+TEST(encode_disconnect_v5_reason_code_allowed_set)
+{
+    static const byte allowed[] = {
+        MQTT_REASON_SUCCESS,
+        MQTT_REASON_DISCONNECT_W_WILL_MSG,
+        MQTT_REASON_UNSPECIFIED_ERR,
+        MQTT_REASON_MALFORMED_PACKET,
+        MQTT_REASON_PROTOCOL_ERR,
+        MQTT_REASON_IMPL_SPECIFIC_ERR,
+        MQTT_REASON_NOT_AUTHORIZED,
+        MQTT_REASON_SERVER_BUSY,
+        MQTT_REASON_SERVER_SHUTTING_DOWN,
+        MQTT_REASON_KEEP_ALIVE_TIMEOUT,
+        MQTT_REASON_SESSION_TAKEN_OVER,
+        MQTT_REASON_TOPIC_FILTER_INVALID,
+        MQTT_REASON_TOPIC_NAME_INVALID,
+        MQTT_REASON_RX_MAX_EXCEEDED,
+        MQTT_REASON_TOPIC_ALIAS_INVALID,
+        MQTT_REASON_PACKET_TOO_LARGE,
+        MQTT_REASON_MSG_RATE_TOO_HIGH,
+        MQTT_REASON_QUOTA_EXCEEDED,
+        MQTT_REASON_ADMIN_ACTION,
+        MQTT_REASON_PAYLOAD_FORMAT_INVALID,
+        MQTT_REASON_RETAIN_NOT_SUPPORTED,
+        MQTT_REASON_QOS_NOT_SUPPORTED,
+        MQTT_REASON_USE_ANOTHER_SERVER,
+        MQTT_REASON_SERVER_MOVED,
+        MQTT_REASON_SS_NOT_SUPPORTED,
+        MQTT_REASON_CON_RATE_EXCEED,
+        MQTT_REASON_MAX_CON_TIME,
+        MQTT_REASON_SUB_ID_NOT_SUP,
+        MQTT_REASON_WILDCARD_SUB_NOT_SUP
+    };
+    MqttDisconnect disc;
+    byte buf[16];
+    size_t i;
+
+    for (i = 0; i < sizeof(allowed); i++) {
+        int rc;
+
+        XMEMSET(&disc, 0, sizeof(disc));
+        XMEMSET(buf, 0xA5, sizeof(buf));
+        disc.protocol_level = MQTT_CONNECT_PROTOCOL_LEVEL_5;
+        disc.reason_code = allowed[i];
+        rc = MqttEncode_Disconnect(buf, (int)sizeof(buf), &disc);
+        ASSERT_EQ(MQTT_PACKET_TYPE_SET(MQTT_PACKET_TYPE_DISCONNECT), buf[0]);
+        if (allowed[i] == MQTT_REASON_SUCCESS) {
+            ASSERT_EQ(2, rc);
+            ASSERT_EQ(0, buf[1]);
+        }
+        else {
+            ASSERT_EQ(3, rc);
+            ASSERT_EQ(1, buf[1]);
+            ASSERT_EQ(allowed[i], buf[2]);
+        }
+    }
+}
+
+/* [MQTT-3.14.2-1] Values assigned only to other packet types are reserved
+ * for DISCONNECT and must not be emitted. */
+TEST(encode_disconnect_v5_reason_code_out_of_table_rejected)
+{
+    static const byte invalid[] = {
+        MQTT_REASON_GRANTED_QOS_1,
+        MQTT_REASON_CONT_AUTH,
+        MQTT_REASON_BAD_AUTH_METHOD,
+        MQTT_REASON_PACKET_ID_NOT_FOUND,
+        0xFF
+    };
+    MqttDisconnect disc;
+    byte buf[16];
+    size_t i;
+
+    for (i = 0; i < sizeof(invalid); i++) {
+        int rc;
+
+        XMEMSET(&disc, 0, sizeof(disc));
+        XMEMSET(buf, 0xA5, sizeof(buf));
+        disc.protocol_level = MQTT_CONNECT_PROTOCOL_LEVEL_5;
+        disc.reason_code = invalid[i];
+        rc = MqttEncode_Disconnect(buf, (int)sizeof(buf), &disc);
+        ASSERT_EQ(MQTT_CODE_ERROR_BAD_ARG, rc);
+        ASSERT_EQ(0xA5, buf[0]);
+    }
+}
 #endif /* WOLFMQTT_V5 */
 
 /* ============================================================================
@@ -6052,6 +6140,8 @@ void run_mqtt_packet_tests(void)
     RUN_TEST(decode_disconnect_v5_invalid_fixed_header_flags_rejected);
     RUN_TEST(decode_disconnect_v5_with_reason_code_accepted);
     RUN_TEST(decode_disconnect_v5_reason_code_past_buf_rejected);
+    RUN_TEST(encode_disconnect_v5_reason_code_allowed_set);
+    RUN_TEST(encode_disconnect_v5_reason_code_out_of_table_rejected);
 #endif
 
     /* Fixed-header reserved-flag validation [MQTT-2.2.2-2] */

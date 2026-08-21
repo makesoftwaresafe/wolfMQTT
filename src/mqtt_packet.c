@@ -251,6 +251,46 @@ int MqttPacket_SubAckReturnCodeValid(byte code, byte protocol_level)
 }
 
 #ifdef WOLFMQTT_V5
+/* [MQTT-3.14.2-1] Validate a DISCONNECT Reason Code against Table 3-10. */
+static int MqttPacket_DisconnectReasonCodeValid(byte code)
+{
+    switch (code) {
+        case MQTT_REASON_SUCCESS:                 /* 0x00 */
+        case MQTT_REASON_DISCONNECT_W_WILL_MSG:   /* 0x04 */
+        case MQTT_REASON_UNSPECIFIED_ERR:         /* 0x80 */
+        case MQTT_REASON_MALFORMED_PACKET:        /* 0x81 */
+        case MQTT_REASON_PROTOCOL_ERR:            /* 0x82 */
+        case MQTT_REASON_IMPL_SPECIFIC_ERR:       /* 0x83 */
+        case MQTT_REASON_NOT_AUTHORIZED:          /* 0x87 */
+        case MQTT_REASON_SERVER_BUSY:             /* 0x89 */
+        case MQTT_REASON_SERVER_SHUTTING_DOWN:    /* 0x8B */
+        case MQTT_REASON_KEEP_ALIVE_TIMEOUT:      /* 0x8D */
+        case MQTT_REASON_SESSION_TAKEN_OVER:      /* 0x8E */
+        case MQTT_REASON_TOPIC_FILTER_INVALID:    /* 0x8F */
+        case MQTT_REASON_TOPIC_NAME_INVALID:      /* 0x90 */
+        case MQTT_REASON_RX_MAX_EXCEEDED:         /* 0x93 */
+        case MQTT_REASON_TOPIC_ALIAS_INVALID:     /* 0x94 */
+        case MQTT_REASON_PACKET_TOO_LARGE:        /* 0x95 */
+        case MQTT_REASON_MSG_RATE_TOO_HIGH:       /* 0x96 */
+        case MQTT_REASON_QUOTA_EXCEEDED:          /* 0x97 */
+        case MQTT_REASON_ADMIN_ACTION:            /* 0x98 */
+        case MQTT_REASON_PAYLOAD_FORMAT_INVALID:  /* 0x99 */
+        case MQTT_REASON_RETAIN_NOT_SUPPORTED:    /* 0x9A */
+        case MQTT_REASON_QOS_NOT_SUPPORTED:       /* 0x9B */
+        case MQTT_REASON_USE_ANOTHER_SERVER:      /* 0x9C */
+        case MQTT_REASON_SERVER_MOVED:            /* 0x9D */
+        case MQTT_REASON_SS_NOT_SUPPORTED:        /* 0x9E */
+        case MQTT_REASON_CON_RATE_EXCEED:         /* 0x9F */
+        case MQTT_REASON_MAX_CON_TIME:            /* 0xA0 */
+        case MQTT_REASON_SUB_ID_NOT_SUP:           /* 0xA1 */
+        case MQTT_REASON_WILDCARD_SUB_NOT_SUP:     /* 0xA2 */
+            return 1;
+        default:
+            break;
+    }
+    return 0;
+}
+
 /* [MQTT-4.8.0-1] Validate a v5 UNSUBACK Reason Code against the fixed set in
  * MQTT 5.0 section 3.11.3. Returns 1 if allowed, 0 if reserved. */
 static int MqttPacket_UnsubAckReasonCodeValid(byte code)
@@ -3681,6 +3721,9 @@ int MqttEncode_Disconnect(byte *tx_buf, int tx_buf_len,
     if ((disconnect != NULL) &&
         (disconnect->protocol_level >= MQTT_CONNECT_PROTOCOL_LEVEL_5)) {
 
+        if (!MqttPacket_DisconnectReasonCodeValid(disconnect->reason_code)) {
+            return MQTT_TRACE_ERROR(MQTT_CODE_ERROR_BAD_ARG);
+        }
         if (disconnect->props != NULL) {
             /* Determine length of properties */
             props_len = MqttEncode_Props(MQTT_PACKET_TYPE_DISCONNECT,
