@@ -174,6 +174,81 @@ static int test_failed_client_free_retried(void)
     return 0;
 }
 
+static int test_repeated_client_deinit_preserves_property_owner(void)
+{
+    int rc;
+    MqttClient client;
+    MqttNet net;
+    byte tx_buf[64];
+    byte rx_buf[64];
+
+    reset_sem_state();
+    XMEMSET(&net, 0, sizeof(net));
+
+    /* Hold one property reference on behalf of another live client. */
+    rc = MqttProps_Init();
+    if (rc != MQTT_CODE_SUCCESS) {
+        fprintf(stderr, "existing property owner initialization returned %d\n",
+            rc);
+        return 1;
+    }
+
+    /* This client initializes its locks, then fails socket validation and
+     * performs its own cleanup before the explicit second deinit below. */
+    rc = MqttClient_Init(&client, &net, NULL, tx_buf, sizeof(tx_buf),
+        rx_buf, sizeof(rx_buf), 1000);
+    if (rc != MQTT_CODE_ERROR_BAD_ARG) {
+        fprintf(stderr, "failed client initialization returned %d\n", rc);
+        (void)MqttProps_ShutDown();
+        return 1;
+    }
+    MqttClient_DeInit(&client);
+
+    if (sem_free_calls != 3) {
+        fprintf(stderr, "repeat deinit freed another client's property lock\n");
+        (void)MqttProps_ShutDown();
+        return 1;
+    }
+
+    (void)MqttProps_ShutDown();
+    if (sem_free_calls != 4) {
+        fprintf(stderr, "property owner cleanup freed %d locks, expected 4\n",
+            sem_free_calls);
+        return 1;
+    }
+
+    return 0;
+}
+
+static int test_failed_property_free_retried(void)
+{
+    int rc;
+
+    reset_sem_state();
+    rc = MqttProps_Init();
+    if (rc != MQTT_CODE_SUCCESS) {
+        fprintf(stderr, "property initialization returned %d\n", rc);
+        return 1;
+    }
+
+    sem_fail_free_on_call = 1;
+    rc = MqttProps_ShutDown();
+    if (rc != MQTT_CODE_ERROR_SYSTEM) {
+        fprintf(stderr, "property free failure returned %d\n", rc);
+        return 1;
+    }
+    sem_fail_free_on_call = 0;
+    rc = MqttProps_ShutDown();
+    if ((rc != MQTT_CODE_SUCCESS) || (sem_free_attempts != 2) ||
+            (sem_free_calls != 1)) {
+        fprintf(stderr, "property free retry made %d attempts and %d frees\n",
+            sem_free_attempts, sem_free_calls);
+        return 1;
+    }
+
+    return 0;
+}
+
 int main(void)
 {
     if (test_property_lock_failure() != 0) {
@@ -183,6 +258,12 @@ int main(void)
         return 1;
     }
     if (test_failed_client_free_retried() != 0) {
+        return 1;
+    }
+    if (test_failed_property_free_retried() != 0) {
+        return 1;
+    }
+    if (test_repeated_client_deinit_preserves_property_owner() != 0) {
         return 1;
     }
     return 0;

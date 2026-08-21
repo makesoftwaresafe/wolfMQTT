@@ -268,6 +268,7 @@ typedef struct _MqttClient {
     byte   retain_avail;  /* Server property */
     byte   enable_eauth;  /* Enhanced authentication */
     byte   protocol_level;
+    byte   props_initialized; /* Internal property-stack ownership flag. */
 #endif
 
 #ifdef WOLFMQTT_DISCONNECT_CB

@@ -4110,10 +4110,13 @@ int MqttProps_ShutDown(void)
 {
     int ret = MQTT_CODE_SUCCESS;
 #if !defined(WOLFMQTT_DYN_PROP) && defined(WOLFMQTT_MULTITHREAD)
-    if (clientPropStack_lockInit > 0) {
+    if (clientPropStack_lockInit > 1) {
         clientPropStack_lockInit--;
-        if (clientPropStack_lockInit == 0) {
-            ret = wm_SemFree(&clientPropStack_lock);
+    }
+    else if (clientPropStack_lockInit == 1) {
+        ret = wm_SemFree(&clientPropStack_lock);
+        if (ret == MQTT_CODE_SUCCESS) {
+            clientPropStack_lockInit = 0;
         }
     }
 #endif

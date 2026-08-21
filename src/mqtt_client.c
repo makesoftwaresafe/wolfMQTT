@@ -2031,6 +2031,9 @@ int MqttClient_Init(MqttClient *client, MqttNet* net,
     /* [MQTT-3.1.2.11.8]: absent Topic Alias Maximum means none accepted. */
     client->topic_alias_max = 0;
     rc = MqttProps_Init();
+    if (rc == MQTT_CODE_SUCCESS) {
+        client->props_initialized = 1;
+    }
 #endif
 
 #ifdef WOLFMQTT_MULTITHREAD
@@ -2103,7 +2106,11 @@ void MqttClient_DeInit(MqttClient *client)
         }
 #endif
 #ifdef WOLFMQTT_V5
-        (void)MqttProps_ShutDown();
+        if (client->props_initialized != 0U) {
+            if (MqttProps_ShutDown() == MQTT_CODE_SUCCESS) {
+                client->props_initialized = 0;
+            }
+        }
 #endif
     }
 }
