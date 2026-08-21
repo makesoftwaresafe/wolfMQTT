@@ -1916,6 +1916,37 @@ TEST(decode_connack_refused_without_session_present_accepted)
     ASSERT_TRUE(rc > 0);
 }
 
+#ifdef WOLFMQTT_BROKER
+/* [MQTT-3.2.2-4] Session Present must be zero when a connection is refused.
+ * The encoder must not produce a CONNACK that the matching decoder rejects. */
+TEST(encode_connack_refused_with_session_present_rejected)
+{
+    byte buf[16];
+    MqttConnectAck ack;
+    int rc;
+
+    XMEMSET(&ack, 0, sizeof(ack));
+    XMEMSET(buf, 0xA5, sizeof(buf));
+    ack.flags = 1;
+    ack.return_code = MQTT_CONNECT_ACK_CODE_REFUSED_PROTO;
+#ifdef WOLFMQTT_V5
+    ack.protocol_level = MQTT_CONNECT_PROTOCOL_LEVEL_4;
+#endif
+    rc = MqttEncode_ConnectAck(buf, (int)sizeof(buf), &ack);
+    ASSERT_EQ(MQTT_CODE_ERROR_BAD_ARG, rc);
+    ASSERT_EQ(0xA5, buf[0]);
+
+#ifdef WOLFMQTT_V5
+    XMEMSET(buf, 0xA5, sizeof(buf));
+    ack.protocol_level = MQTT_CONNECT_PROTOCOL_LEVEL_5;
+    ack.return_code = MQTT_REASON_NOT_AUTHORIZED;
+    rc = MqttEncode_ConnectAck(buf, (int)sizeof(buf), &ack);
+    ASSERT_EQ(MQTT_CODE_ERROR_BAD_ARG, rc);
+    ASSERT_EQ(0xA5, buf[0]);
+#endif
+}
+#endif /* WOLFMQTT_BROKER */
+
 #if defined(WOLFMQTT_BROKER) && defined(WOLFMQTT_V5)
 /* MQTT v3.1.1 section 3.2.2.3 permits only return codes 0x00-0x05, while
  * MQTT 5.0 section 3.2.2.2 uses the version-specific Reason Code table. */
@@ -6245,6 +6276,9 @@ void run_mqtt_packet_tests(void)
     RUN_TEST(decode_connack_flags_all_bits_rejected);
     RUN_TEST(decode_connack_refused_with_session_present_rejected);
     RUN_TEST(decode_connack_refused_without_session_present_accepted);
+#ifdef WOLFMQTT_BROKER
+    RUN_TEST(encode_connack_refused_with_session_present_rejected);
+#endif
 #if defined(WOLFMQTT_BROKER) && defined(WOLFMQTT_V5)
     RUN_TEST(encode_connack_rejects_version_invalid_reason_codes);
 #endif

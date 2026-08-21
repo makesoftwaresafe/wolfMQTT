@@ -2181,6 +2181,13 @@ int MqttEncode_ConnectAck(byte *tx_buf, int tx_buf_len,
         return MQTT_TRACE_ERROR(MQTT_CODE_ERROR_BAD_ARG);
     }
 
+    /* MQTT v3.1.1 [MQTT-3.2.2-4] and MQTT v5 [MQTT-3.2.2-6]:
+     * Session Present must be zero when the connection is refused. */
+    if ((connect_ack->flags & 0x01) != 0 &&
+            connect_ack->return_code != MQTT_CONNECT_ACK_CODE_ACCEPTED) {
+        return MQTT_TRACE_ERROR(MQTT_CODE_ERROR_BAD_ARG);
+    }
+
     /* Determine packet length */
     remain_len = 2; /* flags + return code */
 #ifdef WOLFMQTT_V5
