@@ -97,9 +97,13 @@
     #elif defined(__MACH__)
         /* Apple Style Dispatch Semaphore */
         #include <dispatch/dispatch.h>
+        #include <pthread.h>
         typedef struct {
             dispatch_semaphore_t sem;
         } wm_Sem;
+        #define WOLFMQTT_THREAD_ID_T pthread_t
+        #define WOLFMQTT_THREAD_SELF() pthread_self()
+        #define WOLFMQTT_THREAD_EQUAL(a, b) pthread_equal((a), (b))
 
     #elif defined(__FreeBSD__) || defined(__linux__) || defined(__QNX__)
         /* Posix Style Pthread Mutex and Conditional */
@@ -112,12 +116,21 @@
         #endif
             pthread_mutex_t mutex;
         } wm_Sem;
+        #define WOLFMQTT_THREAD_ID_T pthread_t
+        #define WOLFMQTT_THREAD_SELF() pthread_self()
+        #define WOLFMQTT_THREAD_EQUAL(a, b) pthread_equal((a), (b))
 
     #elif defined(FREERTOS)
         /* FreeRTOS binary semaphore */
         #include <FreeRTOS.h>
         #include <semphr.h>
         typedef SemaphoreHandle_t wm_Sem;
+        #if defined(INCLUDE_xTaskGetCurrentTaskHandle) && \
+            (INCLUDE_xTaskGetCurrentTaskHandle == 1)
+            #define WOLFMQTT_THREAD_ID_T TaskHandle_t
+            #define WOLFMQTT_THREAD_SELF() xTaskGetCurrentTaskHandle()
+            #define WOLFMQTT_THREAD_EQUAL(a, b) ((a) == (b))
+        #endif
 
     #elif defined(USE_WINDOWS_API)
         /* Windows semaphore object */
@@ -125,10 +138,16 @@
         #include <ws2tcpip.h>
         #include <windows.h>
         typedef HANDLE wm_Sem;
+        #define WOLFMQTT_THREAD_ID_T DWORD
+        #define WOLFMQTT_THREAD_SELF() GetCurrentThreadId()
+        #define WOLFMQTT_THREAD_EQUAL(a, b) ((a) == (b))
 
     #elif defined(THREADX)
         #include <tx_api.h>
         typedef TX_SEMAPHORE wm_Sem;
+        #define WOLFMQTT_THREAD_ID_T TX_THREAD*
+        #define WOLFMQTT_THREAD_SELF() tx_thread_identify()
+        #define WOLFMQTT_THREAD_EQUAL(a, b) ((a) == (b))
 
     #else
         #error "Multithreading requires binary semaphore implementation!"

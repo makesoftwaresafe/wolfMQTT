@@ -25,7 +25,9 @@ tests_test_mqtt_props_init_SOURCES = \
     tests/test_mqtt_props_init.c \
     src/mqtt_client.c \
     src/mqtt_packet.c \
-    src/mqtt_socket.c
+    src/mqtt_socket.c \
+    src/mqtt_sn_client.c \
+    src/mqtt_sn_packet.c
 tests_test_mqtt_props_init_CPPFLAGS = -I$(top_srcdir) \
     -include $(top_srcdir)/tests/test_mqtt_props_config.h $(AM_CPPFLAGS)
 
@@ -58,18 +60,69 @@ tests_test_mqtt_sn_CPPFLAGS     = -I$(top_srcdir) $(AM_CPPFLAGS)
 tests_test_mqtt_sn_LDADD        = src/libwolfmqtt.la
 tests_test_mqtt_sn_DEPENDENCIES = src/libwolfmqtt.la
 
-# MQTT-SN client state-machine tests. These drive the public SN_Client_* entry
-# points through a mock MqttNet by linking libwolfmqtt (so they run against
-# whatever options the library was configured with). The happy-path will
-# handshake is checked in every SN build; the non-blocking duplicate-pendResp
-# regression tests compile only when WOLFMQTT_NONBLOCK is enabled (handled with
-# #ifdefs in the test source).
+# MQTT-SN client state-machine tests. Compile the client sources directly so
+# hidden state-machine helpers remain available to the regression tests while
+# AM_CFLAGS preserves the selected library configuration.
 check_PROGRAMS += tests/test_mqtt_sn_client
-tests_test_mqtt_sn_client_SOURCES      = tests/test_mqtt_sn_client.c
-tests_test_mqtt_sn_client_CFLAGS       = -DWOLFMQTT_SN $(AM_CFLAGS)
-tests_test_mqtt_sn_client_CPPFLAGS     = -I$(top_srcdir) $(AM_CPPFLAGS)
-tests_test_mqtt_sn_client_LDADD        = src/libwolfmqtt.la $(LIB_STATIC_ADD)
-tests_test_mqtt_sn_client_DEPENDENCIES = src/libwolfmqtt.la
+tests_test_mqtt_sn_client_SOURCES = \
+    tests/test_mqtt_sn_client.c \
+    src/mqtt_client.c \
+    src/mqtt_packet.c \
+    src/mqtt_socket.c \
+    src/mqtt_sn_client.c \
+    src/mqtt_sn_packet.c
+tests_test_mqtt_sn_client_CFLAGS = -DWOLFMQTT_SN $(AM_CFLAGS)
+tests_test_mqtt_sn_client_CPPFLAGS = -I$(top_srcdir) $(AM_CPPFLAGS)
+tests_test_mqtt_sn_client_LDADD = $(PTHREAD_LIBS)
+
+# Compile the client state machine directly without multithreading or
+# non-blocking I/O so client-owned fallback state is covered independently of
+# the options selected for libwolfmqtt.
+check_PROGRAMS += tests/test_mqtt_sn_client_st_only
+tests_test_mqtt_sn_client_st_only_SOURCES = \
+    tests/test_mqtt_sn_client.c \
+    src/mqtt_client.c \
+    src/mqtt_packet.c \
+    src/mqtt_socket.c \
+    src/mqtt_sn_client.c \
+    src/mqtt_sn_packet.c
+tests_test_mqtt_sn_client_st_only_CFLAGS = -DWOLFMQTT_SN
+tests_test_mqtt_sn_client_st_only_CPPFLAGS = -I$(top_srcdir) $(AM_CPPFLAGS)
+
+# Compile the client state machine directly without WOLFMQTT_NONBLOCK so the
+# multithreaded writer-contention retry path cannot be masked by the configured
+# library's non-blocking support.
+if BUILD_MULTITHREAD
+check_PROGRAMS += tests/test_mqtt_sn_client_mt_only
+tests_test_mqtt_sn_client_mt_only_SOURCES = \
+    tests/test_mqtt_sn_client.c \
+    src/mqtt_client.c \
+    src/mqtt_packet.c \
+    src/mqtt_socket.c \
+    src/mqtt_sn_client.c \
+    src/mqtt_sn_packet.c
+tests_test_mqtt_sn_client_mt_only_CFLAGS = $(PTHREAD_CFLAGS) \
+    -DWOLFMQTT_SN -DWOLFMQTT_MULTITHREAD
+tests_test_mqtt_sn_client_mt_only_CPPFLAGS = -I$(top_srcdir) $(AM_CPPFLAGS)
+tests_test_mqtt_sn_client_mt_only_LDADD = $(PTHREAD_LIBS)
+
+# Exercise the non-blocking policy that releases the send lock when a write
+# makes no progress. Compile the client directly so this configuration is
+# covered independently of the options selected for libwolfmqtt.
+check_PROGRAMS += tests/test_mqtt_sn_client_nodata
+tests_test_mqtt_sn_client_nodata_SOURCES = \
+    tests/test_mqtt_sn_client.c \
+    src/mqtt_client.c \
+    src/mqtt_packet.c \
+    src/mqtt_socket.c \
+    src/mqtt_sn_client.c \
+    src/mqtt_sn_packet.c
+tests_test_mqtt_sn_client_nodata_CFLAGS = $(PTHREAD_CFLAGS) \
+    -DWOLFMQTT_SN -DWOLFMQTT_MULTITHREAD -DWOLFMQTT_NONBLOCK \
+    -DWOLFMQTT_ALLOW_NODATA_UNLOCK
+tests_test_mqtt_sn_client_nodata_CPPFLAGS = -I$(top_srcdir) $(AM_CPPFLAGS)
+tests_test_mqtt_sn_client_nodata_LDADD = $(PTHREAD_LIBS)
+endif
 endif
 
 # Broker CONNECT handler tests. Compiles src/mqtt_broker.c into the test

@@ -19,6 +19,12 @@ static MqttPendResp* sem_pending_to_complete;
 static int sem_pending_completions;
 static int ping_read_calls;
 static int ping_disconnect_calls;
+static int sem_invalid_unlock_calls;
+static wm_Sem* sem_watch_client_lock;
+static wm_Sem* sem_watch_recv_lock;
+static MqttMsgStat* sem_watch_ping_stat;
+static int sem_stale_ping_locks;
+static int sem_watched_recv_locks;
 
 #ifdef ENABLE_MQTT_CURL
     #define TEST_CLIENT_LOCK_COUNT 4
@@ -40,6 +46,12 @@ static void reset_sem_state(void)
     sem_pending_completions = 0;
     ping_read_calls = 0;
     ping_disconnect_calls = 0;
+    sem_invalid_unlock_calls = 0;
+    sem_watch_client_lock = NULL;
+    sem_watch_recv_lock = NULL;
+    sem_watch_ping_stat = NULL;
+    sem_stale_ping_locks = 0;
+    sem_watched_recv_locks = 0;
 }
 
 int wm_SemInit(wm_Sem* sem)
@@ -50,6 +62,7 @@ int wm_SemInit(wm_Sem* sem)
         return MQTT_CODE_ERROR_SYSTEM;
     }
     sem->initialized = 1;
+    sem->lock_count = 0;
     return MQTT_CODE_SUCCESS;
 }
 
@@ -70,6 +83,17 @@ int wm_SemFree(wm_Sem* sem)
 
 int wm_SemLock(wm_Sem* sem)
 {
+    sem->lock_count++;
+    if (sem == sem_watch_recv_lock) {
+        sem_watched_recv_locks++;
+    }
+    if (sem == sem_watch_client_lock && sem_watch_ping_stat != NULL &&
+            sem_watched_recv_locks == 0 &&
+            sem_watch_ping_stat->write == MQTT_MSG_WAIT &&
+            sem_watch_ping_stat->read > MQTT_MSG_WAIT &&
+            !sem_watch_ping_stat->isReadActive) {
+        sem_stale_ping_locks++;
+    }
     if (sem == sem_complete_on_lock && sem_pending_to_complete != NULL) {
         sem_pending_to_complete->packetDone = 1;
         sem_pending_to_complete->packet_ret = MQTT_CODE_SUCCESS;
@@ -81,8 +105,107 @@ int wm_SemLock(wm_Sem* sem)
 
 int wm_SemUnlock(wm_Sem* sem)
 {
-    (void)sem;
+    if (sem->lock_count == 0) {
+        sem_invalid_unlock_calls++;
+    }
+    else {
+        sem->lock_count--;
+    }
     return MQTT_CODE_SUCCESS;
+}
+
+static int ping_net_connect(void* context, const char* host, word16 port,
+    int timeout_ms);
+static int ping_net_write(void* context, const byte* buf, int buf_len,
+    int timeout_ms);
+static int ping_net_disconnect(void* context);
+
+typedef struct SnPingFrames {
+    const byte* frames[2];
+    int lengths[2];
+    int frame;
+    int offset;
+} SnPingFrames;
+
+static int sn_ping_net_read(void* context, byte* buf, int buf_len,
+    int timeout_ms)
+{
+    SnPingFrames* frames = (SnPingFrames*)context;
+    int available;
+    int read_len;
+
+    (void)timeout_ms;
+    if (frames->frame >= 2) {
+        return MQTT_CODE_CONTINUE;
+    }
+    available = frames->lengths[frames->frame] - frames->offset;
+    read_len = (buf_len < available) ? buf_len : available;
+    XMEMCPY(buf, frames->frames[frames->frame] + frames->offset,
+        (size_t)read_len);
+    frames->offset += read_len;
+    if (frames->offset == frames->lengths[frames->frame]) {
+        frames->frame++;
+        frames->offset = 0;
+    }
+    return read_len;
+}
+
+static int test_sn_null_ping_resets_terminal_read_state(void)
+{
+    int rc;
+    MqttClient client;
+    MqttNet net;
+    SnPingFrames frames;
+    byte tx_buf[64];
+    byte rx_buf[64];
+    static const byte malformed[] = {
+        0x03, SN_MSG_TYPE_PING_RESP, 0x00
+    };
+    static const byte valid[] = { 0x02, SN_MSG_TYPE_PING_RESP };
+
+    reset_sem_state();
+    XMEMSET(&net, 0, sizeof(net));
+    XMEMSET(&frames, 0, sizeof(frames));
+    frames.frames[0] = malformed;
+    frames.lengths[0] = (int)sizeof(malformed);
+    frames.frames[1] = valid;
+    frames.lengths[1] = (int)sizeof(valid);
+    net.context = &frames;
+    net.connect = ping_net_connect;
+    net.read = sn_ping_net_read;
+    net.write = ping_net_write;
+    net.disconnect = ping_net_disconnect;
+
+    rc = MqttClient_Init(&client, &net, NULL, tx_buf, sizeof(tx_buf),
+        rx_buf, sizeof(rx_buf), 1000);
+    if (rc != MQTT_CODE_SUCCESS) {
+        fprintf(stderr, "SN ping client initialization returned %d\n", rc);
+        return 1;
+    }
+    (void)MqttClient_Flags(&client, 0, MQTT_CLIENT_FLAG_IS_DTLS);
+
+    rc = SN_Client_Ping(&client, NULL);
+    if (rc != MQTT_CODE_ERROR_MALFORMED_DATA) {
+        fprintf(stderr, "malformed SN PINGRESP returned %d\n", rc);
+        MqttClient_DeInit(&client);
+        return 1;
+    }
+    sem_watch_client_lock = &client.lockClient;
+    sem_watch_recv_lock = &client.lockRecv;
+    sem_watch_ping_stat = &client.pingSN.stat;
+    rc = SN_Client_Ping(&client, NULL);
+    if (rc != MQTT_CODE_SUCCESS || frames.frame != 2 ||
+            sem_invalid_unlock_calls != 0 || sem_stale_ping_locks != 0) {
+        fprintf(stderr,
+            "SN ping retry returned %d, frames=%d invalid unlocks=%d stale locks=%d\n",
+            rc, frames.frame, sem_invalid_unlock_calls,
+            sem_stale_ping_locks);
+        MqttClient_DeInit(&client);
+        return 1;
+    }
+
+    MqttClient_DeInit(&client);
+    return 0;
 }
 
 static int ping_net_connect(void* context, const char* host, word16 port,
@@ -353,6 +476,9 @@ static int test_failed_property_free_retried(void)
 
 int main(void)
 {
+    if (test_sn_null_ping_resets_terminal_read_state() != 0) {
+        return 1;
+    }
     if (test_ping_response_completed_during_read_lock() != 0) {
         return 1;
     }

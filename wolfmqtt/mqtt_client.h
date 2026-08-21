@@ -261,6 +261,10 @@ typedef struct _MqttClient {
     MqttObject   msg;   /* generic incoming message used by MqttClient_WaitType */
 #ifdef WOLFMQTT_SN
     SN_Object    msgSN;
+    SN_PingReq   pingSN; /* persistent state for a NULL SN ping request */
+    byte         pingSN_busy; /* one caller at a time owns pingSN */
+    SN_MsgType  sn_wait_packet_type;
+    word16      sn_wait_packet_id;
     SN_ClientRegisterCb reg_cb;
     void               *reg_ctx;
 #endif
@@ -285,6 +289,10 @@ typedef struct _MqttClient {
 #endif
 #ifdef WOLFMQTT_MULTITHREAD
     byte   init_flags; /* Internal resource-initialization flags. */
+    #ifdef WOLFMQTT_THREAD_ID_T
+    byte   write_owner_valid; /* lockSend owner is known. */
+    WOLFMQTT_THREAD_ID_T write_owner;
+    #endif
     wm_Sem lockSend;
     wm_Sem lockRecv;
     wm_Sem lockClient;
@@ -737,6 +745,8 @@ WOLFMQTT_API const char* MqttClient_ReturnCodeToString(
 #endif /* WOLFMQTT_NO_ERROR_STRINGS */
 
 /* Internal functions */
+WOLFMQTT_LOCAL int MqttWriteStart(MqttClient* client, MqttMsgStat* stat);
+WOLFMQTT_LOCAL void MqttWriteStop(MqttClient* client, MqttMsgStat* stat);
 WOLFMQTT_LOCAL int MqttReadStart(MqttClient* client, MqttMsgStat* stat);
 WOLFMQTT_LOCAL void MqttReadStop(MqttClient* client, MqttMsgStat* stat);
 #ifdef WOLFMQTT_MULTITHREAD

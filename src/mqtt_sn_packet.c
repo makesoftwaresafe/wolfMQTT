@@ -28,6 +28,7 @@
 #include "wolfmqtt/mqtt_sn_packet.h"
 
 #ifdef WOLFMQTT_SN
+#ifndef WOLFMQTT_NO_ERROR_STRINGS
 const char* SN_Packet_TypeDesc(SN_MsgType packet_type)
 {
     switch (packet_type) {
@@ -94,6 +95,7 @@ const char* SN_Packet_TypeDesc(SN_MsgType packet_type)
     }
     return "Unknown";
 }
+#endif /* !WOLFMQTT_NO_ERROR_STRINGS */
 
 int SN_Decode_Header(byte *rx_buf, int rx_buf_len,
     SN_MsgType* p_packet_type, word16* p_packet_id)

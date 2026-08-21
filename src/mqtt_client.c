@@ -243,7 +243,7 @@ static int MqttClient_CancelMessage(MqttClient *client, MqttObject* msg);
 #endif /* MUTEX */
 #endif /* WOLFMQTT_MULTITHREAD */
 
-static int MqttWriteStart(MqttClient* client, MqttMsgStat* stat)
+WOLFMQTT_LOCAL int MqttWriteStart(MqttClient* client, MqttMsgStat* stat)
 {
     int rc = MQTT_CODE_SUCCESS;
 
@@ -254,8 +254,12 @@ static int MqttWriteStart(MqttClient* client, MqttMsgStat* stat)
         rc = MQTT_CODE_ERROR_SYSTEM;
     }
   #endif
-  #ifndef WOLFMQTT_ALLOW_NODATA_UNLOCK
-    /* detect if a write is already in progress */
+  #if !defined(WOLFMQTT_ALLOW_NODATA_UNLOCK) && \
+      (!defined(WOLFMQTT_MULTITHREAD) || defined(WOLFMQTT_NONBLOCK) || \
+       !defined(WOLFMQTT_THREAD_ID_T))
+    /* Detect an in-progress write when the caller cannot wait for it. A
+     * blocking build with thread identities instead distinguishes owner
+     * reentry from another thread below. */
     #ifdef WOLFMQTT_MULTITHREAD
     if (wm_SemLock(&client->lockClient) == 0)
     #endif
@@ -268,13 +272,32 @@ static int MqttWriteStart(MqttClient* client, MqttMsgStat* stat)
         wm_SemUnlock(&client->lockClient);
     #endif
     }
-  #endif /* WOLFMQTT_ALLOW_NODATA_UNLOCK */
+  #endif
     if (rc != MQTT_CODE_SUCCESS) {
         return rc;
     }
 #endif
 
 #ifdef WOLFMQTT_MULTITHREAD
+  #if !defined(WOLFMQTT_ALLOW_NODATA_UNLOCK) && \
+      !defined(WOLFMQTT_NONBLOCK) && defined(WOLFMQTT_THREAD_ID_T)
+    /* A blocking API may wait for another thread's write, but waiting on the
+     * current thread's own non-recursive lockSend would deadlock. This occurs,
+     * for example, when a streaming payload callback attempts another send or
+     * an asynchronous transport leaves the writer active across reentry. */
+    rc = wm_SemLock(&client->lockClient);
+    if (rc == MQTT_CODE_SUCCESS) {
+        if (client->write.isActive && client->write_owner_valid &&
+                WOLFMQTT_THREAD_EQUAL(client->write_owner,
+                    WOLFMQTT_THREAD_SELF())) {
+            rc = MQTT_CODE_CONTINUE;
+        }
+        wm_SemUnlock(&client->lockClient);
+    }
+    if (rc != MQTT_CODE_SUCCESS) {
+        return rc;
+    }
+  #endif
     rc = wm_SemLock(&client->lockSend);
 #endif
     if (rc == MQTT_CODE_SUCCESS) {
@@ -285,6 +308,10 @@ static int MqttWriteStart(MqttClient* client, MqttMsgStat* stat)
     #endif
         {
             client->write.isActive = 1;
+        #if defined(WOLFMQTT_THREAD_ID_T)
+            client->write_owner = WOLFMQTT_THREAD_SELF();
+            client->write_owner_valid = 1;
+        #endif
         #ifdef WOLFMQTT_MULTITHREAD
             wm_SemUnlock(&client->lockClient);
         #endif
@@ -295,7 +322,7 @@ static int MqttWriteStart(MqttClient* client, MqttMsgStat* stat)
 
     return rc;
 }
-static void MqttWriteStop(MqttClient* client, MqttMsgStat* stat)
+WOLFMQTT_LOCAL void MqttWriteStop(MqttClient* client, MqttMsgStat* stat)
 {
 #ifdef WOLFMQTT_DEBUG_CLIENT
     if (!stat->isWriteActive) {
@@ -310,6 +337,9 @@ static void MqttWriteStop(MqttClient* client, MqttMsgStat* stat)
     {
         /* reset write */
         XMEMSET(&client->write, 0, sizeof(client->write));
+    #if defined(WOLFMQTT_MULTITHREAD) && defined(WOLFMQTT_THREAD_ID_T)
+        client->write_owner_valid = 0;
+    #endif
     #ifdef WOLFMQTT_MULTITHREAD
         wm_SemUnlock(&client->lockClient);
     #endif

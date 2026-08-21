@@ -8,9 +8,13 @@
 #ifndef WOLFMQTT_MULTITHREAD
     #define WOLFMQTT_MULTITHREAD
 #endif
+#ifndef WOLFMQTT_SN
+    #define WOLFMQTT_SN
+#endif
 #ifndef WOLFMQTT_USER_THREADING
     typedef struct TestMqttSem {
         int initialized;
+        int lock_count;
     } wm_Sem;
     #define WOLFMQTT_USER_THREADING
 #endif

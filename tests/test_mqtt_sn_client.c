@@ -25,10 +25,8 @@
  * MqttNet so the will-handshake state machine is exercised end to end. The
  * suite builds in any SN configuration: the happy-path test runs in blocking
  * builds too (guarding the refactored BEGIN/WAIT/HEADER flow against a dropped
- * FALL_THROUGH/transition), while the retry tests are compiled only under
- * WOLFMQTT_NONBLOCK. There the mock gateway returns MQTT_CODE_CONTINUE between
- * scripted SN frames so every wait is re-entered at least once, the same way an
- * application would call the API repeatedly.
+ * FALL_THROUGH/transition). The retry tests cover both partial non-blocking
+ * transport writes and multithreaded writer contention.
  *
  * Regression focus: the Last-Will (LWT) connect handshake. SN_WillTopic and
  * SN_WillMessage used to add their pending response to client->firstPendResp
@@ -46,6 +44,17 @@
 
 #include "wolfmqtt/mqtt_client.h"
 #include "wolfmqtt/mqtt_sn_packet.h"
+
+#if defined(WOLFMQTT_MULTITHREAD) && !defined(WOLFMQTT_NONBLOCK) && \
+    (defined(__MACH__) || defined(WOLFMQTT_POSIX_SEMAPHORES))
+    #include <errno.h>
+    #include <pthread.h>
+    #include <signal.h>
+    #include <sys/wait.h>
+    #include <time.h>
+    #include <unistd.h>
+    #define WOLFMQTT_TEST_SN_MT_ONLY_THREADS
+#endif
 
 /* Provide storage for the unit-test framework's global counters. Must be
  * defined before unit_test.h is included. */
@@ -92,10 +101,53 @@ typedef struct MockNet {
     int         write_fail_rc; /* if nonzero, write() returns this instead of
                                 * accepting the buffer (simulate short/failed
                                 * write) */
+    int         write_chunk;   /* maximum bytes accepted per write */
+    int         write_zero_count; /* zero-progress writes before accepting */
+    int         write_continue_count; /* async continuations before accepting */
 
     int         read_calls;
     int         write_calls;
 } MockNet;
+
+#ifdef WOLFMQTT_TEST_SN_MT_ONLY_THREADS
+typedef struct SnMtOnlyRaceCtx {
+    pthread_mutex_t mutex;
+    pthread_cond_t cond;
+    SN_Subscribe subscribe;
+    MqttPublish publish;
+    int reader_waiting;
+    int writer_active;
+    int release_writer;
+    int incoming_delivered;
+    int subscribe_done;
+    int subscribe_done_while_writer_active;
+    int sync_error;
+    int subscribe_rc;
+    int publish_rc;
+} SnMtOnlyRaceCtx;
+
+typedef struct SnPingRaceCtx {
+    pthread_mutex_t mutex;
+    pthread_cond_t cond;
+    int first_write_blocked;
+    int release_first_write;
+    int second_done;
+    int sync_error;
+    int first_rc;
+    int second_rc;
+} SnPingRaceCtx;
+
+static SnMtOnlyRaceCtx* g_mt_only_race;
+static SnPingRaceCtx* g_ping_race;
+static int g_mt_only_reentrant_send_rc;
+static int g_mt_only_reentrant_wait_rc;
+static int g_mt_only_async_callback_count;
+#endif
+
+#ifndef WOLFMQTT_MULTITHREAD
+static int g_st_nested_ping_rc;
+static int g_st_ping_callback_count;
+#endif
 
 static int mock_connect(void *ctx, const char* host, word16 port,
         int timeout_ms)
@@ -114,12 +166,82 @@ static int mock_write(void *ctx, const byte* buf, int buf_len, int timeout_ms)
 {
     MockNet* net = (MockNet*)ctx;
     (void)timeout_ms;
+
+#ifdef WOLFMQTT_TEST_SN_MT_ONLY_THREADS
+    if (g_ping_race != NULL && buf_len >= 2 &&
+            buf[1] == SN_MSG_TYPE_PING_REQ) {
+        int sync_rc;
+
+        sync_rc = pthread_mutex_lock(&g_ping_race->mutex);
+        if (sync_rc != 0) {
+            g_ping_race->sync_error = 1;
+            return MQTT_CODE_ERROR_SYSTEM;
+        }
+        if (!g_ping_race->first_write_blocked) {
+            g_ping_race->first_write_blocked = 1;
+            sync_rc = pthread_cond_broadcast(&g_ping_race->cond);
+            while (sync_rc == 0 && !g_ping_race->release_first_write) {
+                sync_rc = pthread_cond_wait(&g_ping_race->cond,
+                    &g_ping_race->mutex);
+            }
+        }
+        if (sync_rc != 0) {
+            g_ping_race->sync_error = 1;
+        }
+        if (pthread_mutex_unlock(&g_ping_race->mutex) != 0) {
+            g_ping_race->sync_error = 1;
+        }
+        if (g_ping_race->sync_error) {
+            return MQTT_CODE_ERROR_SYSTEM;
+        }
+    }
+
+    if (g_mt_only_race != NULL && buf_len > 0 &&
+            (buf[0] >> 4) == MQTT_PACKET_TYPE_PUBLISH) {
+        int sync_rc;
+
+        sync_rc = pthread_mutex_lock(&g_mt_only_race->mutex);
+        if (sync_rc != 0) {
+            g_mt_only_race->sync_error = 1;
+            return MQTT_CODE_ERROR_SYSTEM;
+        }
+        g_mt_only_race->writer_active = 1;
+        sync_rc = pthread_cond_broadcast(&g_mt_only_race->cond);
+        while (sync_rc == 0 && !g_mt_only_race->release_writer) {
+            sync_rc = pthread_cond_wait(&g_mt_only_race->cond,
+                &g_mt_only_race->mutex);
+        }
+        if (sync_rc != 0) {
+            g_mt_only_race->sync_error = 1;
+        }
+        g_mt_only_race->writer_active = 0;
+        if (pthread_mutex_unlock(&g_mt_only_race->mutex) != 0) {
+            g_mt_only_race->sync_error = 1;
+        }
+        if (g_mt_only_race->sync_error) {
+            return MQTT_CODE_ERROR_SYSTEM;
+        }
+        return buf_len;
+    }
+#endif
+
     net->write_calls++;
     if (net->write_fail_rc != 0) {
         /* Simulate a short/failed write so the caller's rc != xfer error path is
          * exercised. The buffer is left as the caller encoded it (not captured),
          * matching a real transport that errored mid-send. */
         return net->write_fail_rc;
+    }
+    if (net->write_continue_count > 0) {
+        net->write_continue_count--;
+        return MQTT_CODE_CONTINUE;
+    }
+    if (net->write_zero_count > 0) {
+        net->write_zero_count--;
+        return 0;
+    }
+    if (net->write_chunk > 0 && buf_len > net->write_chunk) {
+        buf_len = net->write_chunk;
     }
     if (buf_len > 0 && net->out_len + buf_len <= MOCK_OUT_LEN) {
         XMEMCPY(&net->out[net->out_len], buf, (size_t)buf_len);
@@ -138,6 +260,33 @@ static int mock_read(void *ctx, byte* buf, int buf_len, int timeout_ms)
     if (net->in_idx >= net->in_count) {
         return MQTT_CODE_CONTINUE; /* nothing left to deliver */
     }
+
+#ifdef WOLFMQTT_TEST_SN_MT_ONLY_THREADS
+    if (g_mt_only_race != NULL && net->in_idx == 0 && net->in_off == 0) {
+        int sync_rc;
+
+        sync_rc = pthread_mutex_lock(&g_mt_only_race->mutex);
+        if (sync_rc != 0) {
+            g_mt_only_race->sync_error = 1;
+            return MQTT_CODE_ERROR_SYSTEM;
+        }
+        g_mt_only_race->reader_waiting = 1;
+        sync_rc = pthread_cond_broadcast(&g_mt_only_race->cond);
+        while (sync_rc == 0 && !g_mt_only_race->writer_active) {
+            sync_rc = pthread_cond_wait(&g_mt_only_race->cond,
+                &g_mt_only_race->mutex);
+        }
+        if (sync_rc != 0) {
+            g_mt_only_race->sync_error = 1;
+        }
+        if (pthread_mutex_unlock(&g_mt_only_race->mutex) != 0) {
+            g_mt_only_race->sync_error = 1;
+        }
+        if (g_mt_only_race->sync_error) {
+            return MQTT_CODE_ERROR_SYSTEM;
+        }
+    }
+#endif
 
     /* At a frame boundary, optionally simulate "would block" first. */
     if (net->in_off == 0 && net->continues > 0) {
@@ -273,6 +422,40 @@ static const byte UNSUBACK_FRAME[] = { 0x04, SN_MSG_TYPE_UNSUBACK,
 static const byte SN_PUBLISH_QOS1_FRAME[] = { 0x09, SN_MSG_TYPE_PUBLISH,
                                               0x20, 0x00, 0x0A,
                                               0x00, 0x07, 0x01, 0x02 };
+#if !defined(WOLFMQTT_MULTITHREAD) || \
+    defined(WOLFMQTT_TEST_SN_MT_ONLY_THREADS)
+static const byte SN_PUBLISH_QOS0_FRAME[] = { 0x09, SN_MSG_TYPE_PUBLISH,
+                                              0x00, 0x00, 0x0A,
+                                              0x00, 0x00, 0x01, 0x02 };
+#endif
+
+/* Gateway-initiated messages and their required automatic replies. */
+#if defined(WOLFMQTT_NONBLOCK) || defined(WOLFMQTT_MULTITHREAD)
+static const byte SN_REGISTER_FRAME[] = {
+    0x09, SN_MSG_TYPE_REGISTER, 0x00, 0x0A, 0x00, 0x07, 'a', 'b', 'c'
+};
+#ifdef WOLFMQTT_NONBLOCK
+static const byte SN_REGACK_FRAME[] = {
+    0x07, SN_MSG_TYPE_REGACK, 0x00, 0x0A, 0x00, 0x07, SN_RC_NOTSUPPORTED
+};
+#endif
+static const byte SN_REGACK_ACCEPTED_FRAME[] = {
+    0x07, SN_MSG_TYPE_REGACK, 0x00, 0x0A, 0x00, 0x07, SN_RC_ACCEPTED
+};
+#ifdef WOLFMQTT_NONBLOCK
+static const byte SN_PUBREC_FRAME[] = {
+    0x04, SN_MSG_TYPE_PUBREC, 0x00, 0x07
+};
+static const byte SN_PUBREL_FRAME[] = {
+    0x04, SN_MSG_TYPE_PUBREL, 0x00, 0x07
+};
+static const byte SN_PINGREQ_FRAME[] = { 0x02, SN_MSG_TYPE_PING_REQ };
+static const byte SN_PINGRESP_FRAME[] = { 0x02, SN_MSG_TYPE_PING_RESP };
+#endif
+static const byte SN_PUBACK_FRAME[] = {
+    0x07, SN_MSG_TYPE_PUBACK, 0x00, 0x0A, 0x00, 0x07, SN_RC_ACCEPTED
+};
+#endif
 
 /* ============================================================================
  * Test fixtures
@@ -283,6 +466,9 @@ static MqttNet    g_net;
 static MockNet    g_mock;
 static byte       g_tx[512];
 static byte       g_rx[512];
+#if defined(WOLFMQTT_NONBLOCK) || defined(WOLFMQTT_MULTITHREAD)
+static int        g_incoming_publish_calls;
+#endif
 
 static void sn_will_setup_connect(SN_Connect* mc)
 {
@@ -1072,14 +1258,916 @@ TEST(sn_publish_incoming_null_msg_cb_errors_no_ack)
     ASSERT_EQ(0, g_mock.write_calls);
 }
 
-/* The non-blocking retry behavior is the actual regression and only applies
- * when WOLFMQTT_NONBLOCK is built (otherwise SN_Client_WaitType blocks and
- * never returns MQTT_CODE_CONTINUE). */
+#ifdef WOLFMQTT_TEST_SN_MT_ONLY_THREADS
+static int sn_mt_only_packet_count(const MockNet* net, byte packet_type)
+{
+    int count = 0;
+    int pos = 0;
+
+    while (pos < net->out_len) {
+        int frame_len;
+        int type_pos;
+
+        if (net->out[pos] == 1) {
+            if (pos + 3 >= net->out_len) {
+                return -1;
+            }
+            frame_len = ((int)net->out[pos + 1] << 8) | net->out[pos + 2];
+            type_pos = pos + 3;
+        }
+        else {
+            frame_len = net->out[pos];
+            type_pos = pos + 1;
+        }
+        if (frame_len <= type_pos - pos || pos + frame_len > net->out_len) {
+            return -1;
+        }
+        if (net->out[type_pos] == packet_type) {
+            count++;
+        }
+        pos += frame_len;
+    }
+    return count;
+}
+
+static int sn_mt_only_continue_publish(MqttClient* client, MqttMessage* msg,
+    byte msg_new, byte msg_done)
+{
+    (void)client;
+    (void)msg;
+    (void)msg_new;
+    (void)msg_done;
+    g_incoming_publish_calls++;
+    return MQTT_CODE_CONTINUE;
+}
+
+/* A message callback result other than SUCCESS is terminal. In a blocking
+ * build, CONTINUE must therefore release the receive lock and consume the
+ * packet rather than treating the callback result as an internal retry. */
+TEST(sn_mt_only_callback_continue_releases_reader)
+{
+    int rc;
+
+    ASSERT_EQ(MQTT_CODE_SUCCESS, sn_client_init(0));
+    g_incoming_publish_calls = 0;
+    g_client.msg_cb = sn_mt_only_continue_publish;
+    mock_net_push(&g_mock, SN_PUBLISH_QOS0_FRAME,
+        (int)sizeof(SN_PUBLISH_QOS0_FRAME));
+
+    rc = SN_Client_WaitMessage(&g_client, 1000);
+    ASSERT_EQ(MQTT_CODE_CONTINUE, rc);
+    ASSERT_EQ(1, g_incoming_publish_calls);
+    if (g_client.read.isActive ||
+            g_client.msgSN.publish.stat.isReadActive) {
+        MqttReadStop(&g_client, &g_client.msgSN.publish.stat);
+        g_client.msgSN.publish.stat.read = MQTT_MSG_BEGIN;
+        FAIL("terminal callback result retained the client reader");
+    }
+    ASSERT_EQ(MQTT_MSG_BEGIN, g_client.msgSN.publish.stat.read);
+
+    rc = SN_Client_WaitMessage(&g_client, 1000);
+    ASSERT_EQ(MQTT_CODE_CONTINUE, rc);
+    ASSERT_EQ(1, g_incoming_publish_calls);
+}
+
+static void* sn_ping_race_first_thread(void* arg)
+{
+    SnPingRaceCtx* race = (SnPingRaceCtx*)arg;
+
+    race->first_rc = SN_Client_Ping(&g_client, NULL);
+    return NULL;
+}
+
+static void* sn_ping_race_second_thread(void* arg)
+{
+    SnPingRaceCtx* race = (SnPingRaceCtx*)arg;
+
+    race->second_rc = SN_Client_Ping(&g_client, NULL);
+    if (pthread_mutex_lock(&race->mutex) != 0) {
+        race->sync_error = 1;
+        return NULL;
+    }
+    race->second_done = 1;
+    if (pthread_cond_broadcast(&race->cond) != 0) {
+        race->sync_error = 1;
+    }
+    if (pthread_mutex_unlock(&race->mutex) != 0) {
+        race->sync_error = 1;
+    }
+    return NULL;
+}
+
+/* MQTT-SN 1.2 section 5.10 requires one PINGREQ/PINGRESP exchange. A second
+ * NULL-ping caller must not reset the client-owned request while the first
+ * caller has its pending response linked. */
+TEST(sn_mt_only_concurrent_null_ping_preserves_pending_response)
+{
+    pid_t child;
+    int status;
+
+    child = fork();
+    ASSERT_TRUE(child >= 0);
+    if (child == 0) {
+        SnPingRaceCtx race;
+        pthread_t first_thread;
+        pthread_t second_thread;
+        struct timespec deadline;
+        int wait_rc = 0;
+        int second_finished_while_blocked;
+        int pending_intact;
+        int rc;
+        int ok;
+
+        (void)alarm(3);
+        XMEMSET(&race, 0, sizeof(race));
+        rc = sn_client_init(0);
+        if (rc != MQTT_CODE_SUCCESS ||
+                pthread_mutex_init(&race.mutex, NULL) != 0 ||
+                pthread_cond_init(&race.cond, NULL) != 0) {
+            _exit(1);
+        }
+        g_ping_race = &race;
+        if (pthread_create(&first_thread, NULL,
+                sn_ping_race_first_thread, &race) != 0) {
+            _exit(1);
+        }
+        if (pthread_mutex_lock(&race.mutex) != 0) {
+            _exit(1);
+        }
+        while (!race.first_write_blocked && !race.sync_error) {
+            if (pthread_cond_wait(&race.cond, &race.mutex) != 0) {
+                race.sync_error = 1;
+            }
+        }
+        if (pthread_mutex_unlock(&race.mutex) != 0 ||
+                pthread_create(&second_thread, NULL,
+                    sn_ping_race_second_thread, &race) != 0 ||
+                pthread_mutex_lock(&race.mutex) != 0 ||
+                clock_gettime(CLOCK_REALTIME, &deadline) != 0) {
+            _exit(1);
+        }
+        deadline.tv_sec++;
+        while (!race.second_done && !race.sync_error && wait_rc == 0) {
+            wait_rc = pthread_cond_timedwait(&race.cond, &race.mutex,
+                &deadline);
+        }
+        second_finished_while_blocked = race.second_done;
+        pending_intact = g_client.firstPendResp ==
+                &g_client.pingSN.pendResp &&
+            g_client.pingSN.pendResp.packet_type ==
+                (MqttPacketType)SN_MSG_TYPE_PING_RESP;
+        mock_net_push(&g_mock, PINGRESP_FRAME, (int)sizeof(PINGRESP_FRAME));
+        race.release_first_write = 1;
+        if (pthread_cond_broadcast(&race.cond) != 0 ||
+                pthread_mutex_unlock(&race.mutex) != 0 ||
+                pthread_join(first_thread, NULL) != 0 ||
+                pthread_join(second_thread, NULL) != 0) {
+            _exit(1);
+        }
+        g_ping_race = NULL;
+        ok = !race.sync_error && second_finished_while_blocked &&
+            pending_intact && race.first_rc == MQTT_CODE_SUCCESS &&
+            race.second_rc == MQTT_CODE_CONTINUE &&
+            sn_mt_only_packet_count(&g_mock, SN_MSG_TYPE_PING_REQ) == 1 &&
+            g_client.firstPendResp == NULL;
+        MqttClient_DeInit(&g_client);
+        (void)pthread_cond_destroy(&race.cond);
+        (void)pthread_mutex_destroy(&race.mutex);
+        _exit(ok ? 0 : 1);
+    }
+
+    ASSERT_EQ(child, waitpid(child, &status, 0));
+    ASSERT_TRUE(WIFEXITED(status));
+    ASSERT_EQ(0, WEXITSTATUS(status));
+}
+
+static int sn_mt_only_accept_publish(MqttClient* client, MqttMessage* msg,
+    byte msg_new, byte msg_done)
+{
+    int sync_rc;
+
+    (void)client;
+    (void)msg;
+    (void)msg_new;
+    (void)msg_done;
+    sync_rc = pthread_mutex_lock(&g_mt_only_race->mutex);
+    if (sync_rc != 0) {
+        g_mt_only_race->sync_error = 1;
+        return MQTT_CODE_ERROR_SYSTEM;
+    }
+    g_mt_only_race->incoming_delivered++;
+    if (pthread_cond_broadcast(&g_mt_only_race->cond) != 0) {
+        g_mt_only_race->sync_error = 1;
+    }
+    if (pthread_mutex_unlock(&g_mt_only_race->mutex) != 0) {
+        g_mt_only_race->sync_error = 1;
+    }
+    return g_mt_only_race->sync_error ? MQTT_CODE_ERROR_SYSTEM :
+        MQTT_CODE_SUCCESS;
+}
+
+static int sn_mt_only_arm_auto_reply_continue(MqttClient* client,
+    MqttMessage* msg, byte msg_new, byte msg_done)
+{
+    (void)client;
+    (void)msg;
+    (void)msg_new;
+    (void)msg_done;
+    g_mt_only_async_callback_count++;
+    g_mock.write_continue_count = 1;
+    return MQTT_CODE_SUCCESS;
+}
+
+/* A blocking operation must finish an asynchronous automatic PUBACK write
+ * internally before returning to its caller. The child alarm bounds a stale
+ * read/write lock self-deadlock. */
+TEST(sn_mt_only_subscribe_blocks_through_async_auto_reply)
+{
+    pid_t child;
+    int status;
+
+    child = fork();
+    ASSERT_TRUE(child >= 0);
+    if (child == 0) {
+        SN_Subscribe subscribe;
+        int rc;
+        int ok;
+
+        (void)alarm(2);
+        rc = sn_client_init(0);
+        if (rc != MQTT_CODE_SUCCESS) {
+            _exit(1);
+        }
+        sn_subscribe_setup(&subscribe);
+        g_mt_only_async_callback_count = 0;
+        g_client.msg_cb = sn_mt_only_arm_auto_reply_continue;
+        mock_net_push(&g_mock, SN_PUBLISH_QOS1_FRAME,
+            (int)sizeof(SN_PUBLISH_QOS1_FRAME));
+        mock_net_push(&g_mock, SUBACK_FRAME, (int)sizeof(SUBACK_FRAME));
+
+        rc = SN_Client_Subscribe(&g_client, &subscribe);
+        ok = rc == MQTT_CODE_SUCCESS &&
+            g_mt_only_async_callback_count == 1 &&
+            sn_mt_only_packet_count(&g_mock, SN_MSG_TYPE_SUBSCRIBE) == 1 &&
+            sn_mt_only_packet_count(&g_mock, SN_MSG_TYPE_PUBACK) == 1 &&
+            g_client.firstPendResp == NULL;
+        MqttClient_DeInit(&g_client);
+        _exit(ok ? 0 : 1);
+    }
+
+    ASSERT_EQ(child, waitpid(child, &status, 0));
+    ASSERT_TRUE(WIFEXITED(status));
+    ASSERT_EQ(0, WEXITSTATUS(status));
+}
+
+static void* sn_mt_only_subscribe_thread(void* arg)
+{
+    SnMtOnlyRaceCtx* race = (SnMtOnlyRaceCtx*)arg;
+
+    race->subscribe_rc = SN_Client_Subscribe(&g_client, &race->subscribe);
+    if (pthread_mutex_lock(&race->mutex) != 0) {
+        race->sync_error = 1;
+        return NULL;
+    }
+    race->subscribe_done = 1;
+    if (race->writer_active) {
+        race->subscribe_done_while_writer_active = 1;
+    }
+    if (pthread_cond_broadcast(&race->cond) != 0) {
+        race->sync_error = 1;
+    }
+    if (pthread_mutex_unlock(&race->mutex) != 0) {
+        race->sync_error = 1;
+    }
+    return NULL;
+}
+
+static void* sn_mt_only_publish_thread(void* arg)
+{
+    SnMtOnlyRaceCtx* race = (SnMtOnlyRaceCtx*)arg;
+
+    race->publish_rc = MqttClient_Publish(&g_client, &race->publish);
+    return NULL;
+}
+
+/* MQTT-SN 1.2 sections 5.3.4 and 5.4.4: an unrelated QoS 1 PUBLISH received
+ * while waiting for SUBACK must be acknowledged without abandoning or
+ * retransmitting the subscription. This target deliberately excludes
+ * WOLFMQTT_NONBLOCK so writer contention must serialize instead of escaping as
+ * an operation-level continuation. */
+TEST(sn_subscribe_waits_for_mt_only_automatic_reply_writer)
+{
+    SnMtOnlyRaceCtx race;
+    pthread_t subscribe_thread;
+    pthread_t publish_thread;
+    struct timespec deadline;
+    byte payload = 0xA5;
+    int wait_rc = 0;
+
+    ASSERT_EQ(MQTT_CODE_SUCCESS, sn_client_init(0));
+    XMEMSET(&race, 0, sizeof(race));
+    ASSERT_EQ(0, pthread_mutex_init(&race.mutex, NULL));
+    ASSERT_EQ(0, pthread_cond_init(&race.cond, NULL));
+    sn_subscribe_setup(&race.subscribe);
+    race.publish.topic_name = "writer/topic";
+    race.publish.qos = MQTT_QOS_0;
+    race.publish.buffer = &payload;
+    race.publish.total_len = sizeof(payload);
+    g_client.msg_cb = sn_mt_only_accept_publish;
+    g_mt_only_race = &race;
+    mock_net_push(&g_mock, SN_PUBLISH_QOS1_FRAME,
+        (int)sizeof(SN_PUBLISH_QOS1_FRAME));
+    mock_net_push(&g_mock, SUBACK_FRAME, (int)sizeof(SUBACK_FRAME));
+
+    ASSERT_EQ(0, pthread_create(&subscribe_thread, NULL,
+        sn_mt_only_subscribe_thread, &race));
+    ASSERT_EQ(0, pthread_mutex_lock(&race.mutex));
+    while (!race.reader_waiting) {
+        ASSERT_EQ(0, pthread_cond_wait(&race.cond, &race.mutex));
+    }
+    ASSERT_EQ(0, pthread_mutex_unlock(&race.mutex));
+
+    ASSERT_EQ(0, pthread_create(&publish_thread, NULL,
+        sn_mt_only_publish_thread, &race));
+    ASSERT_EQ(0, pthread_mutex_lock(&race.mutex));
+    while (!race.incoming_delivered && !race.sync_error) {
+        ASSERT_EQ(0, pthread_cond_wait(&race.cond, &race.mutex));
+    }
+    ASSERT_EQ(0, clock_gettime(CLOCK_REALTIME, &deadline));
+    deadline.tv_sec++;
+    while (!race.subscribe_done && !race.sync_error && wait_rc == 0) {
+        wait_rc = pthread_cond_timedwait(&race.cond, &race.mutex, &deadline);
+    }
+    ASSERT_TRUE(wait_rc == 0 || wait_rc == ETIMEDOUT);
+    race.release_writer = 1;
+    ASSERT_EQ(0, pthread_cond_broadcast(&race.cond));
+    ASSERT_EQ(0, pthread_mutex_unlock(&race.mutex));
+
+    ASSERT_EQ(0, pthread_join(publish_thread, NULL));
+    ASSERT_EQ(0, pthread_join(subscribe_thread, NULL));
+    g_mt_only_race = NULL;
+
+    ASSERT_EQ(0, race.sync_error);
+    ASSERT_EQ(MQTT_CODE_SUCCESS, race.publish_rc);
+    ASSERT_EQ(MQTT_CODE_SUCCESS, race.subscribe_rc);
+    ASSERT_EQ(1, race.incoming_delivered);
+    ASSERT_EQ(0, race.subscribe_done_while_writer_active);
+    ASSERT_EQ(g_mock.in_count, g_mock.in_idx);
+    ASSERT_EQ(1, sn_mt_only_packet_count(&g_mock, SN_MSG_TYPE_SUBSCRIBE));
+    ASSERT_EQ(1, sn_mt_only_packet_count(&g_mock, SN_MSG_TYPE_PUBACK));
+    ASSERT_NO_PENDRESP();
+
+    ASSERT_EQ(0, pthread_cond_destroy(&race.cond));
+    ASSERT_EQ(0, pthread_mutex_destroy(&race.mutex));
+}
+#endif
+
+#ifndef WOLFMQTT_MULTITHREAD
+static int sn_st_nested_ping_callback(MqttClient* client, MqttMessage* msg,
+    byte msg_new, byte msg_done)
+{
+    (void)msg;
+    (void)msg_new;
+    (void)msg_done;
+    g_st_ping_callback_count++;
+    if (g_st_ping_callback_count == 1) {
+        g_st_nested_ping_rc = SN_Client_Ping(client, NULL);
+    }
+    return MQTT_CODE_SUCCESS;
+}
+
+/* The client-owned NULL-PING object must not be re-entered by an application
+ * callback while its outer PINGREQ/PINGRESP exchange is active. */
+TEST(sn_st_null_ping_rejects_callback_reentry)
+{
+    int rc;
+
+    ASSERT_EQ(MQTT_CODE_SUCCESS, sn_client_init(0));
+    g_st_nested_ping_rc = MQTT_CODE_SUCCESS;
+    g_st_ping_callback_count = 0;
+    g_client.msg_cb = sn_st_nested_ping_callback;
+    mock_net_push(&g_mock, SN_PUBLISH_QOS0_FRAME,
+        (int)sizeof(SN_PUBLISH_QOS0_FRAME));
+    mock_net_push(&g_mock, PINGRESP_FRAME, (int)sizeof(PINGRESP_FRAME));
+
+    rc = SN_Client_Ping(&g_client, NULL);
+
+    ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
+    ASSERT_EQ(1, g_st_ping_callback_count);
+    ASSERT_EQ(MQTT_CODE_CONTINUE, g_st_nested_ping_rc);
+    ASSERT_EQ(0, g_client.pingSN_busy);
+}
+#endif
+
+/* Automatic response retries can be needed after either a partial
+ * non-blocking write or multithreaded writer contention. */
+#if defined(WOLFMQTT_NONBLOCK) || defined(WOLFMQTT_MULTITHREAD)
+
+static int g_incoming_register_calls;
+static int sn_wait_message_pump(void);
+#ifdef WOLFMQTT_MULTITHREAD
+static int g_reentrant_send_rc;
+#endif
+
+#if defined(WOLFMQTT_NONBLOCK) || \
+    defined(WOLFMQTT_TEST_SN_MT_ONLY_THREADS)
+static int sn_accept_incoming_publish(MqttClient* client, MqttMessage* msg,
+    byte msg_new, byte msg_done)
+{
+    (void)client;
+    (void)msg;
+    (void)msg_new;
+    (void)msg_done;
+    g_incoming_publish_calls++;
+    return MQTT_CODE_SUCCESS;
+}
+#endif
+
+#if defined(WOLFMQTT_NONBLOCK) && \
+    !defined(WOLFMQTT_ALLOW_NODATA_UNLOCK)
+static int sn_accept_incoming_register(word16 topic_id, const char* topic_name,
+    void* ctx)
+{
+    (void)topic_id;
+    (void)topic_name;
+    (void)ctx;
+    g_incoming_register_calls++;
+    return MQTT_CODE_SUCCESS;
+}
+#endif
+
+#ifdef WOLFMQTT_TEST_SN_MT_ONLY_THREADS
+static int mqtt_mt_only_reentrant_publish_cb(MqttPublish* publish)
+{
+    MqttPing ping;
+
+    XMEMSET(&ping, 0, sizeof(ping));
+    g_mt_only_reentrant_send_rc = MqttClient_Ping_ex(&g_client, &ping);
+    XMEMSET(publish->buffer, 0x5A, publish->buffer_len);
+    return (int)publish->buffer_len;
+}
+
+/* A streaming PUBLISH owns lockSend while asking the application for the next
+ * payload chunk. A same-thread send from that callback must return CONTINUE,
+ * not wait forever on the non-recursive lock it already owns. Run the call in
+ * a child so the alarm turns any future deadlock into a bounded test failure. */
+TEST(mqtt_mt_only_stream_callback_reentrant_send_does_not_deadlock)
+{
+    pid_t child;
+    int status;
+
+    child = fork();
+    ASSERT_TRUE(child >= 0);
+    if (child == 0) {
+        MqttPublish publish;
+        byte payload = 0;
+        int rc;
+
+        (void)alarm(2);
+        rc = sn_client_init(0);
+        if (rc == MQTT_CODE_SUCCESS) {
+            XMEMSET(&publish, 0, sizeof(publish));
+            publish.topic_name = "reentrant/topic";
+            publish.qos = MQTT_QOS_0;
+            publish.buffer = &payload;
+            publish.buffer_len = sizeof(payload);
+            publish.total_len = sizeof(payload);
+            g_mt_only_reentrant_send_rc = MQTT_CODE_ERROR_SYSTEM;
+            rc = MqttClient_Publish_ex(&g_client, &publish,
+                mqtt_mt_only_reentrant_publish_cb);
+            MqttClient_DeInit(&g_client);
+        }
+        _exit((rc == MQTT_CODE_SUCCESS &&
+            g_mt_only_reentrant_send_rc == MQTT_CODE_CONTINUE) ? 0 : 1);
+    }
+
+    ASSERT_EQ(child, waitpid(child, &status, 0));
+    ASSERT_TRUE(WIFEXITED(status));
+    ASSERT_EQ(0, WEXITSTATUS(status));
+}
+
+static int mqtt_mt_only_reentrant_sn_wait_cb(MqttPublish* publish)
+{
+    g_mt_only_reentrant_wait_rc = SN_Client_WaitMessage(&g_client, 1000);
+    XMEMSET(publish->buffer, 0x5A, publish->buffer_len);
+    return (int)publish->buffer_len;
+}
+
+/* A blocking streaming callback already owns the client writer. Processing an
+ * incoming MQTT-SN PUBLISH from that callback must return without spinning
+ * when its automatic PUBACK cannot re-enter the same writer. */
+TEST(mqtt_mt_only_stream_callback_sn_wait_does_not_spin)
+{
+    pid_t child;
+    int status;
+
+    child = fork();
+    ASSERT_TRUE(child >= 0);
+    if (child == 0) {
+        MqttPublish publish;
+        byte payload = 0;
+        int rc;
+        int ok;
+
+        (void)alarm(2);
+        rc = sn_client_init(0);
+        if (rc != MQTT_CODE_SUCCESS) {
+            _exit(1);
+        }
+        g_client.msg_cb = sn_accept_incoming_publish;
+        g_incoming_publish_calls = 0;
+        g_mt_only_reentrant_wait_rc = MQTT_CODE_ERROR_SYSTEM;
+        mock_net_push(&g_mock, SN_PUBLISH_QOS1_FRAME,
+            (int)sizeof(SN_PUBLISH_QOS1_FRAME));
+        XMEMSET(&publish, 0, sizeof(publish));
+        publish.topic_name = "reentrant/topic";
+        publish.qos = MQTT_QOS_0;
+        publish.buffer = &payload;
+        publish.buffer_len = sizeof(payload);
+        publish.total_len = sizeof(payload);
+
+        rc = MqttClient_Publish_ex(&g_client, &publish,
+            mqtt_mt_only_reentrant_sn_wait_cb);
+        ok = rc == MQTT_CODE_SUCCESS &&
+            g_mt_only_reentrant_wait_rc == MQTT_CODE_CONTINUE &&
+            g_incoming_publish_calls == 1 && !g_client.read.isActive &&
+            !g_client.msgSN.publish.stat.isReadActive;
+        MqttClient_DeInit(&g_client);
+        _exit(ok ? 0 : 1);
+    }
+
+    ASSERT_EQ(child, waitpid(child, &status, 0));
+    ASSERT_TRUE(WIFEXITED(status));
+    ASSERT_EQ(0, WEXITSTATUS(status));
+}
+
+/* MQTT-SN 1.2 section 5.4.4 requires one application delivery and one PUBACK
+ * even when a blocking multithreaded transport reports an asynchronous
+ * continuation while writing the automatic response. */
+TEST(sn_mt_only_publish_blocks_through_async_auto_reply)
+{
+    int rc;
+
+    ASSERT_EQ(MQTT_CODE_SUCCESS, sn_client_init(0));
+    g_client.msg_cb = sn_accept_incoming_publish;
+    g_incoming_publish_calls = 0;
+    g_mock.write_continue_count = 1;
+    mock_net_push(&g_mock, SN_PUBLISH_QOS1_FRAME,
+        (int)sizeof(SN_PUBLISH_QOS1_FRAME));
+
+    rc = SN_Client_WaitMessage(&g_client, 1000);
+
+    ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
+    ASSERT_EQ(1, g_incoming_publish_calls);
+    ASSERT_EQ((int)sizeof(SN_PUBACK_FRAME), g_mock.out_len);
+    ASSERT_MEM_EQ(SN_PUBACK_FRAME, g_mock.out, sizeof(SN_PUBACK_FRAME));
+}
+#endif
+
+#ifdef WOLFMQTT_MULTITHREAD
+static int sn_send_from_incoming_publish(MqttClient* client, MqttMessage* msg,
+    byte msg_new, byte msg_done)
+{
+    SN_Publish publish;
+    word16 topic_id = SN_TEST_PUB_TOPIC_ID;
+
+    (void)msg;
+    (void)msg_new;
+    (void)msg_done;
+    g_incoming_publish_calls++;
+    sn_publish_setup(&publish, &topic_id, MQTT_QOS_0);
+    g_reentrant_send_rc = SN_Client_Publish(client, &publish);
+    return g_reentrant_send_rc;
+}
+
+static int sn_send_from_incoming_register(word16 topic_id,
+    const char* topic_name, void* ctx)
+{
+    MqttClient* client = (MqttClient*)ctx;
+    SN_Publish publish;
+    word16 publish_topic_id = SN_TEST_PUB_TOPIC_ID;
+
+    (void)topic_id;
+    (void)topic_name;
+    g_incoming_register_calls++;
+    sn_publish_setup(&publish, &publish_topic_id, MQTT_QOS_0);
+    g_reentrant_send_rc = SN_Client_Publish(client, &publish);
+    return g_reentrant_send_rc;
+}
+#endif
+
+static int sn_wait_message_pump(void)
+{
+    int rc = MQTT_CODE_CONTINUE;
+    int i;
+
+    for (i = 0; i < 20 && rc == MQTT_CODE_CONTINUE; i++) {
+        rc = SN_Client_WaitMessage(&g_client, 1000);
+    }
+    return rc;
+}
+
+/* MQTT-SN 1.2 section 5.4.4 requires a QoS 1 PUBLISH to receive PUBACK.
+ * A partial transport write must resume without delivering the PUBLISH twice. */
 #ifdef WOLFMQTT_NONBLOCK
+TEST(sn_publish_auto_reply_resumes_partial_write)
+{
+    int rc;
+
+    ASSERT_EQ(MQTT_CODE_SUCCESS, sn_client_init(0));
+    g_client.msg_cb = sn_accept_incoming_publish;
+    g_incoming_publish_calls = 0;
+    g_mock.write_chunk = 1;
+    mock_net_push(&g_mock, SN_PUBLISH_QOS1_FRAME,
+        (int)sizeof(SN_PUBLISH_QOS1_FRAME));
+
+    rc = sn_wait_message_pump();
+
+    ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
+    ASSERT_EQ(1, g_incoming_publish_calls);
+    ASSERT_EQ((int)sizeof(SN_PUBACK_FRAME), g_mock.out_len);
+    ASSERT_MEM_EQ(SN_PUBACK_FRAME, g_mock.out, sizeof(SN_PUBACK_FRAME));
+}
+#endif
+
+/* Reserve an unrelated writer before receiving a QoS 1 PUBLISH. Application
+ * delivery happens outside the response writer, then the retry must avoid
+ * replaying the callback while it waits to emit PUBACK. */
+#if defined(WOLFMQTT_MULTITHREAD) && defined(WOLFMQTT_NONBLOCK) && \
+    !defined(WOLFMQTT_ALLOW_NODATA_UNLOCK)
+TEST(sn_publish_busy_writer_does_not_replay_callback)
+{
+    MqttMsgStat busy_stat;
+    int rc;
+
+    ASSERT_EQ(MQTT_CODE_SUCCESS, sn_client_init(0));
+    XMEMSET(&busy_stat, 0, sizeof(busy_stat));
+    ASSERT_EQ(MQTT_CODE_SUCCESS, MqttWriteStart(&g_client, &busy_stat));
+    g_client.msg_cb = sn_accept_incoming_publish;
+    g_incoming_publish_calls = 0;
+    mock_net_push(&g_mock, SN_PUBLISH_QOS1_FRAME,
+        (int)sizeof(SN_PUBLISH_QOS1_FRAME));
+
+    rc = SN_Client_WaitMessage(&g_client, 1000);
+    ASSERT_EQ(MQTT_CODE_CONTINUE, rc);
+    ASSERT_EQ(1, g_incoming_publish_calls);
+    ASSERT_EQ(0, g_mock.out_len);
+
+    MqttWriteStop(&g_client, &busy_stat);
+    rc = sn_wait_message_pump();
+
+    ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
+    ASSERT_EQ(1, g_incoming_publish_calls);
+    ASSERT_EQ((int)sizeof(SN_PUBACK_FRAME), g_mock.out_len);
+    ASSERT_MEM_EQ(SN_PUBACK_FRAME, g_mock.out, sizeof(SN_PUBACK_FRAME));
+}
+#endif
+
+#ifdef WOLFMQTT_MULTITHREAD
+/* An incoming PUBLISH callback may itself send a QoS 0 PUBLISH. The automatic
+ * PUBACK writer must not hold lockSend across application code. */
+TEST(sn_publish_callback_can_send)
+{
+    int rc;
+
+    ASSERT_EQ(MQTT_CODE_SUCCESS, sn_client_init(0));
+    g_client.msg_cb = sn_send_from_incoming_publish;
+    g_incoming_publish_calls = 0;
+    g_reentrant_send_rc = MQTT_CODE_ERROR_SYSTEM;
+    mock_net_push(&g_mock, SN_PUBLISH_QOS1_FRAME,
+        (int)sizeof(SN_PUBLISH_QOS1_FRAME));
+
+    rc = sn_wait_message_pump();
+
+    ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
+    ASSERT_EQ(MQTT_CODE_SUCCESS, g_reentrant_send_rc);
+    ASSERT_EQ(1, g_incoming_publish_calls);
+    ASSERT_TRUE(g_mock.out_len > (int)sizeof(SN_PUBACK_FRAME));
+    ASSERT_EQ(SN_MSG_TYPE_PUBLISH, g_mock.out[1]);
+    ASSERT_MEM_EQ(SN_PUBACK_FRAME,
+        &g_mock.out[g_mock.out_len - (int)sizeof(SN_PUBACK_FRAME)],
+        sizeof(SN_PUBACK_FRAME));
+}
+#endif
+
+/* MQTT-SN 1.2 section 5.3.5 requires REGISTER to receive REGACK. */
+#ifdef WOLFMQTT_NONBLOCK
+TEST(sn_register_auto_reply_resumes_partial_write)
+{
+    int rc;
+
+    ASSERT_EQ(MQTT_CODE_SUCCESS, sn_client_init(0));
+    g_mock.write_chunk = 1;
+    mock_net_push(&g_mock, SN_REGISTER_FRAME, (int)sizeof(SN_REGISTER_FRAME));
+
+    rc = sn_wait_message_pump();
+
+    ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
+    ASSERT_EQ((int)sizeof(SN_REGACK_FRAME), g_mock.out_len);
+    ASSERT_MEM_EQ(SN_REGACK_FRAME, g_mock.out, sizeof(SN_REGACK_FRAME));
+}
+#endif
+
+/* REGISTER has the same callback-before-response ordering requirement: the
+ * callback runs once, then REGACK waits for the busy writer to be released. */
+#if defined(WOLFMQTT_MULTITHREAD) && defined(WOLFMQTT_NONBLOCK) && \
+    !defined(WOLFMQTT_ALLOW_NODATA_UNLOCK)
+TEST(sn_register_busy_writer_does_not_replay_callback)
+{
+    MqttMsgStat busy_stat;
+    int rc;
+
+    ASSERT_EQ(MQTT_CODE_SUCCESS, sn_client_init(0));
+    XMEMSET(&busy_stat, 0, sizeof(busy_stat));
+    ASSERT_EQ(MQTT_CODE_SUCCESS, MqttWriteStart(&g_client, &busy_stat));
+    ASSERT_EQ(MQTT_CODE_SUCCESS, SN_Client_SetRegisterCallback(&g_client,
+        sn_accept_incoming_register, NULL));
+    g_incoming_register_calls = 0;
+    mock_net_push(&g_mock, SN_REGISTER_FRAME, (int)sizeof(SN_REGISTER_FRAME));
+
+    rc = SN_Client_WaitMessage(&g_client, 1000);
+    ASSERT_EQ(MQTT_CODE_CONTINUE, rc);
+    ASSERT_EQ(1, g_incoming_register_calls);
+    ASSERT_EQ(0, g_mock.out_len);
+
+    MqttWriteStop(&g_client, &busy_stat);
+    rc = sn_wait_message_pump();
+
+    ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
+    ASSERT_EQ(1, g_incoming_register_calls);
+    ASSERT_EQ((int)sizeof(SN_REGACK_ACCEPTED_FRAME), g_mock.out_len);
+    ASSERT_MEM_EQ(SN_REGACK_ACCEPTED_FRAME, g_mock.out,
+        sizeof(SN_REGACK_ACCEPTED_FRAME));
+}
+#endif
+
+#ifdef WOLFMQTT_MULTITHREAD
+/* A REGISTER callback may also send through the same client; REGACK is encoded
+ * only after that nested send releases lockSend. */
+TEST(sn_register_callback_can_send)
+{
+    int rc;
+
+    ASSERT_EQ(MQTT_CODE_SUCCESS, sn_client_init(0));
+    ASSERT_EQ(MQTT_CODE_SUCCESS, SN_Client_SetRegisterCallback(&g_client,
+        sn_send_from_incoming_register, &g_client));
+    g_incoming_register_calls = 0;
+    g_reentrant_send_rc = MQTT_CODE_ERROR_SYSTEM;
+    mock_net_push(&g_mock, SN_REGISTER_FRAME, (int)sizeof(SN_REGISTER_FRAME));
+
+    rc = sn_wait_message_pump();
+
+    ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
+    ASSERT_EQ(MQTT_CODE_SUCCESS, g_reentrant_send_rc);
+    ASSERT_EQ(1, g_incoming_register_calls);
+    ASSERT_TRUE(g_mock.out_len > (int)sizeof(SN_REGACK_ACCEPTED_FRAME));
+    ASSERT_EQ(SN_MSG_TYPE_PUBLISH, g_mock.out[1]);
+    ASSERT_MEM_EQ(SN_REGACK_ACCEPTED_FRAME,
+        &g_mock.out[g_mock.out_len -
+            (int)sizeof(SN_REGACK_ACCEPTED_FRAME)],
+        sizeof(SN_REGACK_ACCEPTED_FRAME));
+}
+#endif
+
+/* MQTT-SN 1.2 section 5.4.11 requires PUBREC to receive PUBREL. */
+#ifdef WOLFMQTT_NONBLOCK
+TEST(sn_pubrec_auto_reply_resumes_partial_write)
+{
+    int rc;
+
+    ASSERT_EQ(MQTT_CODE_SUCCESS, sn_client_init(0));
+    g_mock.write_chunk = 1;
+    mock_net_push(&g_mock, SN_PUBREC_FRAME, (int)sizeof(SN_PUBREC_FRAME));
+
+    rc = sn_wait_message_pump();
+
+    ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
+    ASSERT_EQ((int)sizeof(SN_PUBREL_FRAME), g_mock.out_len);
+    ASSERT_MEM_EQ(SN_PUBREL_FRAME, g_mock.out, sizeof(SN_PUBREL_FRAME));
+}
+#endif
+
+#if defined(WOLFMQTT_MULTITHREAD) && defined(WOLFMQTT_NONBLOCK) && \
+    !defined(WOLFMQTT_ALLOW_NODATA_UNLOCK)
+/* A queued PUBREL must retain the decoded PUBREC while another operation owns
+ * the client writer. */
+TEST(sn_pubrec_auto_reply_resumes_after_busy_writer)
+{
+    MqttMsgStat busy_stat;
+    int rc;
+
+    ASSERT_EQ(MQTT_CODE_SUCCESS, sn_client_init(0));
+    XMEMSET(&busy_stat, 0, sizeof(busy_stat));
+    ASSERT_EQ(MQTT_CODE_SUCCESS, MqttWriteStart(&g_client, &busy_stat));
+    mock_net_push(&g_mock, SN_PUBREC_FRAME, (int)sizeof(SN_PUBREC_FRAME));
+
+    rc = SN_Client_WaitMessage(&g_client, 1000);
+    ASSERT_EQ(MQTT_CODE_CONTINUE, rc);
+    ASSERT_EQ(0, g_mock.out_len);
+
+    MqttWriteStop(&g_client, &busy_stat);
+    rc = sn_wait_message_pump();
+
+    ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
+    ASSERT_EQ((int)sizeof(SN_PUBREL_FRAME), g_mock.out_len);
+    ASSERT_MEM_EQ(SN_PUBREL_FRAME, g_mock.out, sizeof(SN_PUBREL_FRAME));
+}
+#endif
+
+/* MQTT-SN 1.2 section 5.10 requires PINGREQ to receive PINGRESP. */
+#ifdef WOLFMQTT_NONBLOCK
+TEST(sn_pingreq_auto_reply_resumes_zero_progress_write)
+{
+    int rc;
+
+    ASSERT_EQ(MQTT_CODE_SUCCESS, sn_client_init(0));
+    g_mock.write_zero_count = 1;
+    mock_net_push(&g_mock, SN_PINGREQ_FRAME, (int)sizeof(SN_PINGREQ_FRAME));
+
+    rc = sn_wait_message_pump();
+
+    ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
+    ASSERT_EQ((int)sizeof(SN_PINGRESP_FRAME), g_mock.out_len);
+    ASSERT_MEM_EQ(SN_PINGRESP_FRAME, g_mock.out, sizeof(SN_PINGRESP_FRAME));
+}
+#endif
+
+#if defined(WOLFMQTT_MULTITHREAD) && defined(WOLFMQTT_NONBLOCK) && \
+    defined(WOLFMQTT_ALLOW_NODATA_UNLOCK)
+/* A response write that transfers no bytes must release the shared writer so
+ * another operation can use the client before the response is retried. */
+TEST(sn_pingreq_zero_progress_releases_writer)
+{
+    MqttMsgStat other_stat;
+    SN_Publish publish;
+    word16 topic_id = SN_TEST_PUB_TOPIC_ID;
+    int rc;
+
+    ASSERT_EQ(MQTT_CODE_SUCCESS, sn_client_init(0));
+
+    /* A completed direct send leaves cumulative write.total populated because
+     * the MQTT-SN send path owns lockSend directly rather than using
+     * MqttWriteStop. The following response still starts with zero progress. */
+    sn_publish_setup(&publish, &topic_id, MQTT_QOS_0);
+    ASSERT_EQ(MQTT_CODE_SUCCESS, SN_Client_Publish(&g_client, &publish));
+    ASSERT_TRUE(g_client.write.total > 0);
+    g_mock.out_len = 0;
+
+    g_mock.write_zero_count = 1;
+    mock_net_push(&g_mock, SN_PINGREQ_FRAME, (int)sizeof(SN_PINGREQ_FRAME));
+
+    rc = SN_Client_WaitMessage(&g_client, 1000);
+    ASSERT_EQ(MQTT_CODE_CONTINUE, rc);
+    if (g_client.write.isActive ||
+            g_client.msgSN.pingReq.stat.isWriteActive) {
+        MqttWriteStop(&g_client, &g_client.msgSN.pingReq.stat);
+        MqttReadStop(&g_client, &g_client.msgSN.pingReq.stat);
+        FAIL("zero-progress automatic response retained the client writer");
+    }
+
+    XMEMSET(&other_stat, 0, sizeof(other_stat));
+    ASSERT_EQ(MQTT_CODE_SUCCESS, MqttWriteStart(&g_client, &other_stat));
+    MqttWriteStop(&g_client, &other_stat);
+
+    rc = sn_wait_message_pump();
+    ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
+    ASSERT_EQ((int)sizeof(SN_PINGRESP_FRAME), g_mock.out_len);
+    ASSERT_MEM_EQ(SN_PINGRESP_FRAME, g_mock.out,
+        sizeof(SN_PINGRESP_FRAME));
+}
+#endif
+
+#if defined(WOLFMQTT_MULTITHREAD) && defined(WOLFMQTT_NONBLOCK) && \
+    !defined(WOLFMQTT_ALLOW_NODATA_UNLOCK)
+/* PINGRESP generation must resume from the decoded PINGREQ once the current
+ * writer releases the client. */
+TEST(sn_pingreq_auto_reply_resumes_after_busy_writer)
+{
+    MqttMsgStat busy_stat;
+    int rc;
+
+    ASSERT_EQ(MQTT_CODE_SUCCESS, sn_client_init(0));
+    XMEMSET(&busy_stat, 0, sizeof(busy_stat));
+    ASSERT_EQ(MQTT_CODE_SUCCESS, MqttWriteStart(&g_client, &busy_stat));
+    mock_net_push(&g_mock, SN_PINGREQ_FRAME, (int)sizeof(SN_PINGREQ_FRAME));
+
+    rc = SN_Client_WaitMessage(&g_client, 1000);
+    ASSERT_EQ(MQTT_CODE_CONTINUE, rc);
+    ASSERT_EQ(0, g_mock.out_len);
+
+    MqttWriteStop(&g_client, &busy_stat);
+    rc = sn_wait_message_pump();
+
+    ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
+    ASSERT_EQ((int)sizeof(SN_PINGRESP_FRAME), g_mock.out_len);
+    ASSERT_MEM_EQ(SN_PINGRESP_FRAME, g_mock.out, sizeof(SN_PINGRESP_FRAME));
+}
+#endif
 
 /* The headline regression: with a CONTINUE armed before every gateway frame
  * the connect must still converge to SUCCESS and never surface BAD_ARG from a
  * duplicate pending-response add. */
+#ifdef WOLFMQTT_NONBLOCK
 TEST(sn_connect_lwt_nonblock_retry)
 {
     SN_Connect mc;
@@ -1421,19 +2509,14 @@ TEST(sn_unsubscribe_crossthread_unsuback_routing)
 
 #endif /* WOLFMQTT_NONBLOCK */
 
+#endif /* WOLFMQTT_NONBLOCK || WOLFMQTT_MULTITHREAD */
+
 /* ============================================================================
  * SN ping pending-response lifecycle tests (use-after-scope regression, #3132)
  *
- * SN_Client_Ping accepts a NULL 'ping' and falls back to a function-local
- * SN_PingReq (loc_ping) on the stack. Under WOLFMQTT_MULTITHREAD it registers
- * &ping->pendResp on client->firstPendResp. Under WOLFMQTT_NONBLOCK an in-flight
- * MQTT_CODE_CONTINUE used to be returned verbatim - which, for the NULL
- * fallback, left &loc_ping.pendResp linked on the respList after the stack frame
- * unwound. A later call reused the stack address, so the stale entry could be
- * dereferenced by the receive path (use-after-scope). The fix removes the entry
- * before any CONTINUE return for the NULL fallback, while a caller-owned object
- * (which persists across calls) still keeps its entry linked so it can resume.
- * These tests pin both halves of that contract.
+ * SN_Client_Ping accepts a NULL 'ping' and uses client-owned state. This keeps
+ * the pending-response entry valid across MQTT_CODE_CONTINUE and lets either a
+ * caller-owned or internal request resume safely. These tests pin both paths.
  * ============================================================================ */
 
 /* Happy path with a caller-owned ping: PINGRESP is immediately available. Runs
@@ -1477,17 +2560,58 @@ TEST(sn_ping_null_no_continue)
     ASSERT_NO_PENDRESP();
 }
 
+/* MQTT-SN 1.2 section 5.10 permits repeated PINGREQ/PINGRESP exchanges. The
+ * client-owned NULL-ping object must start each completed exchange cleanly. */
+TEST(sn_ping_null_consecutive_success)
+{
+    int rc;
+
+    ASSERT_EQ(MQTT_CODE_SUCCESS, sn_client_init(0));
+    mock_net_push(&g_mock, PINGRESP_FRAME, (int)sizeof(PINGRESP_FRAME));
+    mock_net_push(&g_mock, PINGRESP_FRAME, (int)sizeof(PINGRESP_FRAME));
+
+    rc = sn_ping_pump(NULL, NULL);
+    ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
+    rc = sn_ping_pump(NULL, NULL);
+
+    ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
+    ASSERT_EQ(2, g_mock.write_calls);
+    ASSERT_EQ(g_mock.in_count, g_mock.in_idx);
+    ASSERT_NO_PENDRESP();
+}
+
+/* A terminal malformed response also ends the current exchange. A later
+ * NULL-ping retry must reacquire lockRecv and consume a fresh PINGRESP. */
+TEST(sn_ping_null_recovers_after_malformed_response)
+{
+    int rc;
+    static const byte malformed_pingresp[] = {
+        0x03, SN_MSG_TYPE_PING_RESP, 0x00
+    };
+
+    ASSERT_EQ(MQTT_CODE_SUCCESS, sn_client_init(0));
+    mock_net_push(&g_mock, malformed_pingresp,
+        (int)sizeof(malformed_pingresp));
+    mock_net_push(&g_mock, PINGRESP_FRAME, (int)sizeof(PINGRESP_FRAME));
+
+    rc = sn_ping_pump(NULL, NULL);
+    ASSERT_EQ(MQTT_CODE_ERROR_MALFORMED_DATA, rc);
+    rc = sn_ping_pump(NULL, NULL);
+
+    ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
+    ASSERT_EQ(2, g_mock.write_calls);
+    ASSERT_EQ(g_mock.in_count, g_mock.in_idx);
+    ASSERT_NO_PENDRESP();
+}
+
 /* The non-blocking dangling-pointer regression only manifests under
  * WOLFMQTT_NONBLOCK (otherwise SN_Client_WaitType blocks and never returns
  * MQTT_CODE_CONTINUE, so the early-return path that leaked the entry is never
  * taken). */
 #ifdef WOLFMQTT_NONBLOCK
 
-/* The headline #3132 regression. With a CONTINUE armed before the PINGRESP, a
- * ping==NULL call returns in-flight while &loc_ping.pendResp would (pre-fix)
- * still be linked - a pointer into the now-dead stack frame. Under MULTITHREAD
- * this pins the dangling-pointer contract directly: after the in-flight CONTINUE
- * NO pending response may remain. The retry must still converge to SUCCESS. */
+/* With a CONTINUE armed before the PINGRESP, a NULL ping keeps its pending
+ * response in client-owned storage until the retry completes. */
 TEST(sn_ping_null_nonblock_no_dangling_pendresp)
 {
     int rc, iters = 0;
@@ -1496,16 +2620,14 @@ TEST(sn_ping_null_nonblock_no_dangling_pendresp)
 
     mock_net_push(&g_mock, PINGRESP_FRAME, (int)sizeof(PINGRESP_FRAME));
 
-    /* First call sends PINGREQ and the armed CONTINUE forces an in-flight return
-     * before the PINGRESP is delivered. With ping==NULL the request is built on
-     * a stack-local SN_PingReq that does not survive this return. */
+    /* First call sends PINGREQ and returns before PINGRESP is delivered. */
     rc = SN_Client_Ping(&g_client, NULL);
     ASSERT_EQ(MQTT_CODE_CONTINUE, rc);
+    ASSERT_EQ(0, g_client.pingSN_busy);
 #ifdef WOLFMQTT_MULTITHREAD
-    /* Pre-fix &loc_ping.pendResp was left linked on the client respList here and
-     * dangled once SN_Client_Ping returned. The fix removes it before the
-     * CONTINUE return for the NULL fallback, so no entry may remain. */
-    ASSERT_NULL(g_client.firstPendResp);
+    ASSERT_NOT_NULL(g_client.firstPendResp);
+    ASSERT_EQ((void*)&g_client.pingSN.pendResp,
+        (void*)g_client.firstPendResp);
 #endif
 
     /* A correct non-blocking caller keeps retrying until the ping resolves. */
@@ -1727,11 +2849,51 @@ int main(int argc, char** argv)
     RUN_TEST(sn_publish_incoming_null_msg_cb_errors_no_ack);
     RUN_TEST(sn_ping_no_continue);
     RUN_TEST(sn_ping_null_no_continue);
+    RUN_TEST(sn_ping_null_consecutive_success);
+    RUN_TEST(sn_ping_null_recovers_after_malformed_response);
     RUN_TEST(sn_packet_read_bounds_fixed_header);
     RUN_TEST(sn_packet_read_rejects_header_past_buffer);
     RUN_TEST(sn_nondtls_reads_full_frames);
+#ifdef WOLFMQTT_TEST_SN_MT_ONLY_THREADS
+    RUN_TEST(sn_mt_only_callback_continue_releases_reader);
+    RUN_TEST(sn_mt_only_concurrent_null_ping_preserves_pending_response);
+    RUN_TEST(sn_subscribe_waits_for_mt_only_automatic_reply_writer);
+    RUN_TEST(sn_mt_only_publish_blocks_through_async_auto_reply);
+    RUN_TEST(sn_mt_only_subscribe_blocks_through_async_auto_reply);
+    RUN_TEST(mqtt_mt_only_stream_callback_reentrant_send_does_not_deadlock);
+    RUN_TEST(mqtt_mt_only_stream_callback_sn_wait_does_not_spin);
+#endif
+#ifndef WOLFMQTT_MULTITHREAD
+    RUN_TEST(sn_st_null_ping_rejects_callback_reentry);
+#endif
 
-    /* The non-blocking retry regression only exists under WOLFMQTT_NONBLOCK. */
+    /* Partial transport writes are specific to non-blocking builds. */
+#ifdef WOLFMQTT_NONBLOCK
+    RUN_TEST(sn_publish_auto_reply_resumes_partial_write);
+    RUN_TEST(sn_register_auto_reply_resumes_partial_write);
+    RUN_TEST(sn_pubrec_auto_reply_resumes_partial_write);
+    RUN_TEST(sn_pingreq_auto_reply_resumes_zero_progress_write);
+#endif
+
+#if defined(WOLFMQTT_MULTITHREAD) && defined(WOLFMQTT_NONBLOCK) && \
+    defined(WOLFMQTT_ALLOW_NODATA_UNLOCK)
+    RUN_TEST(sn_pingreq_zero_progress_releases_writer);
+#endif
+
+    /* Writer-contention retries exist in multithreaded builds even when the
+     * transport itself is blocking. */
+#ifdef WOLFMQTT_MULTITHREAD
+    #if defined(WOLFMQTT_NONBLOCK) && \
+        !defined(WOLFMQTT_ALLOW_NODATA_UNLOCK)
+    RUN_TEST(sn_publish_busy_writer_does_not_replay_callback);
+    RUN_TEST(sn_register_busy_writer_does_not_replay_callback);
+    RUN_TEST(sn_pubrec_auto_reply_resumes_after_busy_writer);
+    RUN_TEST(sn_pingreq_auto_reply_resumes_after_busy_writer);
+    #endif
+    RUN_TEST(sn_publish_callback_can_send);
+    RUN_TEST(sn_register_callback_can_send);
+#endif
+
 #ifdef WOLFMQTT_NONBLOCK
     RUN_TEST(sn_connect_lwt_nonblock_retry);
     RUN_TEST(sn_connect_lwt_many_continues);
