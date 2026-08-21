@@ -6167,6 +6167,22 @@ static int BrokerHandle_Connect(BrokerClient* bc, int rx_len,
             if (id_len > 0) {
                 BROKER_STORE_STR(bc->client_id, mc.client_id, id_len,
                     BROKER_MAX_CLIENT_ID_LEN);
+                if (!BROKER_STR_VALID(bc->client_id)) {
+                    WBLOG_ERR(broker,
+                        "broker: client_id store failed sock=%d",
+                        (int)bc->sock);
+                #ifdef WOLFMQTT_V5
+                    if (mc.protocol_level >= MQTT_CONNECT_PROTOCOL_LEVEL_5) {
+                        ack.return_code = MQTT_REASON_SERVER_UNAVAILABLE;
+                    }
+                    else
+                #endif
+                    {
+                        ack.return_code =
+                            MQTT_CONNECT_ACK_CODE_REFUSED_UNAVAIL;
+                    }
+                    goto send_connack;
+                }
             }
         }
     }

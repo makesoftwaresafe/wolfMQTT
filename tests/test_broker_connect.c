@@ -503,6 +503,72 @@ TEST(connect_v311_nonempty_clean0_accepted)
     MqttBroker_Free(&broker);
 }
 
+#ifndef WOLFMQTT_STATIC_MEMORY
+TEST(connect_v311_client_id_alloc_failure_refused)
+{
+    MqttBroker broker;
+    MqttBrokerNet net;
+    static const byte connect[] = {
+        0x10, 14,
+        0x00, 0x04, 'M', 'Q', 'T', 'T',
+        0x04, 0x02, 0x00, 0x3C,
+        0x00, 0x02, 'i', 'd'
+    };
+
+    install_mock_net(&net);
+    XMEMSET(&broker, 0, sizeof(broker));
+    ASSERT_EQ(MQTT_CODE_SUCCESS, MqttBroker_Init(&broker, &net));
+    ASSERT_EQ(MQTT_CODE_SUCCESS, MqttBroker_Start(&broker));
+
+    reset_mock_state(connect, sizeof(connect));
+    /* Client object and its two I/O buffers precede ClientId storage. */
+    broker_test_fail_alloc_after(3);
+    run_broker_one_connect(&broker);
+    broker_test_disable_alloc_failure();
+
+    ASSERT_EQ(1, g_alloc_failure_count);
+    ASSERT_TRUE(g_out_len >= 4);
+    ASSERT_EQ(MQTT_CONNECT_ACK_CODE_REFUSED_UNAVAIL, g_out_buf[3]);
+    ASSERT_TRUE(g_client_closed);
+
+    MqttBroker_Stop(&broker);
+    MqttBroker_Free(&broker);
+}
+
+#ifdef WOLFMQTT_V5
+TEST(connect_v5_client_id_alloc_failure_refused)
+{
+    MqttBroker broker;
+    MqttBrokerNet net;
+    static const byte connect[] = {
+        0x10, 15,
+        0x00, 0x04, 'M', 'Q', 'T', 'T',
+        0x05, 0x02, 0x00, 0x3C,
+        0x00,
+        0x00, 0x02, 'i', 'd'
+    };
+
+    install_mock_net(&net);
+    XMEMSET(&broker, 0, sizeof(broker));
+    ASSERT_EQ(MQTT_CODE_SUCCESS, MqttBroker_Init(&broker, &net));
+    ASSERT_EQ(MQTT_CODE_SUCCESS, MqttBroker_Start(&broker));
+
+    reset_mock_state(connect, sizeof(connect));
+    broker_test_fail_alloc_after(3);
+    run_broker_one_connect(&broker);
+    broker_test_disable_alloc_failure();
+
+    ASSERT_EQ(1, g_alloc_failure_count);
+    ASSERT_TRUE(g_out_len >= 5);
+    ASSERT_EQ(MQTT_REASON_SERVER_UNAVAILABLE, g_out_buf[3]);
+    ASSERT_TRUE(g_client_closed);
+
+    MqttBroker_Stop(&broker);
+    MqttBroker_Free(&broker);
+}
+#endif
+#endif
+
 /* The broker reserves the "auto-" prefix for server-assigned IDs. An
  * explicit client_id starting with "auto-" must be refused, otherwise an
  * attacker could observe their own assigned ID, predict a future value, and
@@ -7036,6 +7102,12 @@ int main(int argc, char** argv)
     RUN_TEST(connect_v311_emptyid_clean0_refused);
     RUN_TEST(connect_v311_emptyid_clean1_accepted);
     RUN_TEST(connect_v311_nonempty_clean0_accepted);
+#ifndef WOLFMQTT_STATIC_MEMORY
+    RUN_TEST(connect_v311_client_id_alloc_failure_refused);
+#ifdef WOLFMQTT_V5
+    RUN_TEST(connect_v5_client_id_alloc_failure_refused);
+#endif
+#endif
     RUN_TEST(connect_v311_explicit_auto_prefix_refused);
     RUN_TEST(connect_unsupported_level_3_refused);
     RUN_TEST(connect_unsupported_level_6_refused);
