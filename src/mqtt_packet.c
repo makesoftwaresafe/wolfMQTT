@@ -1893,6 +1893,15 @@ int MqttDecode_Connect(byte *rx_buf, int rx_buf_len, MqttConnect *mc_connect)
             rc = MQTT_TRACE_ERROR(MQTT_CODE_ERROR_OUT_OF_BUFFER);
             goto cleanup;
         }
+        /* [MQTT-3.1.3.3] Will Topic is a non-empty Topic Name. */
+        if (mc_connect->lwt_msg->topic_name_len == 0 ||
+                !MqttPacket_TopicNameValid(
+                    mc_connect->lwt_msg->topic_name,
+                    mc_connect->lwt_msg->topic_name_len,
+                    mc_connect->protocol_level)) {
+            rc = MQTT_TRACE_ERROR(MQTT_CODE_ERROR_MALFORMED_DATA);
+            goto cleanup;
+        }
         rx_payload += tmp;
 
         {

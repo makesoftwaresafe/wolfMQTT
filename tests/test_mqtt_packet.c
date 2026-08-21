@@ -3247,6 +3247,60 @@ TEST(decode_connect_will_topic_contains_u0000_rejected)
     ASSERT_EQ(MQTT_CODE_ERROR_MALFORMED_DATA, rc);
 }
 
+/* [MQTT-3.1.3.3] / [MQTT-4.7.1-1]: the Will Topic is a Topic Name and
+ * cannot contain wildcard characters. This fixture carries "sport/#". */
+TEST(decode_connect_will_topic_wildcard_rejected)
+{
+    byte buf[] = {
+        0x10, 0x1B,                         /* CONNECT, remain_len = 27 */
+        0x00, 0x04, 'M', 'Q', 'T', 'T',
+        0x04,
+        0x06,                               /* clean | will_flag */
+        0x00, 0x3C,
+        0x00, 0x03, 'c', 'i', 'd',
+        0x00, 0x07, 's', 'p', 'o', 'r', 't', '/', '#',
+        0x00, 0x01, 'm'
+    };
+    MqttConnect dec;
+    MqttMessage lwt;
+    int rc;
+
+    XMEMSET(&dec, 0, sizeof(dec));
+    XMEMSET(&lwt, 0, sizeof(lwt));
+    dec.lwt_msg = &lwt;
+    rc = MqttDecode_Connect(buf, (int)sizeof(buf), &dec);
+    ASSERT_EQ(MQTT_CODE_ERROR_MALFORMED_DATA, rc);
+}
+
+#ifdef WOLFMQTT_V5
+/* [MQTT-4.7.3-1]: a Will Topic must contain at least one character.
+ * Topic Alias does not apply to the CONNECT Will Topic. */
+TEST(decode_connect_v5_empty_will_topic_rejected)
+{
+    byte buf[] = {
+        0x10, 0x16,                         /* CONNECT, remain_len = 22 */
+        0x00, 0x04, 'M', 'Q', 'T', 'T',
+        0x05,
+        0x06,                               /* clean | will_flag */
+        0x00, 0x3C,
+        0x00,                               /* CONNECT properties length */
+        0x00, 0x03, 'c', 'i', 'd',
+        0x00,                               /* Will properties length */
+        0x00, 0x00,                         /* empty Will Topic */
+        0x00, 0x01, 'm'
+    };
+    MqttConnect dec;
+    MqttMessage lwt;
+    int rc;
+
+    XMEMSET(&dec, 0, sizeof(dec));
+    XMEMSET(&lwt, 0, sizeof(lwt));
+    dec.lwt_msg = &lwt;
+    rc = MqttDecode_Connect(buf, (int)sizeof(buf), &dec);
+    ASSERT_EQ(MQTT_CODE_ERROR_MALFORMED_DATA, rc);
+}
+#endif
+
 /* [MQTT-3.1.2-22] If the User Name Flag is 0, the Password Flag MUST be 0.
  * The encoder already enforces this; the decoder must too. Wire is
  * flags 0x42 = clean_session | password, with client_id "cid" followed
@@ -6020,6 +6074,7 @@ void run_mqtt_packet_tests(void)
     RUN_TEST(decode_connect_will_qos3_rejected);
     RUN_TEST(decode_connect_will_topic_invalid_utf8_rejected);
     RUN_TEST(decode_connect_will_topic_contains_u0000_rejected);
+    RUN_TEST(decode_connect_will_topic_wildcard_rejected);
     RUN_TEST(decode_connect_password_flag_without_username_flag_rejected);
     RUN_TEST(decode_connect_trailing_garbage_rejected);
 #ifdef WOLFMQTT_V5
@@ -6029,6 +6084,7 @@ void run_mqtt_packet_tests(void)
     RUN_TEST(decode_connect_v5_max_packet_size_zero_rejected);
     RUN_TEST(decode_connect_v5_auth_data_without_auth_method_rejected);
     RUN_TEST(decode_connect_v5_will_props_session_expiry_rejected);
+    RUN_TEST(decode_connect_v5_empty_will_topic_rejected);
 #endif
 
     /* MqttDecode_Subscribe */
