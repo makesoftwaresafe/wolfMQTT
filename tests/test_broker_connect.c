@@ -57,6 +57,7 @@ static int g_alloc_fail_after = -1;
 static int g_alloc_failure_count;
 static int g_alloc_success_count;
 static int g_alloc_free_count;
+static unsigned long g_broker_time_s;
 static size_t g_capture_alloc_size;
 static void* g_capture_alloc_ptr;
 static byte g_capture_freed[64];
@@ -100,6 +101,11 @@ void wolfmqtt_test_broker_free(void* ptr)
         }
     }
     free(ptr);
+}
+
+unsigned long wolfmqtt_test_broker_time_s(void)
+{
+    return g_broker_time_s;
 }
 
 static void broker_test_fail_alloc_after(int successful_allocations)
@@ -342,7 +348,7 @@ static void run_broker_one_connect(MqttBroker* broker)
     }
 }
 
-static void setup(void)    { }
+static void setup(void)    { g_broker_time_s = 0; }
 static void teardown(void) { }
 
 /* -------------------------------------------------------------------------- */
@@ -2998,6 +3004,40 @@ TEST(pingreq_nonzero_remain_len_closes_no_pingresp)
 
     ASSERT_EQ(0, count_packets_of_type(g_out_buf, g_out_len,
         MQTT_PACKET_TYPE_PING_RESP));
+    ASSERT_TRUE(g_client_closed);
+
+    MqttBroker_Stop(&broker);
+    MqttBroker_Free(&broker);
+}
+
+TEST(broker_keepalive_expires_at_exact_deadline)
+{
+    MqttBroker broker;
+    MqttBrokerNet net;
+    static const byte connect[] = {
+        0x10, 14,
+        0x00, 0x04, 'M', 'Q', 'T', 'T',
+        0x04, 0x02,
+        0x00, 0x02,
+        0x00, 0x02, 'i', 'd'
+    };
+
+    install_mock_net(&net);
+    XMEMSET(&broker, 0, sizeof(broker));
+    ASSERT_EQ(MQTT_CODE_SUCCESS, MqttBroker_Init(&broker, &net));
+    ASSERT_EQ(MQTT_CODE_SUCCESS, MqttBroker_Start(&broker));
+
+    reset_mock_state(connect, sizeof(connect));
+    run_broker_one_connect(&broker);
+    ASSERT_FALSE(g_client_closed);
+
+    g_broker_time_s = 2;
+    (void)MqttBroker_Step(&broker);
+    ASSERT_FALSE(g_client_closed);
+
+    /* Keep Alive 2 has an exact 1.5x deadline at tick 3. */
+    g_broker_time_s = 3;
+    (void)MqttBroker_Step(&broker);
     ASSERT_TRUE(g_client_closed);
 
     MqttBroker_Stop(&broker);
@@ -7172,6 +7212,7 @@ int main(int argc, char** argv)
 #endif
     RUN_TEST(pingreq_valid_emits_pingresp);
     RUN_TEST(pingreq_nonzero_remain_len_closes_no_pingresp);
+    RUN_TEST(broker_keepalive_expires_at_exact_deadline);
 #ifndef WOLFMQTT_V5
     RUN_TEST(disconnect_v311_nonzero_remain_len_fires_will);
 #endif

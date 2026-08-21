@@ -12,6 +12,7 @@
 
 void* wolfmqtt_test_broker_malloc(size_t size);
 void wolfmqtt_test_broker_free(void* ptr);
+unsigned long wolfmqtt_test_broker_time_s(void);
 
 #define WOLFMQTT_MALLOC(size) wolfmqtt_test_broker_malloc((size))
 #define WOLFMQTT_FREE(ptr)    wolfmqtt_test_broker_free((ptr))

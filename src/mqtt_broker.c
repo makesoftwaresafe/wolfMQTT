@@ -8469,8 +8469,12 @@ check_timeouts:
     /* Check keepalive timeout (MQTT spec 3.1.2.10: 1.5x keep alive) */
     if (bc->keep_alive_sec > 0) {
         WOLFMQTT_BROKER_TIME_T now = WOLFMQTT_BROKER_GET_TIME_S();
-        if (now >= bc->last_rx && (now - bc->last_rx) >
-            (WOLFMQTT_BROKER_TIME_T)(bc->keep_alive_sec * 3 / 2)) {
+        WOLFMQTT_BROKER_TIME_T deadline = (WOLFMQTT_BROKER_TIME_T)
+            (((word32)bc->keep_alive_sec * 3u + 1u) / 2u);
+
+        /* Enforce the first whole-second tick at or past 1.5x
+         * [MQTT-3.1.2-24] and MQTT v5 [MQTT-3.1.2-22]. */
+        if (now >= bc->last_rx && (now - bc->last_rx) >= deadline) {
             WBLOG_ERR(broker, "broker: keepalive timeout sock=%d", (int)bc->sock);
         #ifdef WOLFMQTT_V5
         #ifndef WOLFMQTT_STATIC_MEMORY
