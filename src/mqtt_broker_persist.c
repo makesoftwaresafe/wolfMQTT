@@ -209,6 +209,8 @@ static WC_INLINE int wmqb_read_header(const byte* buf, word32 buf_len,
 }
 
 #ifdef WOLFMQTT_BROKER_PERSIST_ENCRYPT
+static void wmqb_force_zero(void* mem, word32 len);
+
 /* Lazy-init key cache. Single-threaded broker - no lock needed. The
  * application-provided derive_key hook fills 32 bytes on first request.
  * The cache lives on the MqttBroker (broker->persist_key_cache /
@@ -230,6 +232,8 @@ static int wmqb_get_key(MqttBroker* broker)
     }
     if (h->derive_key(h->ctx, broker->persist_key_cache,
             (word32)sizeof(broker->persist_key_cache)) != 0) {
+        wmqb_force_zero(broker->persist_key_cache,
+            (word32)sizeof(broker->persist_key_cache));
         return MQTT_CODE_ERROR_SYSTEM;
     }
     broker->persist_key_loaded = 1;

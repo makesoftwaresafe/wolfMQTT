@@ -5968,6 +5968,50 @@ typedef struct PersistIterCapture {
     int calls;
 } PersistIterCapture;
 
+#ifdef WOLFMQTT_BROKER_PERSIST_ENCRYPT
+static int persist_test_put_noop(void* ctx, byte ns, const byte* key,
+    word16 key_len, const byte* blob, word32 blob_len)
+{
+    (void)ctx;
+    (void)ns;
+    (void)key;
+    (void)key_len;
+    (void)blob;
+    (void)blob_len;
+    return MQTT_CODE_SUCCESS;
+}
+
+static int persist_test_derive_partial_failure(void* ctx, byte* out_key,
+    word32 key_len)
+{
+    (void)ctx;
+    XMEMSET(out_key, 0xA5, key_len / 2);
+    return MQTT_CODE_ERROR_SYSTEM;
+}
+
+TEST(persist_failed_key_derivation_scrubs_cache)
+{
+    MqttBroker broker;
+    MqttBrokerPersistHooks hooks;
+    int rc;
+    word32 i;
+
+    XMEMSET(&broker, 0, sizeof(broker));
+    XMEMSET(&hooks, 0, sizeof(hooks));
+    hooks.kv_put = persist_test_put_noop;
+    hooks.derive_key = persist_test_derive_partial_failure;
+    ASSERT_EQ(MQTT_CODE_SUCCESS, MqttBroker_SetPersistHooks(&broker, &hooks));
+
+    rc = BrokerPersist_PutOrphanSession(&broker, "client", 4, 60,
+        (WOLFMQTT_BROKER_TIME_T)1);
+    ASSERT_EQ(MQTT_CODE_ERROR_SYSTEM, rc);
+    ASSERT_EQ(0, broker.persist_key_loaded);
+    for (i = 0; i < (word32)sizeof(broker.persist_key_cache); i++) {
+        ASSERT_EQ(0, broker.persist_key_cache[i]);
+    }
+}
+#endif /* WOLFMQTT_BROKER_PERSIST_ENCRYPT */
+
 static int persist_test_iter_cb(const byte* key, word16 key_len,
     const byte* blob, word32 blob_len, void* ctx)
 {
@@ -6447,6 +6491,9 @@ int main(int argc, char** argv)
     RUN_TEST(persist_root_readable_permissions_accepted);
     RUN_TEST(persist_root_writable_permissions_rejected);
     RUN_TEST(persist_put_rejects_existing_temp_symlink);
+#ifdef WOLFMQTT_BROKER_PERSIST_ENCRYPT
+    RUN_TEST(persist_failed_key_derivation_scrubs_cache);
+#endif
 #endif
     TEST_SUITE_END();
 
