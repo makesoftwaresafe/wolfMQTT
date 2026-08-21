@@ -12,8 +12,19 @@ tests_unit_tests_CPPFLAGS     = -I$(top_srcdir) $(AM_CPPFLAGS)
 tests_unit_tests_LDADD        = src/libwolfmqtt.la
 tests_unit_tests_DEPENDENCIES = src/libwolfmqtt.la
 
+# Property-lock lifecycle tests. Build mqtt_packet.c directly with injected
+# semaphore functions so initialization failures are deterministic on every
+# supported host platform.
+check_PROGRAMS += tests/test_mqtt_props_init
+tests_test_mqtt_props_init_SOURCES = \
+    tests/test_mqtt_props_init.c \
+    src/mqtt_packet.c
+tests_test_mqtt_props_init_CPPFLAGS = -I$(top_srcdir) \
+    -include $(top_srcdir)/tests/test_mqtt_props_config.h $(AM_CPPFLAGS)
+
 # Test framework headers
-noinst_HEADERS += tests/unit_test.h tests/test_broker_alloc.h
+noinst_HEADERS += tests/unit_test.h tests/test_broker_alloc.h \
+                  tests/test_mqtt_props_config.h
 
 # MQTT-SN packet decoder tests. The SN_Decode_* routines are WOLFMQTT_LOCAL
 # (hidden) so they cannot be linked from libwolfmqtt; src/mqtt_sn_packet.c is

@@ -4096,7 +4096,9 @@ int MqttProps_Init(void)
     if (clientPropStack_lockInit == 0) {
         ret = wm_SemInit(&clientPropStack_lock);
     }
-    clientPropStack_lockInit++;
+    if (ret == MQTT_CODE_SUCCESS) {
+        clientPropStack_lockInit++;
+    }
 #endif
     return  ret;
 }
@@ -4108,9 +4110,11 @@ int MqttProps_ShutDown(void)
 {
     int ret = MQTT_CODE_SUCCESS;
 #if !defined(WOLFMQTT_DYN_PROP) && defined(WOLFMQTT_MULTITHREAD)
-    clientPropStack_lockInit--;
-    if (clientPropStack_lockInit == 0) {
-        ret = wm_SemFree(&clientPropStack_lock);
+    if (clientPropStack_lockInit > 0) {
+        clientPropStack_lockInit--;
+        if (clientPropStack_lockInit == 0) {
+            ret = wm_SemFree(&clientPropStack_lock);
+        }
     }
 #endif
     return ret;
