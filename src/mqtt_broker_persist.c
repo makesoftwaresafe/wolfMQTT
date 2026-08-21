@@ -358,12 +358,14 @@ static int wmqb_decrypt_blob(MqttBroker* broker,
     XMEMCPY(out, ct, WMQB_HDR_LEN);
 
     if (wc_AesInit(&aes, NULL, INVALID_DEVID) != 0) {
+        wmqb_force_zero(out, *plain_out_len);
         WOLFMQTT_FREE(out);
         return MQTT_CODE_ERROR_SYSTEM;
     }
     if (wc_AesGcmSetKey(&aes, broker->persist_key_cache,
             (word32)sizeof(broker->persist_key_cache)) != 0) {
         wc_AesFree(&aes);
+        wmqb_force_zero(out, *plain_out_len);
         WOLFMQTT_FREE(out);
         return MQTT_CODE_ERROR_SYSTEM;
     }
@@ -375,6 +377,7 @@ static int wmqb_decrypt_blob(MqttBroker* broker,
             WMQB_GCM_TAG_LEN,
             ct, WMQB_HDR_LEN) != 0) {
         wc_AesFree(&aes);
+        wmqb_force_zero(out, *plain_out_len);
         WOLFMQTT_FREE(out);
         return MQTT_CODE_ERROR_MALFORMED_DATA;
     }

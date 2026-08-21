@@ -57,6 +57,11 @@ static int g_alloc_fail_after = -1;
 static int g_alloc_failure_count;
 static int g_alloc_success_count;
 static int g_alloc_free_count;
+static size_t g_capture_alloc_size;
+static void* g_capture_alloc_ptr;
+static byte g_capture_freed[64];
+static size_t g_capture_freed_len;
+static int g_capture_free_seen;
 
 void* wolfmqtt_test_broker_malloc(size_t size)
 {
@@ -73,6 +78,12 @@ void* wolfmqtt_test_broker_malloc(size_t size)
     ptr = malloc(size);
     if (ptr != NULL) {
         g_alloc_success_count++;
+        if (g_capture_alloc_size == size &&
+                size <= sizeof(g_capture_freed) &&
+                g_capture_alloc_ptr == NULL) {
+            g_capture_alloc_ptr = ptr;
+            XMEMSET(ptr, 0xA5, size);
+        }
     }
     return ptr;
 }
@@ -81,6 +92,12 @@ void wolfmqtt_test_broker_free(void* ptr)
 {
     if (ptr != NULL) {
         g_alloc_free_count++;
+        if (ptr == g_capture_alloc_ptr) {
+            g_capture_freed_len = g_capture_alloc_size;
+            XMEMCPY(g_capture_freed, ptr, g_capture_freed_len);
+            g_capture_free_seen = 1;
+            g_capture_alloc_ptr = NULL;
+        }
     }
     free(ptr);
 }
@@ -94,6 +111,21 @@ static void broker_test_fail_alloc_after(int successful_allocations)
 static void broker_test_disable_alloc_failure(void)
 {
     g_alloc_fail_after = -1;
+}
+
+static void broker_test_capture_free(size_t allocation_size)
+{
+    g_capture_alloc_size = allocation_size;
+    g_capture_alloc_ptr = NULL;
+    g_capture_freed_len = 0;
+    g_capture_free_seen = 0;
+    XMEMSET(g_capture_freed, 0, sizeof(g_capture_freed));
+}
+
+static void broker_test_disable_free_capture(void)
+{
+    g_capture_alloc_size = 0;
+    g_capture_alloc_ptr = NULL;
 }
 
 /* Mock socket constants */
@@ -5989,6 +6021,32 @@ static int persist_test_derive_partial_failure(void* ctx, byte* out_key,
     return MQTT_CODE_ERROR_SYSTEM;
 }
 
+static int persist_test_derive_success(void* ctx, byte* out_key,
+    word32 key_len)
+{
+    (void)ctx;
+    XMEMSET(out_key, 0x11, key_len);
+    return MQTT_CODE_SUCCESS;
+}
+
+static int persist_test_get_bad_tag(void* ctx, byte ns, const byte* key,
+    word16 key_len, byte* out, word32* inout_len)
+{
+    const word32 encrypted_meta_len = 44;
+
+    (void)ctx;
+    (void)ns;
+    (void)key;
+    (void)key_len;
+    if (out == NULL || inout_len == NULL ||
+            *inout_len < encrypted_meta_len) {
+        return MQTT_CODE_ERROR_OUT_OF_BUFFER;
+    }
+    XMEMSET(out, 0xA5, encrypted_meta_len);
+    *inout_len = encrypted_meta_len;
+    return MQTT_CODE_SUCCESS;
+}
+
 TEST(persist_failed_key_derivation_scrubs_cache)
 {
     MqttBroker broker;
@@ -6008,6 +6066,34 @@ TEST(persist_failed_key_derivation_scrubs_cache)
     ASSERT_EQ(0, broker.persist_key_loaded);
     for (i = 0; i < (word32)sizeof(broker.persist_key_cache); i++) {
         ASSERT_EQ(0, broker.persist_key_cache[i]);
+    }
+}
+
+TEST(persist_bad_tag_scrubs_plaintext_before_free)
+{
+    MqttBroker broker;
+    MqttBrokerPersistHooks hooks;
+    int rc;
+    int capture_seen;
+    size_t i;
+
+    XMEMSET(&broker, 0, sizeof(broker));
+    XMEMSET(&hooks, 0, sizeof(hooks));
+    hooks.kv_get = persist_test_get_bad_tag;
+    hooks.derive_key = persist_test_derive_success;
+    ASSERT_EQ(MQTT_CODE_SUCCESS, MqttBroker_SetPersistHooks(&broker, &hooks));
+
+    /* 44 encrypted META bytes decode into a 16-byte plaintext allocation. */
+    broker_test_capture_free(16);
+    rc = BrokerPersist_Restore(&broker);
+    capture_seen = g_capture_free_seen;
+    broker_test_disable_free_capture();
+
+    ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
+    ASSERT_TRUE(capture_seen);
+    ASSERT_EQ(16, g_capture_freed_len);
+    for (i = 0; i < g_capture_freed_len; i++) {
+        ASSERT_EQ(0, g_capture_freed[i]);
     }
 }
 #endif /* WOLFMQTT_BROKER_PERSIST_ENCRYPT */
@@ -6493,6 +6579,7 @@ int main(int argc, char** argv)
     RUN_TEST(persist_put_rejects_existing_temp_symlink);
 #ifdef WOLFMQTT_BROKER_PERSIST_ENCRYPT
     RUN_TEST(persist_failed_key_derivation_scrubs_cache);
+    RUN_TEST(persist_bad_tag_scrubs_plaintext_before_free);
 #endif
 #endif
     TEST_SUITE_END();
