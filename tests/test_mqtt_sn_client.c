@@ -807,6 +807,40 @@ TEST(sn_willmsgupd_scrubbed_on_response_registration_error)
 }
 #endif /* WOLFMQTT_MULTITHREAD */
 
+#ifdef WOLFMQTT_MULTITHREAD
+/* A malformed response reaches the shared-object reset after its header is
+ * decoded, but fails before the response decoder assigns return_code. Both
+ * response layouts therefore expose whether reset cleared that field. */
+TEST(sn_will_response_reset_clears_return_code)
+{
+    static const byte frames[][2] = {
+        { 0x02, SN_MSG_TYPE_WILLTOPICRESP },
+        { 0x02, SN_MSG_TYPE_WILLMSGRESP }
+    };
+    int i;
+
+    ASSERT_EQ(MQTT_CODE_SUCCESS, sn_client_init(0));
+
+    for (i = 0; i < (int)(sizeof(frames) / sizeof(frames[0])); i++) {
+        int rc;
+
+        XMEMSET(&g_client.msgSN, 0xA5, sizeof(g_client.msgSN));
+        XMEMSET(&g_client.msgSN.willTopicResp.stat, 0,
+            sizeof(g_client.msgSN.willTopicResp.stat));
+        mock_net_push(&g_mock, frames[i], (int)sizeof(frames[i]));
+
+        rc = SN_Client_WaitMessage(&g_client, 1000);
+        ASSERT_EQ(MQTT_CODE_ERROR_MALFORMED_DATA, rc);
+        if (frames[i][1] == SN_MSG_TYPE_WILLTOPICRESP) {
+            ASSERT_EQ(0, g_client.msgSN.willTopicResp.return_code);
+        }
+        else {
+            ASSERT_EQ(0, g_client.msgSN.willMsgResp.return_code);
+        }
+    }
+}
+#endif /* WOLFMQTT_MULTITHREAD */
+
 /* ============================================================================
  * SN subscribe pending-response lifecycle tests
  *
@@ -1577,17 +1611,18 @@ TEST(sn_packet_read_bounds_fixed_header)
     int rx_len;
     int rc;
 
+    ASSERT_EQ(MQTT_CODE_SUCCESS, sn_client_init(0));
+
     for (datagram = 0; datagram <= 1; datagram++) {
         for (frame_idx = 0; frame_idx < 2; frame_idx++) {
             for (rx_len = 1; rx_len <= 4; rx_len++) {
-                XMEMSET(&g_client, 0, sizeof(g_client));
+                XMEMSET(&g_client.packet, 0, sizeof(g_client.packet));
                 mock_net_init(&g_mock, &g_net, 0);
                 mock_net_push(&g_mock, frames[frame_idx],
                     frame_lens[frame_idx]);
-                g_client.net = &g_net;
-                if (datagram) {
-                    g_client.flags = MQTT_CLIENT_FLAG_IS_DTLS;
-                }
+                (void)MqttClient_Flags(&g_client,
+                    MQTT_CLIENT_FLAG_IS_DTLS,
+                    datagram ? MQTT_CLIENT_FLAG_IS_DTLS : 0);
                 XMEMSET(guarded, 0xA5, sizeof(guarded));
 
                 rc = SN_Packet_Read(&g_client, &guarded[1], rx_len, 0);
@@ -1610,10 +1645,7 @@ TEST(sn_packet_read_rejects_header_past_buffer)
     byte guarded[6];
     int rc;
 
-    XMEMSET(&g_client, 0, sizeof(g_client));
-    mock_net_init(&g_mock, &g_net, 0);
-    g_client.net = &g_net;
-    g_client.flags = MQTT_CLIENT_FLAG_IS_DTLS;
+    ASSERT_EQ(MQTT_CODE_SUCCESS, sn_client_init(0));
     g_client.packet.stat = MQTT_PK_READ_HEAD;
     g_client.packet.header_len = 5;
     XMEMSET(guarded, 0xA5, sizeof(guarded));
@@ -1684,6 +1716,7 @@ int main(int argc, char** argv)
     RUN_TEST(sn_willmsgupd_payload_scrubbed_on_write_error);
 #ifdef WOLFMQTT_MULTITHREAD
     RUN_TEST(sn_willmsgupd_scrubbed_on_response_registration_error);
+    RUN_TEST(sn_will_response_reset_clears_return_code);
 #endif
     RUN_TEST(sn_subscribe_no_continue);
     RUN_TEST(sn_subscribe_rejected);

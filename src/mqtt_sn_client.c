@@ -574,13 +574,15 @@ static void MqttSNClient_PacketReset(SN_MsgType packet_type, void* packet_obj)
         #endif
             break;
         case SN_MSG_TYPE_WILLTOPICUPD:
-        case SN_MSG_TYPE_WILLTOPICRESP:
         case SN_MSG_TYPE_WILLMSGUPD:
-        case SN_MSG_TYPE_WILLMSGRESP:
             objSz = sizeof(SN_Will);
         #ifdef WOLFMQTT_MULTITHREAD
             offset += sizeof(MqttPendResp);
         #endif
+            break;
+        case SN_MSG_TYPE_WILLTOPICRESP:
+        case SN_MSG_TYPE_WILLMSGRESP:
+            objSz = sizeof(SN_WillTopicResp);
             break;
         case SN_MSG_TYPE_ENCAPMSG:
         case SN_MSG_TYPE_ANY:
