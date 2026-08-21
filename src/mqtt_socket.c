@@ -96,10 +96,6 @@ int MqttSocket_Init(MqttClient *client, MqttNet *net)
 {
     int rc = MQTT_CODE_ERROR_BAD_ARG;
     if (client) {
-    #ifdef ENABLE_MQTT_CURL
-        curl_global_init(CURL_GLOBAL_DEFAULT);
-    #endif
-
         client->net = net;
         MqttClient_Flags(client, (MQTT_CLIENT_FLAG_IS_CONNECTED |
             MQTT_CLIENT_FLAG_IS_TLS), 0);;
@@ -112,6 +108,15 @@ int MqttSocket_Init(MqttClient *client, MqttNet *net)
 
         /* Validate callbacks are not null! */
         if (net && net->connect && net->read && net->write && net->disconnect) {
+        #ifdef ENABLE_MQTT_CURL
+            if (!client->curl_initialized) {
+                CURLcode curl_rc = curl_global_init(CURL_GLOBAL_DEFAULT);
+                if (curl_rc != CURLE_OK) {
+                    return MQTT_TRACE_ERROR(MQTT_CODE_ERROR_CURL);
+                }
+                client->curl_initialized = 1;
+            }
+        #endif
             rc = MQTT_CODE_SUCCESS;
         }
     }
@@ -579,7 +584,10 @@ int MqttSocket_Disconnect(MqttClient *client)
         MqttClient_Flags(client, MQTT_CLIENT_FLAG_IS_CONNECTED, 0);
 
     #ifdef ENABLE_MQTT_CURL
-        curl_global_cleanup();
+        if (client->curl_initialized) {
+            curl_global_cleanup();
+            client->curl_initialized = 0;
+        }
     #endif
     }
 #ifdef WOLFMQTT_DEBUG_SOCKET

@@ -245,6 +245,9 @@ typedef struct _MqttClient {
     int          rx_buf_len;
 
     MqttNet     *net;   /* Pointer to network callbacks and context */
+#ifdef ENABLE_MQTT_CURL
+    byte         curl_initialized; /* Owns one curl global init reference. */
+#endif
 #ifdef ENABLE_MQTT_TLS
     MqttTls      tls;   /* WolfSSL context for TLS */
 #endif

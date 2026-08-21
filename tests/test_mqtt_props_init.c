@@ -20,6 +20,12 @@ static int sem_pending_completions;
 static int ping_read_calls;
 static int ping_disconnect_calls;
 
+#ifdef ENABLE_MQTT_CURL
+    #define TEST_CLIENT_LOCK_COUNT 4
+#else
+    #define TEST_CLIENT_LOCK_COUNT 3
+#endif
+
 static void reset_sem_state(void)
 {
     sem_init_calls = 0;
@@ -258,7 +264,8 @@ static int test_failed_client_free_retried(void)
     sem_fail_free_on_call = 0;
     MqttClient_DeInit(&client);
 
-    if ((sem_free_attempts != 5) || (sem_free_calls != 4) ||
+    if ((sem_free_attempts != TEST_CLIENT_LOCK_COUNT + 2) ||
+            (sem_free_calls != TEST_CLIENT_LOCK_COUNT + 1) ||
             (sem_invalid_free_calls != 0)) {
         fprintf(stderr,
             "free retry made %d attempts, %d successes and %d invalid frees\n",
@@ -299,16 +306,16 @@ static int test_repeated_client_deinit_preserves_property_owner(void)
     }
     MqttClient_DeInit(&client);
 
-    if (sem_free_calls != 3) {
+    if (sem_free_calls != TEST_CLIENT_LOCK_COUNT) {
         fprintf(stderr, "repeat deinit freed another client's property lock\n");
         (void)MqttProps_ShutDown();
         return 1;
     }
 
     (void)MqttProps_ShutDown();
-    if (sem_free_calls != 4) {
-        fprintf(stderr, "property owner cleanup freed %d locks, expected 4\n",
-            sem_free_calls);
+    if (sem_free_calls != TEST_CLIENT_LOCK_COUNT + 1) {
+        fprintf(stderr, "property owner cleanup freed %d locks, expected %d\n",
+            sem_free_calls, TEST_CLIENT_LOCK_COUNT + 1);
         return 1;
     }
 

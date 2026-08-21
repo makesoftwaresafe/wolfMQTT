@@ -29,9 +29,20 @@ tests_test_mqtt_props_init_SOURCES = \
 tests_test_mqtt_props_init_CPPFLAGS = -I$(top_srcdir) \
     -include $(top_srcdir)/tests/test_mqtt_props_config.h $(AM_CPPFLAGS)
 
+# libcurl global lifecycle tests. Compile mqtt_socket.c directly so the test
+# can inject deterministic curl_global_init/cleanup results.
+if HAVE_LIBCURL
+check_PROGRAMS += tests/test_mqtt_curl_init
+tests_test_mqtt_curl_init_SOURCES = \
+    tests/test_mqtt_curl_init.c \
+    src/mqtt_socket.c
+tests_test_mqtt_curl_init_CPPFLAGS = -I$(top_srcdir) \
+    -include $(top_srcdir)/tests/test_mqtt_curl_config.h $(AM_CPPFLAGS)
+endif
+
 # Test framework headers
 noinst_HEADERS += tests/unit_test.h tests/test_broker_alloc.h \
-                  tests/test_mqtt_props_config.h
+                  tests/test_mqtt_props_config.h tests/test_mqtt_curl_config.h
 
 # MQTT-SN packet decoder tests. The SN_Decode_* routines are WOLFMQTT_LOCAL
 # (hidden) so they cannot be linked from libwolfmqtt; src/mqtt_sn_packet.c is
