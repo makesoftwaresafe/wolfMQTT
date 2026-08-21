@@ -67,6 +67,13 @@ WOLFMQTT_LOCAL void MqttClient_ForceZero(void* mem, word32 len)
 
 /* Private functions */
 
+#ifdef WOLFMQTT_MULTITHREAD
+    #define MQTT_CLIENT_INIT_LOCK_SEND   0x01U
+    #define MQTT_CLIENT_INIT_LOCK_RECV   0x02U
+    #define MQTT_CLIENT_INIT_LOCK_CLIENT 0x04U
+    #define MQTT_CLIENT_INIT_LOCK_CURL   0x08U
+#endif
+
 /* forward declarations */
 static int MqttClient_Publish_ReadPayload(MqttClient* client,
     MqttPublish* publish, int timeout_ms);
@@ -2029,16 +2036,28 @@ int MqttClient_Init(MqttClient *client, MqttNet* net,
 #ifdef WOLFMQTT_MULTITHREAD
     if (rc == 0) {
         rc = wm_SemInit(&client->lockSend);
+        if (rc == 0) {
+            client->init_flags |= MQTT_CLIENT_INIT_LOCK_SEND;
+        }
     }
     if (rc == 0) {
         rc = wm_SemInit(&client->lockRecv);
+        if (rc == 0) {
+            client->init_flags |= MQTT_CLIENT_INIT_LOCK_RECV;
+        }
     }
     if (rc == 0) {
         rc = wm_SemInit(&client->lockClient);
+        if (rc == 0) {
+            client->init_flags |= MQTT_CLIENT_INIT_LOCK_CLIENT;
+        }
     }
     #ifdef ENABLE_MQTT_CURL
     if (rc == 0) {
         rc = wm_SemInit(&client->lockCURL);
+        if (rc == 0) {
+            client->init_flags |= MQTT_CLIENT_INIT_LOCK_CURL;
+        }
     }
     #endif
 #endif
@@ -2060,12 +2079,28 @@ void MqttClient_DeInit(MqttClient *client)
 {
     if (client != NULL) {
 #ifdef WOLFMQTT_MULTITHREAD
-        (void)wm_SemFree(&client->lockSend);
-        (void)wm_SemFree(&client->lockRecv);
-        (void)wm_SemFree(&client->lockClient);
     #ifdef ENABLE_MQTT_CURL
-        (void)wm_SemFree(&client->lockCURL);
+        if ((client->init_flags & MQTT_CLIENT_INIT_LOCK_CURL) != 0U) {
+            if (wm_SemFree(&client->lockCURL) == MQTT_CODE_SUCCESS) {
+                client->init_flags &= (byte)~MQTT_CLIENT_INIT_LOCK_CURL;
+            }
+        }
     #endif
+        if ((client->init_flags & MQTT_CLIENT_INIT_LOCK_CLIENT) != 0U) {
+            if (wm_SemFree(&client->lockClient) == MQTT_CODE_SUCCESS) {
+                client->init_flags &= (byte)~MQTT_CLIENT_INIT_LOCK_CLIENT;
+            }
+        }
+        if ((client->init_flags & MQTT_CLIENT_INIT_LOCK_RECV) != 0U) {
+            if (wm_SemFree(&client->lockRecv) == MQTT_CODE_SUCCESS) {
+                client->init_flags &= (byte)~MQTT_CLIENT_INIT_LOCK_RECV;
+            }
+        }
+        if ((client->init_flags & MQTT_CLIENT_INIT_LOCK_SEND) != 0U) {
+            if (wm_SemFree(&client->lockSend) == MQTT_CODE_SUCCESS) {
+                client->init_flags &= (byte)~MQTT_CLIENT_INIT_LOCK_SEND;
+            }
+        }
 #endif
 #ifdef WOLFMQTT_V5
         (void)MqttProps_ShutDown();

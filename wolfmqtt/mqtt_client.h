@@ -279,6 +279,7 @@ typedef struct _MqttClient {
     void          *property_ctx;
 #endif
 #ifdef WOLFMQTT_MULTITHREAD
+    byte   init_flags; /* Internal resource-initialization flags. */
     wm_Sem lockSend;
     wm_Sem lockRecv;
     wm_Sem lockClient;
