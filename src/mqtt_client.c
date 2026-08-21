@@ -1851,6 +1851,17 @@ wait_again:
     /* Record whether the failure came from decoding/handling received data;
      * a local ack-encode failure below must not tear down a healthy link. */
     recvFatal = (rc < 0);
+    if (recvFatal && MqttClient_IsFatalProtoError(rc)) {
+        if (mms_stat->isWriteActive) {
+            CLIENT_FORCE_ZERO(client->tx_buf, client->tx_buf_len);
+            MqttWriteStop(client, mms_stat);
+        }
+        /* The cleanup below releases lockRecv. Reset the wait state with it so
+         * a later reuse cannot bypass MqttReadStart and read without the lock. */
+        mms_stat->read = MQTT_MSG_BEGIN;
+        mms_stat->ack = MQTT_MSG_BEGIN;
+        goto read_cleanup;
+    }
 
     switch (mms_stat->ack)
     {
@@ -1939,6 +1950,11 @@ wait_again:
     }
 #endif
 
+read_cleanup:
+    if (recvFatal && MqttClient_IsFatalProtoError(rc)) {
+        /* Scrub decoded peer data before releasing lockRecv. */
+        CLIENT_FORCE_ZERO(client->rx_buf, client->rx_buf_len);
+    }
     MqttReadStop(client, mms_stat);
 
 #ifdef WOLFMQTT_NONBLOCK

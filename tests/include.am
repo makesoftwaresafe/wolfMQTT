@@ -4,13 +4,18 @@
 
 # Unit tests
 check_PROGRAMS += tests/unit_tests
-tests_unit_tests_SOURCES      = tests/unit_test.c \
-                                tests/test_framework.c \
-                                tests/test_mqtt_packet.c \
-                                tests/test_mqtt_client.c
-tests_unit_tests_CPPFLAGS     = -I$(top_srcdir) $(AM_CPPFLAGS)
-tests_unit_tests_LDADD        = src/libwolfmqtt.la
-tests_unit_tests_DEPENDENCIES = src/libwolfmqtt.la
+tests_unit_tests_SOURCES = \
+    tests/unit_test.c \
+    tests/test_framework.c \
+    tests/test_mqtt_packet.c \
+    tests/test_mqtt_client.c \
+    src/mqtt_client.c \
+    src/mqtt_packet.c \
+    src/mqtt_socket.c \
+    src/mqtt_sn_client.c \
+    src/mqtt_sn_packet.c
+tests_unit_tests_CPPFLAGS = -I$(top_srcdir) $(AM_CPPFLAGS)
+tests_unit_tests_LDADD = $(PTHREAD_LIBS)
 
 # Property-lock lifecycle tests. Build mqtt_packet.c directly with injected
 # semaphore functions so initialization failures are deterministic on every

@@ -96,6 +96,15 @@ static int mock_net_read_wouldblock(void *context, byte* buf, int buf_len,
     (void)context; (void)buf; (void)buf_len; (void)timeout_ms;
     return MQTT_CODE_CONTINUE;
 }
+
+#ifdef WOLFMQTT_V5
+static int mock_net_write_wouldblock(void *context, const byte* buf,
+    int buf_len, int timeout_ms)
+{
+    (void)context; (void)buf; (void)buf_len; (void)timeout_ms;
+    return MQTT_CODE_CONTINUE;
+}
+#endif
 #endif
 
 static int test_client_inited;
@@ -1321,6 +1330,10 @@ static void drive_fatal_proto_teardown(const byte* frame, int frame_len,
     ASSERT_EQ(expected_rc, rc);
     ASSERT_EQ(0, (int)(MqttClient_Flags(&test_client, 0, 0) &
                        MQTT_CLIENT_FLAG_IS_CONNECTED));
+    /* A terminal receive error releases lockRecv and must also reset the wait
+     * object so its next use starts by reacquiring that lock. */
+    ASSERT_EQ(MQTT_MSG_BEGIN, test_client.msg.stat.read);
+    ASSERT_EQ(0, test_client.msg.stat.isReadActive);
 }
 
 /* An unexpected client-only packet type (CONNECT) arriving from the peer is a
@@ -1337,6 +1350,7 @@ TEST(wait_message_fatal_packet_type_clears_is_connected)
  * Method is a fatal PROPERTY error and must clear IS_CONNECTED. */
 TEST(wait_message_fatal_property_clears_is_connected)
 {
+    int i;
     /* AUTH, remain=6, reason=0x18 (Continue Auth), prop_len=4,
      * AUTH_DATA(0x16)="x" with no Auth Method. */
     static const byte frame[] = {
@@ -1344,7 +1358,61 @@ TEST(wait_message_fatal_property_clears_is_connected)
     };
     drive_fatal_proto_teardown(frame, (int)sizeof(frame),
         MQTT_CODE_ERROR_PROPERTY);
+    for (i = 0; i < TEST_RX_BUF_SIZE; i++) {
+        ASSERT_EQ(0, test_rx_buf[i]);
+    }
 }
+
+#ifdef WOLFMQTT_NONBLOCK
+TEST(wait_message_fatal_property_pending_ack_scrubs_rx_buf)
+{
+    MqttMsgStat next_stat;
+    int rc;
+    int i;
+    static const byte frame[] = {
+        0xF0, 0x06, 0x18, 0x04, 0x16, 0x00, 0x01, 'x'
+    };
+
+    ASSERT_EQ(MQTT_CODE_SUCCESS, test_init_client());
+    test_client.protocol_level = MQTT_CONNECT_PROTOCOL_LEVEL_5;
+    test_net.write = mock_net_write_wouldblock;
+    test_net.read = mock_net_read_canned;
+    XMEMCPY(g_canned_buf, frame, sizeof(frame));
+    g_canned_len = (int)sizeof(frame);
+    g_canned_pos = 0;
+
+    test_client.packetAck.packet_type = MQTT_PACKET_TYPE_PUBLISH_ACK;
+    test_client.packetAck.packet_id = 1;
+    test_client.packetAck.protocol_level = MQTT_CONNECT_PROTOCOL_LEVEL_5;
+
+    ASSERT_EQ(MQTT_CODE_SUCCESS,
+        MqttWriteStart(&test_client, &test_client.msg.stat));
+    rc = MqttEncode_PublishResp(test_client.tx_buf, test_client.tx_buf_len,
+        test_client.packetAck.packet_type, &test_client.packetAck);
+    ASSERT_TRUE(rc > 0);
+    test_client.write.len = rc;
+    test_client.msg.stat.ack = MQTT_MSG_HEADER;
+    ASSERT_EQ(MQTT_CODE_CONTINUE,
+        MqttPacket_Write(&test_client, test_client.tx_buf,
+            test_client.write.len));
+
+    rc = MqttClient_WaitMessage(&test_client, TEST_CMD_TIMEOUT_MS);
+    ASSERT_EQ(MQTT_CODE_ERROR_PROPERTY, rc);
+    ASSERT_EQ(0, test_client.msg.stat.isWriteActive);
+    ASSERT_EQ(0, test_client.write.isActive);
+    ASSERT_EQ(MQTT_MSG_BEGIN, test_client.msg.stat.ack);
+    for (i = 0; i < TEST_RX_BUF_SIZE; i++) {
+        ASSERT_EQ(0, test_rx_buf[i]);
+    }
+    for (i = 0; i < TEST_TX_BUF_SIZE; i++) {
+        ASSERT_EQ(0, test_tx_buf[i]);
+    }
+
+    XMEMSET(&next_stat, 0, sizeof(next_stat));
+    ASSERT_EQ(MQTT_CODE_SUCCESS, MqttWriteStart(&test_client, &next_stat));
+    MqttWriteStop(&test_client, &next_stat);
+}
+#endif
 #endif /* WOLFMQTT_V5 */
 
 #ifdef WOLFMQTT_V5
@@ -3576,6 +3644,80 @@ static int test_accept_message_cb(MqttClient* client, MqttMessage* msg,
     return MQTT_CODE_SUCCESS;
 }
 
+#ifdef WOLFMQTT_NONBLOCK
+static int g_partial_vbi_read_step;
+static byte g_partial_vbi_publish[131];
+
+static int mock_net_read_partial_vbi_timeout(void* context, byte* buf,
+    int buf_len, int timeout_ms)
+{
+    (void)context;
+    (void)timeout_ms;
+
+    switch (g_partial_vbi_read_step++) {
+        case 0:
+            if (buf_len != 2) {
+                return MQTT_CODE_ERROR_NETWORK;
+            }
+            XMEMCPY(buf, g_partial_vbi_publish, 2);
+            return 2;
+        case 1:
+            return MQTT_CODE_CONTINUE;
+        case 2:
+            return MQTT_CODE_ERROR_TIMEOUT;
+        case 3:
+            if (buf_len != 1) {
+                return MQTT_CODE_ERROR_NETWORK;
+            }
+            buf[0] = g_partial_vbi_publish[2];
+            return 1;
+        case 4:
+            if (buf_len != 128) {
+                return MQTT_CODE_ERROR_NETWORK;
+            }
+            XMEMCPY(buf, &g_partial_vbi_publish[3], 128);
+            return 128;
+        default:
+            return MQTT_CODE_CONTINUE;
+    }
+}
+
+/* A transport timeout is resumable and must not destroy a partially received
+ * MQTT fixed header. The fixture is a v3.1.1 QoS 0 PUBLISH whose Remaining
+ * Length is the two-byte VBI 0x80 0x01 (128). The mock pauses after 0x80,
+ * times out on the first retry, then supplies the rest of the fixed packet. */
+TEST(wait_message_timeout_preserves_partial_vbi)
+{
+    int rc;
+
+    XMEMSET(g_partial_vbi_publish, 'x', sizeof(g_partial_vbi_publish));
+    g_partial_vbi_publish[0] = 0x30;
+    g_partial_vbi_publish[1] = 0x80;
+    g_partial_vbi_publish[2] = 0x01;
+    g_partial_vbi_publish[3] = 0x00;
+    g_partial_vbi_publish[4] = 0x02;
+    g_partial_vbi_publish[5] = 'a';
+    g_partial_vbi_publish[6] = 'b';
+
+    ASSERT_EQ(MQTT_CODE_SUCCESS, test_init_client());
+#ifdef WOLFMQTT_V5
+    test_client.protocol_level = MQTT_CONNECT_PROTOCOL_LEVEL_4;
+#endif
+    test_client.msg_cb = test_accept_message_cb;
+    test_net.read = mock_net_read_partial_vbi_timeout;
+    g_partial_vbi_read_step = 0;
+    g_msg_cb_calls = 0;
+
+    rc = MqttClient_WaitMessage(&test_client, TEST_CMD_TIMEOUT_MS);
+    ASSERT_EQ(MQTT_CODE_CONTINUE, rc);
+    rc = MqttClient_WaitMessage(&test_client, TEST_CMD_TIMEOUT_MS);
+    ASSERT_EQ(MQTT_CODE_ERROR_TIMEOUT, rc);
+    rc = MqttClient_WaitMessage(&test_client, TEST_CMD_TIMEOUT_MS);
+
+    ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
+    ASSERT_EQ(1, g_msg_cb_calls);
+}
+#endif /* WOLFMQTT_NONBLOCK */
 /* Positive control for #6217: with a real msg_cb registered, an incoming QoS 1
  * PUBLISH must still be delivered to the callback AND acknowledged with a
  * PUBACK. The no-callback error is gated on msg_cb == NULL, so the normal
@@ -4662,6 +4804,9 @@ void run_mqtt_client_tests(void)
     RUN_TEST(wait_message_v5_props_null_msg_cb_frees_props);
 #endif
     RUN_TEST(wait_message_qos1_with_msg_cb_delivers_and_acks);
+#ifdef WOLFMQTT_NONBLOCK
+    RUN_TEST(wait_message_timeout_preserves_partial_vbi);
+#endif
     RUN_TEST(wait_message_qos0_publish_no_ack);
     RUN_TEST(wait_message_qos1_publish_acks_puback);
     RUN_TEST(wait_message_qos2_publish_acks_pubrec);
@@ -4679,6 +4824,9 @@ void run_mqtt_client_tests(void)
     RUN_TEST(wait_message_fatal_packet_type_clears_is_connected);
 #ifdef WOLFMQTT_V5
     RUN_TEST(wait_message_fatal_property_clears_is_connected);
+#ifdef WOLFMQTT_NONBLOCK
+    RUN_TEST(wait_message_fatal_property_pending_ack_scrubs_rx_buf);
+#endif
 #endif
 
 #ifndef WOLFMQTT_NO_TIME
