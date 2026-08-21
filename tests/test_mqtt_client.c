@@ -26,6 +26,13 @@
 #include "wolfmqtt/mqtt_client.h"
 #include "tests/unit_test.h"
 
+#if defined(WOLFMQTT_MULTITHREAD) && \
+    (defined(__MACH__) || defined(WOLFMQTT_POSIX_SEMAPHORES))
+    #include <errno.h>
+    #include <pthread.h>
+    #include <time.h>
+#endif
+
 void run_mqtt_client_tests(void);
 
 /* ============================================================================
@@ -1797,6 +1804,209 @@ TEST(ping_null_client)
     rc = MqttClient_Ping(NULL);
     ASSERT_EQ(MQTT_CODE_ERROR_BAD_ARG, rc);
 }
+
+static int mock_net_read_ping_timeout(void *context, byte* buf, int buf_len,
+    int timeout_ms)
+{
+    (void)context;
+    (void)buf;
+    (void)buf_len;
+    (void)timeout_ms;
+    return MQTT_CODE_ERROR_TIMEOUT;
+}
+
+TEST(ping_response_timeout_disconnects_network)
+{
+    int rc;
+
+    rc = test_init_client();
+    ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
+
+    (void)MqttClient_Flags(&test_client, 0, MQTT_CLIENT_FLAG_IS_CONNECTED);
+    g_disconnect_calls = 0;
+    g_frames_written = 0;
+    test_net.write = mock_net_write_accept;
+    test_net.read = mock_net_read_ping_timeout;
+    test_net.disconnect = mock_net_disconnect_counting;
+
+    rc = MqttClient_Ping(&test_client);
+
+    ASSERT_EQ(MQTT_CODE_ERROR_TIMEOUT, rc);
+    ASSERT_EQ(1, g_frames_written);
+    ASSERT_EQ(1, g_disconnect_calls);
+    ASSERT_EQ(0, (int)(MqttClient_Flags(&test_client, 0, 0) &
+                       MQTT_CLIENT_FLAG_IS_CONNECTED));
+}
+
+#if defined(WOLFMQTT_MULTITHREAD) && \
+    (defined(__MACH__) || defined(WOLFMQTT_POSIX_SEMAPHORES))
+typedef struct PingTimeoutRaceCtx {
+    pthread_mutex_t mutex;
+    pthread_cond_t cond;
+    MqttPublish publish;
+    byte payload;
+    int read_waiting;
+    int writer_active;
+    int disconnect_calls;
+    int disconnect_during_write;
+    int sync_error;
+    int ping_rc;
+    int publish_rc;
+} PingTimeoutRaceCtx;
+
+static int mock_net_write_ping_timeout_race(void *context, const byte* buf,
+    int buf_len, int timeout_ms)
+{
+    PingTimeoutRaceCtx* race = (PingTimeoutRaceCtx*)context;
+    struct timespec deadline;
+    int wait_rc = 0;
+
+    (void)timeout_ms;
+    if (buf_len > 0 && (buf[0] >> 4) == MQTT_PACKET_TYPE_PING_REQ) {
+        return buf_len;
+    }
+
+    if (pthread_mutex_lock(&race->mutex) != 0) {
+        race->sync_error = 1;
+        return MQTT_CODE_ERROR_SYSTEM;
+    }
+    race->writer_active = 1;
+    if (pthread_cond_broadcast(&race->cond) != 0 ||
+            clock_gettime(CLOCK_REALTIME, &deadline) != 0) {
+        race->sync_error = 1;
+        race->writer_active = 0;
+        (void)pthread_mutex_unlock(&race->mutex);
+        return MQTT_CODE_ERROR_SYSTEM;
+    }
+    deadline.tv_sec++;
+    while (race->disconnect_calls == 0 && wait_rc == 0) {
+        wait_rc = pthread_cond_timedwait(&race->cond, &race->mutex,
+            &deadline);
+    }
+    if (wait_rc != 0 && wait_rc != ETIMEDOUT) {
+        race->sync_error = 1;
+    }
+    race->writer_active = 0;
+    if (pthread_mutex_unlock(&race->mutex) != 0) {
+        race->sync_error = 1;
+        return MQTT_CODE_ERROR_SYSTEM;
+    }
+    return buf_len;
+}
+
+static int mock_net_read_ping_timeout_race(void *context, byte* buf,
+    int buf_len, int timeout_ms)
+{
+    PingTimeoutRaceCtx* race = (PingTimeoutRaceCtx*)context;
+
+    (void)buf;
+    (void)buf_len;
+    (void)timeout_ms;
+    if (pthread_mutex_lock(&race->mutex) != 0) {
+        race->sync_error = 1;
+        return MQTT_CODE_ERROR_SYSTEM;
+    }
+    race->read_waiting = 1;
+    if (pthread_cond_broadcast(&race->cond) != 0) {
+        race->sync_error = 1;
+        (void)pthread_mutex_unlock(&race->mutex);
+        return MQTT_CODE_ERROR_SYSTEM;
+    }
+    while (race->writer_active == 0) {
+        if (pthread_cond_wait(&race->cond, &race->mutex) != 0) {
+            race->sync_error = 1;
+            (void)pthread_mutex_unlock(&race->mutex);
+            return MQTT_CODE_ERROR_SYSTEM;
+        }
+    }
+    if (pthread_mutex_unlock(&race->mutex) != 0) {
+        race->sync_error = 1;
+        return MQTT_CODE_ERROR_SYSTEM;
+    }
+    return MQTT_CODE_ERROR_TIMEOUT;
+}
+
+static int mock_net_disconnect_ping_timeout_race(void *context)
+{
+    PingTimeoutRaceCtx* race = (PingTimeoutRaceCtx*)context;
+
+    if (pthread_mutex_lock(&race->mutex) != 0) {
+        race->sync_error = 1;
+        return MQTT_CODE_ERROR_SYSTEM;
+    }
+    race->disconnect_calls++;
+    if (race->writer_active != 0) {
+        race->disconnect_during_write = 1;
+    }
+    if (pthread_cond_broadcast(&race->cond) != 0 ||
+            pthread_mutex_unlock(&race->mutex) != 0) {
+        race->sync_error = 1;
+        return MQTT_CODE_ERROR_SYSTEM;
+    }
+    return MQTT_CODE_SUCCESS;
+}
+
+static void* ping_timeout_race_ping_thread(void* arg)
+{
+    PingTimeoutRaceCtx* race = (PingTimeoutRaceCtx*)arg;
+
+    race->ping_rc = MqttClient_Ping(&test_client);
+    return NULL;
+}
+
+static void* ping_timeout_race_publish_thread(void* arg)
+{
+    PingTimeoutRaceCtx* race = (PingTimeoutRaceCtx*)arg;
+
+    race->publish_rc = MqttClient_Publish(&test_client, &race->publish);
+    return NULL;
+}
+
+TEST(ping_timeout_waits_for_concurrent_writer)
+{
+    PingTimeoutRaceCtx race;
+    pthread_t ping_thread;
+    pthread_t publish_thread;
+    int rc;
+
+    rc = test_init_client();
+    ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
+    XMEMSET(&race, 0, sizeof(race));
+    ASSERT_EQ(0, pthread_mutex_init(&race.mutex, NULL));
+    ASSERT_EQ(0, pthread_cond_init(&race.cond, NULL));
+
+    race.publish.topic_name = "race/topic";
+    race.publish.qos = MQTT_QOS_0;
+    race.publish.buffer = &race.payload;
+    race.publish.total_len = 1;
+    test_net.context = &race;
+    test_net.write = mock_net_write_ping_timeout_race;
+    test_net.read = mock_net_read_ping_timeout_race;
+    test_net.disconnect = mock_net_disconnect_ping_timeout_race;
+    (void)MqttClient_Flags(&test_client, 0, MQTT_CLIENT_FLAG_IS_CONNECTED);
+
+    ASSERT_EQ(0, pthread_create(&ping_thread, NULL,
+        ping_timeout_race_ping_thread, &race));
+    ASSERT_EQ(0, pthread_mutex_lock(&race.mutex));
+    while (race.read_waiting == 0) {
+        ASSERT_EQ(0, pthread_cond_wait(&race.cond, &race.mutex));
+    }
+    ASSERT_EQ(0, pthread_mutex_unlock(&race.mutex));
+    ASSERT_EQ(0, pthread_create(&publish_thread, NULL,
+        ping_timeout_race_publish_thread, &race));
+
+    ASSERT_EQ(0, pthread_join(ping_thread, NULL));
+    ASSERT_EQ(0, pthread_join(publish_thread, NULL));
+    ASSERT_EQ(MQTT_CODE_ERROR_TIMEOUT, race.ping_rc);
+    ASSERT_EQ(MQTT_CODE_SUCCESS, race.publish_rc);
+    ASSERT_EQ(1, race.disconnect_calls);
+    ASSERT_EQ(0, race.disconnect_during_write);
+    ASSERT_EQ(0, race.sync_error);
+
+    ASSERT_EQ(0, pthread_cond_destroy(&race.cond));
+    ASSERT_EQ(0, pthread_mutex_destroy(&race.mutex));
+}
+#endif
 
 /* ============================================================================
  * MqttClient_Subscribe Tests
@@ -4322,6 +4532,11 @@ void run_mqtt_client_tests(void)
 
     /* MqttClient_Ping tests */
     RUN_TEST(ping_null_client);
+    RUN_TEST(ping_response_timeout_disconnects_network);
+#if defined(WOLFMQTT_MULTITHREAD) && \
+    (defined(__MACH__) || defined(WOLFMQTT_POSIX_SEMAPHORES))
+    RUN_TEST(ping_timeout_waits_for_concurrent_writer);
+#endif
 
     /* MqttClient_Subscribe tests */
     RUN_TEST(subscribe_null_client);

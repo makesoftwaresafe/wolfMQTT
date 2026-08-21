@@ -1575,6 +1575,18 @@ wait_again:
                 return rc;
             }
 
+        #ifdef WOLFMQTT_MULTITHREAD
+            /* Another reader can complete this response after the check above
+             * but before this waiter acquires lockRecv. Recheck while holding
+             * lockRecv; no reader can change the result after this point. */
+            rc = MqttClient_CheckPendResp(client, wait_type, wait_packet_id);
+            if (rc != MQTT_CODE_ERROR_NOT_FOUND &&
+                    rc != MQTT_CODE_CONTINUE) {
+                MqttReadStop(client, mms_stat);
+                return rc;
+            }
+        #endif
+
             mms_stat->read = MQTT_MSG_WAIT;
         }
         FALL_THROUGH;
@@ -3438,6 +3450,34 @@ int MqttClient_Unsubscribe(MqttClient *client, MqttUnsubscribe *unsubscribe)
     return rc;
 }
 
+static int MqttClient_PingTimeoutDisconnect(MqttClient *client)
+{
+#ifdef WOLFMQTT_MULTITHREAD
+    int rc;
+
+    /* A message callback can hold lockRecv while starting a publish, so take
+     * the I/O locks in that same direction. Once both are held, no read or
+     * write callback can still reference socket, TLS, or curl state while the
+     * transport is released. */
+    rc = wm_SemLock(&client->lockRecv);
+    if (rc != MQTT_CODE_SUCCESS) {
+        return rc;
+    }
+    rc = wm_SemLock(&client->lockSend);
+    if (rc != MQTT_CODE_SUCCESS) {
+        (void)wm_SemUnlock(&client->lockRecv);
+        return rc;
+    }
+
+    rc = MqttClient_NetDisconnect(client);
+    (void)wm_SemUnlock(&client->lockSend);
+    (void)wm_SemUnlock(&client->lockRecv);
+    return rc;
+#else
+    return MqttClient_NetDisconnect(client);
+#endif
+}
+
 int MqttClient_Ping_ex(MqttClient *client, MqttPing* ping)
 {
     int rc;
@@ -3523,6 +3563,16 @@ int MqttClient_Ping_ex(MqttClient *client, MqttPing* ping)
 
     /* reset state */
     ping->stat.write = MQTT_MSG_BEGIN;
+
+    /* MQTT 3.1.1 and 5.0 section 3.1.2.10: a client that does not receive
+     * PINGRESP within a reasonable time should close the network connection.
+     * MQTT_CODE_CONTINUE returned above keeps non-blocking exchanges alive;
+     * only a terminal timeout reaches this teardown. Preserve the timeout for
+     * direct Ping callers while the automatic keep-alive path maps it to a
+     * network error. */
+    if (rc == MQTT_CODE_ERROR_TIMEOUT) {
+        (void)MqttClient_PingTimeoutDisconnect(client);
+    }
 
     return rc;
 }

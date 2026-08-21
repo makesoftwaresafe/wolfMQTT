@@ -14,6 +14,11 @@ static int sem_invalid_free_calls;
 static int sem_fail_all;
 static int sem_fail_on_call;
 static int sem_fail_free_on_call;
+static wm_Sem* sem_complete_on_lock;
+static MqttPendResp* sem_pending_to_complete;
+static int sem_pending_completions;
+static int ping_read_calls;
+static int ping_disconnect_calls;
 
 static void reset_sem_state(void)
 {
@@ -24,6 +29,11 @@ static void reset_sem_state(void)
     sem_fail_all = 0;
     sem_fail_on_call = 0;
     sem_fail_free_on_call = 0;
+    sem_complete_on_lock = NULL;
+    sem_pending_to_complete = NULL;
+    sem_pending_completions = 0;
+    ping_read_calls = 0;
+    ping_disconnect_calls = 0;
 }
 
 int wm_SemInit(wm_Sem* sem)
@@ -54,7 +64,12 @@ int wm_SemFree(wm_Sem* sem)
 
 int wm_SemLock(wm_Sem* sem)
 {
-    (void)sem;
+    if (sem == sem_complete_on_lock && sem_pending_to_complete != NULL) {
+        sem_pending_to_complete->packetDone = 1;
+        sem_pending_to_complete->packet_ret = MQTT_CODE_SUCCESS;
+        sem_pending_to_complete = NULL;
+        sem_pending_completions++;
+    }
     return MQTT_CODE_SUCCESS;
 }
 
@@ -62,6 +77,86 @@ int wm_SemUnlock(wm_Sem* sem)
 {
     (void)sem;
     return MQTT_CODE_SUCCESS;
+}
+
+static int ping_net_connect(void* context, const char* host, word16 port,
+    int timeout_ms)
+{
+    (void)context;
+    (void)host;
+    (void)port;
+    (void)timeout_ms;
+    return MQTT_CODE_SUCCESS;
+}
+
+static int ping_net_read(void* context, byte* buf, int buf_len, int timeout_ms)
+{
+    (void)context;
+    (void)buf;
+    (void)buf_len;
+    (void)timeout_ms;
+    ping_read_calls++;
+    return MQTT_CODE_ERROR_TIMEOUT;
+}
+
+static int ping_net_write(void* context, const byte* buf, int buf_len,
+    int timeout_ms)
+{
+    (void)context;
+    (void)buf;
+    (void)timeout_ms;
+    return buf_len;
+}
+
+static int ping_net_disconnect(void* context)
+{
+    (void)context;
+    ping_disconnect_calls++;
+    return MQTT_CODE_SUCCESS;
+}
+
+static int test_ping_response_completed_during_read_lock(void)
+{
+    int rc;
+    MqttClient client;
+    MqttNet net;
+    MqttPing ping;
+    byte tx_buf[64];
+    byte rx_buf[64];
+
+    reset_sem_state();
+    XMEMSET(&net, 0, sizeof(net));
+    XMEMSET(&ping, 0, sizeof(ping));
+    net.connect = ping_net_connect;
+    net.read = ping_net_read;
+    net.write = ping_net_write;
+    net.disconnect = ping_net_disconnect;
+
+    rc = MqttClient_Init(&client, &net, NULL, tx_buf, sizeof(tx_buf),
+        rx_buf, sizeof(rx_buf), 1000);
+    if (rc != MQTT_CODE_SUCCESS) {
+        fprintf(stderr, "ping-race client initialization returned %d\n", rc);
+        return 1;
+    }
+
+    /* Model another reader delivering PINGRESP after the waiter's first
+     * pending-response check but while that waiter acquires lockRecv. */
+    sem_complete_on_lock = &client.lockRecv;
+    sem_pending_to_complete = &ping.pendResp;
+    rc = MqttClient_Ping_ex(&client, &ping);
+
+    if (rc != MQTT_CODE_SUCCESS || sem_pending_completions != 1 ||
+            ping_read_calls != 0 || ping_disconnect_calls != 0) {
+        fprintf(stderr,
+            "completed ping returned %d, completions=%d reads=%d disconnects=%d\n",
+            rc, sem_pending_completions, ping_read_calls,
+            ping_disconnect_calls);
+        MqttClient_DeInit(&client);
+        return 1;
+    }
+
+    MqttClient_DeInit(&client);
+    return 0;
 }
 
 static int test_property_lock_failure(void)
@@ -251,6 +346,9 @@ static int test_failed_property_free_retried(void)
 
 int main(void)
 {
+    if (test_ping_response_completed_during_read_lock() != 0) {
+        return 1;
+    }
     if (test_property_lock_failure() != 0) {
         return 1;
     }
