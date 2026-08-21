@@ -857,6 +857,7 @@ int MqttEncode_Props(MqttPacketType packet, MqttProp* props, byte* buf)
 {
     int rc = 0, tmp;
     int prop_count = 0;
+    word32 seen_lo = 0, seen_hi = 0;
     MqttProp* cur_prop = props;
 
     /* loop through the list properties */
@@ -876,6 +877,29 @@ int MqttEncode_Props(MqttPacketType packet, MqttProp* props, byte* buf)
         if (!(gPropMatrix[cur_prop->type].packet_type_mask & (1 << packet))) {
             rc = MQTT_TRACE_ERROR(MQTT_CODE_ERROR_PROPERTY_MISMATCH);
             break;
+        }
+
+        /* MQTT 5.0 section 2.2.2.2 limits repeated properties. */
+        if (cur_prop->type != MQTT_PROP_USER_PROP &&
+                !(cur_prop->type == MQTT_PROP_SUBSCRIPTION_ID &&
+                  packet == MQTT_PACKET_TYPE_PUBLISH)) {
+            word32 bit;
+            if (cur_prop->type < 32) {
+                bit = (word32)1 << cur_prop->type;
+                if (seen_lo & bit) {
+                    rc = MQTT_TRACE_ERROR(MQTT_CODE_ERROR_PROPERTY);
+                    break;
+                }
+                seen_lo |= bit;
+            }
+            else {
+                bit = (word32)1 << (cur_prop->type - 32);
+                if (seen_hi & bit) {
+                    rc = MQTT_TRACE_ERROR(MQTT_CODE_ERROR_PROPERTY);
+                    break;
+                }
+                seen_hi |= bit;
+            }
         }
 
         /* Encode the Identifier */

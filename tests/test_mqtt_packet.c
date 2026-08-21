@@ -5603,6 +5603,49 @@ TEST(encode_props_user_prop_invalid_utf8_rejected)
     ASSERT_EQ(MQTT_CODE_ERROR_MALFORMED_DATA, rc);
 }
 
+/* MQTT 5.0 section 2.2.2.2 permits repeated User Property and repeated
+ * Subscription Identifier in PUBLISH; other properties are singletons. */
+TEST(encode_props_duplicate_repeatability)
+{
+    MqttProp first;
+    MqttProp second;
+    char key[] = "key";
+    char value[] = "value";
+    int rc;
+
+    XMEMSET(&first, 0, sizeof(first));
+    XMEMSET(&second, 0, sizeof(second));
+    first.type = MQTT_PROP_TOPIC_ALIAS;
+    first.data_short = 1;
+    first.next = &second;
+    second.type = MQTT_PROP_TOPIC_ALIAS;
+    second.data_short = 2;
+    rc = MqttEncode_Props(MQTT_PACKET_TYPE_PUBLISH, &first, NULL);
+    ASSERT_EQ(MQTT_CODE_ERROR_PROPERTY, rc);
+
+    first.type = MQTT_PROP_SUBSCRIPTION_ID;
+    first.data_int = 1;
+    second.type = MQTT_PROP_SUBSCRIPTION_ID;
+    second.data_int = 2;
+    rc = MqttEncode_Props(MQTT_PACKET_TYPE_SUBSCRIBE, &first, NULL);
+    ASSERT_EQ(MQTT_CODE_ERROR_PROPERTY, rc);
+    rc = MqttEncode_Props(MQTT_PACKET_TYPE_PUBLISH, &first, NULL);
+    ASSERT_TRUE(rc > 0);
+
+    first.type = MQTT_PROP_USER_PROP;
+    first.data_str.str = key;
+    first.data_str.len = (word16)XSTRLEN(key);
+    first.data_str2.str = value;
+    first.data_str2.len = (word16)XSTRLEN(value);
+    second.type = MQTT_PROP_USER_PROP;
+    second.data_str.str = key;
+    second.data_str.len = (word16)XSTRLEN(key);
+    second.data_str2.str = value;
+    second.data_str2.len = (word16)XSTRLEN(value);
+    rc = MqttEncode_Props(MQTT_PACKET_TYPE_PUBLISH, &first, NULL);
+    ASSERT_TRUE(rc > 0);
+}
+
 /* ============================================================================
  * MqttEncode/Decode_Auth roundtrip
  *
@@ -6389,6 +6432,7 @@ void run_mqtt_packet_tests(void)
     /* MqttEncode/Decode_Auth */
     RUN_TEST(encode_props_string_invalid_utf8_rejected);
     RUN_TEST(encode_props_user_prop_invalid_utf8_rejected);
+    RUN_TEST(encode_props_duplicate_repeatability);
     RUN_TEST(auth_v5_cont_auth_roundtrip);
     RUN_TEST(auth_v5_reauth_roundtrip);
     RUN_TEST(auth_v5_reauth_decodes_without_error);
