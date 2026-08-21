@@ -1916,6 +1916,32 @@ TEST(decode_connack_refused_without_session_present_accepted)
     ASSERT_TRUE(rc > 0);
 }
 
+#if defined(WOLFMQTT_BROKER) && defined(WOLFMQTT_V5)
+/* MQTT v3.1.1 section 3.2.2.3 permits only return codes 0x00-0x05, while
+ * MQTT 5.0 section 3.2.2.2 uses the version-specific Reason Code table. */
+TEST(encode_connack_rejects_version_invalid_reason_codes)
+{
+    byte buf[16];
+    MqttConnectAck ack;
+    int rc;
+
+    XMEMSET(&ack, 0, sizeof(ack));
+    XMEMSET(buf, 0xA5, sizeof(buf));
+    ack.protocol_level = MQTT_CONNECT_PROTOCOL_LEVEL_4;
+    ack.return_code = MQTT_REASON_UNSPECIFIED_ERR;
+    rc = MqttEncode_ConnectAck(buf, (int)sizeof(buf), &ack);
+    ASSERT_EQ(MQTT_CODE_ERROR_BAD_ARG, rc);
+    ASSERT_EQ(0xA5, buf[0]);
+
+    XMEMSET(buf, 0xA5, sizeof(buf));
+    ack.protocol_level = MQTT_CONNECT_PROTOCOL_LEVEL_5;
+    ack.return_code = MQTT_REASON_GRANTED_QOS_1;
+    rc = MqttEncode_ConnectAck(buf, (int)sizeof(buf), &ack);
+    ASSERT_EQ(MQTT_CODE_ERROR_BAD_ARG, rc);
+    ASSERT_EQ(0xA5, buf[0]);
+}
+#endif /* WOLFMQTT_BROKER && WOLFMQTT_V5 */
+
 /* ============================================================================
  * MqttEncode_Subscribe
  * ============================================================================ */
@@ -6125,6 +6151,9 @@ void run_mqtt_packet_tests(void)
     RUN_TEST(decode_connack_flags_all_bits_rejected);
     RUN_TEST(decode_connack_refused_with_session_present_rejected);
     RUN_TEST(decode_connack_refused_without_session_present_accepted);
+#if defined(WOLFMQTT_BROKER) && defined(WOLFMQTT_V5)
+    RUN_TEST(encode_connack_rejects_version_invalid_reason_codes);
+#endif
 
     /* MqttEncode_Subscribe */
     RUN_TEST(encode_subscribe_packet_id_zero);

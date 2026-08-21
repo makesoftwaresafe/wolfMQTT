@@ -108,6 +108,7 @@ unsigned long wolfmqtt_test_broker_time_s(void)
     return g_broker_time_s;
 }
 
+#ifndef WOLFMQTT_STATIC_MEMORY
 static void broker_test_fail_alloc_after(int successful_allocations)
 {
     g_alloc_fail_after = successful_allocations;
@@ -118,6 +119,7 @@ static void broker_test_disable_alloc_failure(void)
 {
     g_alloc_fail_after = -1;
 }
+#endif
 
 #ifdef WOLFMQTT_BROKER_PERSIST_ENCRYPT
 static void broker_test_capture_free(size_t allocation_size)
@@ -395,6 +397,59 @@ static size_t build_v5_connect_emptyid(byte* out, byte connect_flags)
     out[9] = connect_flags;
     return sizeof(tmpl);
 }
+
+#ifdef WOLFMQTT_BROKER_WILL
+/* Build a v5 CONNECT with a Will from the wire layout in MQTT 5.0 section
+ * 3.1.2 and 3.1.3. The Remaining Length uses the section 1.5.5 algorithm. */
+static size_t build_v5_connect_will(byte* out, size_t out_sz,
+    word16 topic_len, word16 payload_len)
+{
+    word32 remain_len = 11u + 3u + 1u + 2u + topic_len + 2u + payload_len;
+    word32 value = remain_len;
+    size_t pos = 0;
+    word16 i;
+
+    if (out == NULL || remain_len + 5u > out_sz) {
+        return 0;
+    }
+    out[pos++] = 0x10;
+    do {
+        byte encoded = (byte)(value % 128u);
+        value /= 128u;
+        if (value > 0) {
+            encoded |= 0x80;
+        }
+        out[pos++] = encoded;
+    } while (value > 0);
+
+    out[pos++] = 0x00;
+    out[pos++] = 0x04;
+    out[pos++] = 'M';
+    out[pos++] = 'Q';
+    out[pos++] = 'T';
+    out[pos++] = 'T';
+    out[pos++] = MQTT_CONNECT_PROTOCOL_LEVEL_5;
+    out[pos++] = 0x06; /* Clean Start and Will Flag. */
+    out[pos++] = 0x00;
+    out[pos++] = 0x3C;
+    out[pos++] = 0x00; /* CONNECT Properties length. */
+    out[pos++] = 0x00;
+    out[pos++] = 0x01;
+    out[pos++] = 'i';
+    out[pos++] = 0x00; /* Will Properties length. */
+    out[pos++] = (byte)(topic_len >> 8);
+    out[pos++] = (byte)topic_len;
+    for (i = 0; i < topic_len; i++) {
+        out[pos++] = 't';
+    }
+    out[pos++] = (byte)(payload_len >> 8);
+    out[pos++] = (byte)payload_len;
+    for (i = 0; i < payload_len; i++) {
+        out[pos++] = 0xA5;
+    }
+    return pos;
+}
+#endif
 #endif
 
 /* -------------------------------------------------------------------------- */
@@ -567,6 +622,74 @@ TEST(connect_v5_client_id_alloc_failure_refused)
     ASSERT_EQ(1, g_alloc_failure_count);
     ASSERT_TRUE(g_out_len >= 5);
     ASSERT_EQ(MQTT_REASON_SERVER_UNAVAILABLE, g_out_buf[3]);
+    ASSERT_TRUE(g_client_closed);
+
+    MqttBroker_Stop(&broker);
+    MqttBroker_Free(&broker);
+}
+#endif
+#endif
+
+#if defined(WOLFMQTT_V5) && defined(WOLFMQTT_BROKER_WILL)
+TEST(connect_v5_oversize_will_payload_emits_connack)
+{
+    MqttBroker broker;
+    MqttBrokerNet net;
+    byte connect[MOCK_BUF_SZ];
+    size_t connect_len;
+
+    connect_len = build_v5_connect_will(connect, sizeof(connect), 1,
+        BROKER_MAX_WILL_PAYLOAD_LEN + 1);
+    ASSERT_TRUE(connect_len > 0);
+
+    install_mock_net(&net);
+    XMEMSET(&broker, 0, sizeof(broker));
+    ASSERT_EQ(MQTT_CODE_SUCCESS, MqttBroker_Init(&broker, &net));
+    ASSERT_EQ(MQTT_CODE_SUCCESS, MqttBroker_Start(&broker));
+
+    reset_mock_state(connect, connect_len);
+    run_broker_one_connect(&broker);
+
+    /* [MQTT-3.2.2-2] A refused v5 CONNECT carries a valid Reason Code. */
+    ASSERT_TRUE(g_out_len >= 5);
+    ASSERT_EQ(0x20, g_out_buf[0]);
+    ASSERT_EQ(0x03, g_out_buf[1]);
+    ASSERT_EQ(0x00, g_out_buf[2]);
+    ASSERT_EQ(MQTT_REASON_PACKET_TOO_LARGE, g_out_buf[3]);
+    ASSERT_EQ(0x00, g_out_buf[4]);
+    ASSERT_TRUE(g_client_closed);
+
+    MqttBroker_Stop(&broker);
+    MqttBroker_Free(&broker);
+}
+
+#ifdef WOLFMQTT_STATIC_MEMORY
+TEST(connect_v5_oversize_will_topic_emits_connack)
+{
+    MqttBroker broker;
+    MqttBrokerNet net;
+    byte connect[MOCK_BUF_SZ];
+    size_t connect_len;
+
+    connect_len = build_v5_connect_will(connect, sizeof(connect),
+        BROKER_MAX_TOPIC_LEN, 0);
+    ASSERT_TRUE(connect_len > 0);
+
+    install_mock_net(&net);
+    XMEMSET(&broker, 0, sizeof(broker));
+    ASSERT_EQ(MQTT_CODE_SUCCESS, MqttBroker_Init(&broker, &net));
+    ASSERT_EQ(MQTT_CODE_SUCCESS, MqttBroker_Start(&broker));
+
+    reset_mock_state(connect, connect_len);
+    run_broker_one_connect(&broker);
+
+    /* [MQTT-3.2.2-2] The server reports a rejected Will Topic in CONNACK. */
+    ASSERT_TRUE(g_out_len >= 5);
+    ASSERT_EQ(0x20, g_out_buf[0]);
+    ASSERT_EQ(0x03, g_out_buf[1]);
+    ASSERT_EQ(0x00, g_out_buf[2]);
+    ASSERT_EQ(MQTT_REASON_TOPIC_NAME_INVALID, g_out_buf[3]);
+    ASSERT_EQ(0x00, g_out_buf[4]);
     ASSERT_TRUE(g_client_closed);
 
     MqttBroker_Stop(&broker);
@@ -7214,6 +7337,12 @@ int main(int argc, char** argv)
 #ifdef WOLFMQTT_V5
     RUN_TEST(connect_v5_client_id_alloc_failure_refused);
 #endif
+#endif
+#if defined(WOLFMQTT_V5) && defined(WOLFMQTT_BROKER_WILL)
+    RUN_TEST(connect_v5_oversize_will_payload_emits_connack);
+    #ifdef WOLFMQTT_STATIC_MEMORY
+    RUN_TEST(connect_v5_oversize_will_topic_emits_connack);
+    #endif
 #endif
     RUN_TEST(connect_v311_explicit_auto_prefix_refused);
     RUN_TEST(connect_unsupported_level_3_refused);

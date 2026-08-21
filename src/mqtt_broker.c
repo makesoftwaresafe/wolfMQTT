@@ -6516,7 +6516,15 @@ static int BrokerHandle_Connect(BrokerClient* bc, int rx_len,
                 "broker: LWT topic too long (%u >= %d) sock=%d",
                 (unsigned)mc.lwt_msg->topic_name_len,
                 BROKER_MAX_TOPIC_LEN, (int)bc->sock);
-            ack.return_code = MQTT_CONNECT_ACK_CODE_REFUSED_UNAVAIL;
+        #ifdef WOLFMQTT_V5
+            if (mc.protocol_level >= MQTT_CONNECT_PROTOCOL_LEVEL_5) {
+                ack.return_code = MQTT_REASON_TOPIC_NAME_INVALID;
+            }
+            else
+        #endif
+            {
+                ack.return_code = MQTT_CONNECT_ACK_CODE_REFUSED_UNAVAIL;
+            }
             goto send_connack;
         }
     #endif
@@ -6525,7 +6533,15 @@ static int BrokerHandle_Connect(BrokerClient* bc, int rx_len,
                 "broker: LWT payload too large (%u > %d) sock=%d",
                 (unsigned)mc.lwt_msg->total_len,
                 BROKER_MAX_WILL_PAYLOAD_LEN, (int)bc->sock);
-            ack.return_code = MQTT_CONNECT_ACK_CODE_REFUSED_UNAVAIL;
+        #ifdef WOLFMQTT_V5
+            if (mc.protocol_level >= MQTT_CONNECT_PROTOCOL_LEVEL_5) {
+                ack.return_code = MQTT_REASON_PACKET_TOO_LARGE;
+            }
+            else
+        #endif
+            {
+                ack.return_code = MQTT_CONNECT_ACK_CODE_REFUSED_UNAVAIL;
+            }
             goto send_connack;
         }
 #ifdef WOLFMQTT_V5
