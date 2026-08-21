@@ -351,12 +351,10 @@ typedef struct MqttBrokerNet {
  * error code. Shadow-write failures are logged while in-memory state remains
  * authoritative. Iterator failures during restore abort MqttBroker_Start.
  *
- * Both a key/value API and a streaming API are provided. The broker will
- * use whichever family the registered hook implements; any individual
- * hook pointer may be NULL when not supported. At minimum kv_put / kv_get
- * / kv_iter must be installed for sessions / subs / retained / outq to
- * round-trip; the streaming API is offered for backends that prefer an
- * append-only log (e.g., raw NOR flash). */
+ * The broker currently uses only the key/value API. At minimum kv_put,
+ * kv_get, and kv_iter must be installed for sessions, subscriptions,
+ * retained messages, and outbound queues to round-trip. kv_del is required
+ * to remove persisted records. */
 
 /* Iterator callback supplied by the broker to kv_iter. Return 0 to
  * continue, non-zero to stop iteration early. */
@@ -379,7 +377,8 @@ typedef struct MqttBrokerPersistHooks {
     int (*kv_iter)(void* ctx, byte ns, MqttBrokerPersist_IterCb cb,
                    void* cb_ctx);
 
-    /* Streaming API. handle is opaque; broker passes through. */
+    /* Reserved for future use. Ignored when a complete KV family is present;
+     * a stream-only hook structure is rejected. */
     int (*stream_open)(void* ctx, byte ns, const byte* key, word16 key_len,
                        int mode, void** handle);
     int (*stream_read)(void* ctx, void* handle, byte* buf, word32 len,
@@ -889,7 +888,9 @@ WOLFMQTT_API int MqttBrokerNet_Init(MqttBrokerNet* net);
 /* Install non-NULL persistence hooks after MqttBroker_Init and before the
  * first MqttBroker_Start, or after MqttBroker_Free. Passing NULL may detach
  * the current hooks at any time. The MqttBrokerPersistHooks struct must
- * outlive the broker while installed. */
+ * outlive the broker while installed. Stream-only hooks are unsupported;
+ * deprecated stream members are ignored when all four KV callbacks are
+ * provided. */
 WOLFMQTT_API int MqttBroker_SetPersistHooks(MqttBroker* broker,
     const MqttBrokerPersistHooks* hooks);
 

@@ -577,6 +577,13 @@ int MqttBroker_SetPersistHooks(MqttBroker* broker,
     if (broker == NULL) {
         return MQTT_CODE_ERROR_BAD_ARG;
     }
+    if (hooks != NULL && (hooks->stream_open != NULL ||
+            hooks->stream_read != NULL || hooks->stream_write != NULL ||
+            hooks->stream_close != NULL) &&
+            (hooks->kv_put == NULL || hooks->kv_get == NULL ||
+             hooks->kv_del == NULL || hooks->kv_iter == NULL)) {
+        return MQTT_CODE_ERROR_BAD_ARG;
+    }
     if (hooks != NULL && (broker->running || broker->persist_restored)) {
         return MQTT_CODE_ERROR_BAD_ARG;
     }

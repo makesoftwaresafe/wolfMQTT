@@ -6000,6 +6000,145 @@ typedef struct PersistIterCapture {
     int calls;
 } PersistIterCapture;
 
+static int persist_test_stream_open(void* ctx, byte ns, const byte* key,
+    word16 key_len, int mode, void** handle)
+{
+    int* calls = (int*)ctx;
+
+    (void)ns;
+    (void)key;
+    (void)key_len;
+    (void)mode;
+    (void)handle;
+    (*calls)++;
+    return MQTT_CODE_SUCCESS;
+}
+
+static int persist_test_stream_read(void* ctx, void* handle, byte* buf,
+    word32 len, word32* out_len)
+{
+    int* calls = (int*)ctx;
+
+    (void)handle;
+    (void)buf;
+    (void)len;
+    (void)out_len;
+    (*calls)++;
+    return MQTT_CODE_SUCCESS;
+}
+
+static int persist_test_stream_write(void* ctx, void* handle,
+    const byte* buf, word32 len)
+{
+    int* calls = (int*)ctx;
+
+    (void)handle;
+    (void)buf;
+    (void)len;
+    (*calls)++;
+    return MQTT_CODE_SUCCESS;
+}
+
+static int persist_test_stream_close(void* ctx, void* handle)
+{
+    int* calls = (int*)ctx;
+
+    (void)handle;
+    (*calls)++;
+    return MQTT_CODE_SUCCESS;
+}
+
+TEST(persist_stream_only_hooks_rejected)
+{
+    MqttBroker broker;
+    MqttBrokerPersistHooks hooks;
+    int calls = 0;
+
+    XMEMSET(&broker, 0, sizeof(broker));
+    XMEMSET(&hooks, 0, sizeof(hooks));
+    hooks.stream_open = persist_test_stream_open;
+    hooks.stream_read = persist_test_stream_read;
+    hooks.stream_write = persist_test_stream_write;
+    hooks.stream_close = persist_test_stream_close;
+    hooks.ctx = &calls;
+
+    ASSERT_EQ(MQTT_CODE_ERROR_BAD_ARG,
+        MqttBroker_SetPersistHooks(&broker, &hooks));
+    ASSERT_NULL(broker.persist);
+    ASSERT_EQ(0, calls);
+}
+
+static int persist_test_kv_put_noop(void* ctx, byte ns, const byte* key,
+    word16 key_len, const byte* blob, word32 blob_len)
+{
+    (void)ctx;
+    (void)ns;
+    (void)key;
+    (void)key_len;
+    (void)blob;
+    (void)blob_len;
+    return MQTT_CODE_SUCCESS;
+}
+
+static int persist_test_kv_get_not_found(void* ctx, byte ns, const byte* key,
+    word16 key_len, byte* out, word32* inout_len)
+{
+    (void)ctx;
+    (void)ns;
+    (void)key;
+    (void)key_len;
+    (void)out;
+    (void)inout_len;
+    return MQTT_CODE_ERROR_NOT_FOUND;
+}
+
+static int persist_test_kv_del_noop(void* ctx, byte ns, const byte* key,
+    word16 key_len)
+{
+    (void)ctx;
+    (void)ns;
+    (void)key;
+    (void)key_len;
+    return MQTT_CODE_SUCCESS;
+}
+
+static int persist_test_kv_iter_noop(void* ctx, byte ns,
+    MqttBrokerPersist_IterCb cb, void* cb_ctx)
+{
+    (void)ctx;
+    (void)ns;
+    (void)cb;
+    (void)cb_ctx;
+    return MQTT_CODE_SUCCESS;
+}
+
+/* Deprecated stream members may coexist with a complete KV backend. The
+ * broker uses only the KV family, so rejecting this previously supported
+ * mixed structure would be an unnecessary API compatibility break. */
+TEST(persist_mixed_kv_and_stream_hooks_accepted)
+{
+    MqttBroker broker;
+    MqttBrokerPersistHooks hooks;
+    int calls = 0;
+
+    XMEMSET(&broker, 0, sizeof(broker));
+    XMEMSET(&hooks, 0, sizeof(hooks));
+    hooks.kv_put = persist_test_kv_put_noop;
+    hooks.kv_get = persist_test_kv_get_not_found;
+    hooks.kv_del = persist_test_kv_del_noop;
+    hooks.kv_iter = persist_test_kv_iter_noop;
+    hooks.stream_open = persist_test_stream_open;
+    hooks.stream_read = persist_test_stream_read;
+    hooks.stream_write = persist_test_stream_write;
+    hooks.stream_close = persist_test_stream_close;
+    hooks.ctx = &calls;
+
+    ASSERT_EQ(MQTT_CODE_SUCCESS,
+        MqttBroker_SetPersistHooks(&broker, &hooks));
+    ASSERT_TRUE(broker.persist == &hooks);
+    ASSERT_EQ(0, calls);
+}
+
 #ifdef WOLFMQTT_BROKER_PERSIST_ENCRYPT
 static int persist_test_put_noop(void* ctx, byte ns, const byte* key,
     word16 key_len, const byte* blob, word32 blob_len)
@@ -6571,6 +6710,8 @@ int main(int argc, char** argv)
 #ifdef WOLFMQTT_BROKER_PERSIST
     RUN_TEST(persist_parent_component_rejected_as_bad_argument);
     RUN_TEST(persist_iter_skips_fifo_without_blocking);
+    RUN_TEST(persist_stream_only_hooks_rejected);
+    RUN_TEST(persist_mixed_kv_and_stream_hooks_accepted);
     #ifdef __MACH__
     RUN_TEST(persist_root_below_macos_tmp_alias_accepted);
     #endif
