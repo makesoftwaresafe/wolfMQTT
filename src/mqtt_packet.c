@@ -2090,27 +2090,39 @@ int MqttDecode_ConnectAck(byte *rx_buf, int rx_buf_len,
 #ifdef WOLFMQTT_V5
         connect_ack->props = NULL;
         if (connect_ack->protocol_level >= MQTT_CONNECT_PROTOCOL_LEVEL_5) {
+            byte* packet_end = &rx_buf[header_len + remain_len];
             word32 props_len = 0;
             int props_tmp;
+
             /* Decode Length of Properties */
-            if (rx_buf_len < (rx_payload - rx_buf)) {
-                return MQTT_TRACE_ERROR(MQTT_CODE_ERROR_OUT_OF_BUFFER);
-            }
             props_tmp = MqttDecode_Vbi(rx_payload, &props_len,
-                    (word32)(rx_buf_len - (rx_payload - rx_buf)));
+                    (word32)(packet_end - rx_payload));
             if (props_tmp < 0) {
                 return props_tmp;
             }
             rx_payload += props_tmp;
+            if (props_len > (word32)(packet_end - rx_payload)) {
+                return MQTT_TRACE_ERROR(MQTT_CODE_ERROR_OUT_OF_BUFFER);
+            }
             if (props_len > 0) {
                 /* Decode the Properties */
                 props_tmp = MqttDecode_Props(MQTT_PACKET_TYPE_CONNECT_ACK,
                                &connect_ack->props, rx_payload,
-                               (word32)(rx_buf_len - (rx_payload - rx_buf)),
+                               (word32)(packet_end - rx_payload),
                                props_len);
-                if (props_tmp < 0)
+                if (props_tmp < 0) {
                     return props_tmp;
+                }
                 rx_payload += props_tmp;
+            }
+            /* MQTT 5.0 section 3.2.2: the property block must consume the
+             * complete CONNACK variable header. */
+            if (rx_payload != packet_end) {
+                if (connect_ack->props != NULL) {
+                    (void)MqttProps_Free(connect_ack->props);
+                    connect_ack->props = NULL;
+                }
+                return MQTT_TRACE_ERROR(MQTT_CODE_ERROR_MALFORMED_DATA);
             }
         }
 #endif

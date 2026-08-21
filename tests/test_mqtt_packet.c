@@ -1836,6 +1836,49 @@ TEST(decode_connack_truncated_partial_var_header)
     ASSERT_EQ(MQTT_CODE_ERROR_OUT_OF_BUFFER, rc);
 }
 
+#ifdef WOLFMQTT_V5
+/* MQTT 5.0 section 3.2.2.3: the Property Length belongs to this CONNACK,
+ * so bytes after its declared Remaining Length cannot satisfy the property
+ * block. The trailing bytes form a valid Maximum QoS property deliberately. */
+TEST(decode_connack_v5_props_cannot_cross_packet_end)
+{
+    byte buf[] = {
+        0x20, 0x03, 0x00, MQTT_REASON_SUCCESS, 0x02,
+        MQTT_PROP_MAX_QOS, MQTT_QOS_1
+    };
+    MqttConnectAck ack;
+    int rc;
+
+    XMEMSET(&ack, 0, sizeof(ack));
+    ack.protocol_level = MQTT_CONNECT_PROTOCOL_LEVEL_5;
+
+    rc = MqttDecode_ConnectAck(buf, (int)sizeof(buf), &ack);
+
+    ASSERT_EQ(MQTT_CODE_ERROR_OUT_OF_BUFFER, rc);
+    ASSERT_NULL(ack.props);
+}
+
+/* MQTT 5.0 section 3.2.2 requires the Remaining Length to contain exactly
+ * the flags, Reason Code, Property Length, and declared Properties. */
+TEST(decode_connack_v5_rejects_bytes_after_property_block)
+{
+    byte buf[] = {
+        0x20, 0x05, 0x00, MQTT_REASON_SUCCESS, 0x00,
+        MQTT_PROP_MAX_QOS, MQTT_QOS_1
+    };
+    MqttConnectAck ack;
+    int rc;
+
+    XMEMSET(&ack, 0, sizeof(ack));
+    ack.protocol_level = MQTT_CONNECT_PROTOCOL_LEVEL_5;
+
+    rc = MqttDecode_ConnectAck(buf, (int)sizeof(buf), &ack);
+
+    ASSERT_EQ(MQTT_CODE_ERROR_MALFORMED_DATA, rc);
+    ASSERT_NULL(ack.props);
+}
+#endif /* WOLFMQTT_V5 */
+
 /* [MQTT-3.2.2-1] / [MQTT-3.2.2-4] CONNACK Flags receive-side validation.
  *
  * The Connect Acknowledge Flags byte has only bit 0 (Session Present)
@@ -6370,6 +6413,10 @@ void run_mqtt_packet_tests(void)
     RUN_TEST(decode_connack_truncated_one_byte_buffer);
     RUN_TEST(decode_connack_truncated_no_var_header);
     RUN_TEST(decode_connack_truncated_partial_var_header);
+#ifdef WOLFMQTT_V5
+    RUN_TEST(decode_connack_v5_props_cannot_cross_packet_end);
+    RUN_TEST(decode_connack_v5_rejects_bytes_after_property_block);
+#endif
     RUN_TEST(decode_connack_flags_session_present_accepted);
     RUN_TEST(decode_connack_flags_no_session_accepted);
     RUN_TEST(decode_connack_flags_reserved_bit_1_rejected);
