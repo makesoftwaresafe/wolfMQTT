@@ -4956,6 +4956,29 @@ TEST(decode_unsuback_v5_props_past_remain_len_rejected)
 }
 #endif /* WOLFMQTT_V5 */
 
+#if defined(WOLFMQTT_BROKER) && defined(WOLFMQTT_V5)
+/* [MQTT-4.8.0-1] An UNSUBACK Reason Code outside the set in MQTT 5.0
+ * section 3.11.3 must not be serialized. */
+TEST(encode_unsuback_v5_reserved_reason_code_rejected)
+{
+    byte buf[16];
+    byte reason_code = MQTT_REASON_GRANTED_QOS_1;
+    MqttUnsubscribeAck ack;
+    int rc;
+
+    XMEMSET(&ack, 0, sizeof(ack));
+    XMEMSET(buf, 0xA5, sizeof(buf));
+    ack.packet_id = 1;
+    ack.protocol_level = MQTT_CONNECT_PROTOCOL_LEVEL_5;
+    ack.reason_codes = &reason_code;
+    ack.reason_code_count = 1;
+
+    rc = MqttEncode_UnsubscribeAck(buf, (int)sizeof(buf), &ack);
+    ASSERT_EQ(MQTT_CODE_ERROR_BAD_ARG, rc);
+    ASSERT_EQ(0xA5, buf[0]);
+}
+#endif /* WOLFMQTT_BROKER && WOLFMQTT_V5 */
+
 /* ============================================================================
  * MqttDecode_Ping (PINGRESP) and MqttDecode_Disconnect length validation
  *
@@ -6285,6 +6308,9 @@ void run_mqtt_packet_tests(void)
 #ifdef WOLFMQTT_V5
     RUN_TEST(decode_unsuback_v5_reason_codes);
     RUN_TEST(decode_unsuback_v5_props_past_remain_len_rejected);
+#endif
+#if defined(WOLFMQTT_BROKER) && defined(WOLFMQTT_V5)
+    RUN_TEST(encode_unsuback_v5_reserved_reason_code_rejected);
 #endif
 
     /* MqttDecode_Ping (PINGRESP) length validation */

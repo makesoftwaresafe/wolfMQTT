@@ -3603,6 +3603,15 @@ int MqttEncode_UnsubscribeAck(byte *tx_buf, int tx_buf_len, MqttUnsubscribeAck *
 
         if (unsubscribe_ack->reason_codes != NULL &&
             unsubscribe_ack->reason_code_count > 0) {
+            int i;
+
+            /* [MQTT-3.11.3-2] Do not serialize a reserved Reason Code. */
+            for (i = 0; i < unsubscribe_ack->reason_code_count; i++) {
+                if (!MqttPacket_UnsubAckReasonCodeValid(
+                        unsubscribe_ack->reason_codes[i])) {
+                    return MQTT_TRACE_ERROR(MQTT_CODE_ERROR_BAD_ARG);
+                }
+            }
             reason_code_count = unsubscribe_ack->reason_code_count;
             remain_len += reason_code_count;
         }
