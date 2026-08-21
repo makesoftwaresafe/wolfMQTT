@@ -1735,6 +1735,13 @@ int SN_Packet_Read(MqttClient *client, byte* rx_buf, int rx_buf_len,
     int rc, len = 0, remain_read = 0;
     word16 total_len = 0, idx = 0;
 
+    if (client == NULL || rx_buf == NULL) {
+        return MQTT_TRACE_ERROR(MQTT_CODE_ERROR_BAD_ARG);
+    }
+    if (rx_buf_len < MQTT_PACKET_HEADER_MIN_SIZE + MQTT_DATA_LEN_SIZE) {
+        return MQTT_TRACE_ERROR(MQTT_CODE_ERROR_OUT_OF_BUFFER);
+    }
+
     switch (client->packet.stat)
     {
         case MQTT_PK_BEGIN:
@@ -1757,6 +1764,9 @@ int SN_Packet_Read(MqttClient *client, byte* rx_buf, int rx_buf_len,
 
             if (rx_buf[0] == SN_PACKET_LEN_IND){
                 /* Read length stored in first three bytes, type in fourth */
+                if (len + MQTT_DATA_LEN_SIZE > rx_buf_len) {
+                    return MQTT_TRACE_ERROR(MQTT_CODE_ERROR_OUT_OF_BUFFER);
+                }
                 if (MqttClient_Flags(client,0,0) & MQTT_CLIENT_FLAG_IS_DTLS) {
                     rc = MqttSocket_Read(client, rx_buf+len, 2, timeout_ms);
                     if (rc < 0) {
@@ -1810,6 +1820,9 @@ int SN_Packet_Read(MqttClient *client, byte* rx_buf, int rx_buf_len,
                 }
 
                 /* Make sure it does not overflow rx_buf */
+                if (rx_buf_len < client->packet.header_len) {
+                    return MQTT_TRACE_ERROR(MQTT_CODE_ERROR_OUT_OF_BUFFER);
+                }
                 if (client->packet.remain_len >
                     (rx_buf_len - client->packet.header_len)) {
                     client->packet.remain_len = rx_buf_len -
@@ -1857,6 +1870,9 @@ int SN_Packet_Read(MqttClient *client, byte* rx_buf, int rx_buf_len,
     client->packet.stat = MQTT_PK_BEGIN;
 
     /* Return read length */
+    if (remain_read > rx_buf_len) {
+        remain_read = rx_buf_len;
+    }
     return remain_read;
 }
 

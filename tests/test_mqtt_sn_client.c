@@ -1561,6 +1561,69 @@ TEST(sn_ping_unsolicited_gwinfo_captured)
 
 #endif /* WOLFMQTT_NONBLOCK */
 
+TEST(sn_packet_read_bounds_fixed_header)
+{
+    static const byte short_frame[] = { 0x02, SN_MSG_TYPE_PING_RESP };
+    static const byte extended_frame[] = {
+        SN_PACKET_LEN_IND, 0x00, 0x04, SN_MSG_TYPE_PING_RESP
+    };
+    const byte* frames[] = { short_frame, extended_frame };
+    const int frame_lens[] = {
+        (int)sizeof(short_frame), (int)sizeof(extended_frame)
+    };
+    byte guarded[6];
+    int datagram;
+    int frame_idx;
+    int rx_len;
+    int rc;
+
+    for (datagram = 0; datagram <= 1; datagram++) {
+        for (frame_idx = 0; frame_idx < 2; frame_idx++) {
+            for (rx_len = 1; rx_len <= 4; rx_len++) {
+                XMEMSET(&g_client, 0, sizeof(g_client));
+                mock_net_init(&g_mock, &g_net, 0);
+                mock_net_push(&g_mock, frames[frame_idx],
+                    frame_lens[frame_idx]);
+                g_client.net = &g_net;
+                if (datagram) {
+                    g_client.flags = MQTT_CLIENT_FLAG_IS_DTLS;
+                }
+                XMEMSET(guarded, 0xA5, sizeof(guarded));
+
+                rc = SN_Packet_Read(&g_client, &guarded[1], rx_len, 0);
+                ASSERT_EQ(0xA5, guarded[0]);
+                ASSERT_EQ(0xA5, guarded[rx_len + 1]);
+                if (rx_len < 4) {
+                    ASSERT_EQ(MQTT_CODE_ERROR_OUT_OF_BUFFER, rc);
+                }
+                else {
+                    ASSERT_EQ(frame_lens[frame_idx], rc);
+                    ASSERT_TRUE(rc <= rx_len);
+                }
+            }
+        }
+    }
+}
+
+TEST(sn_packet_read_rejects_header_past_buffer)
+{
+    byte guarded[6];
+    int rc;
+
+    XMEMSET(&g_client, 0, sizeof(g_client));
+    mock_net_init(&g_mock, &g_net, 0);
+    g_client.net = &g_net;
+    g_client.flags = MQTT_CLIENT_FLAG_IS_DTLS;
+    g_client.packet.stat = MQTT_PK_READ_HEAD;
+    g_client.packet.header_len = 5;
+    XMEMSET(guarded, 0xA5, sizeof(guarded));
+
+    rc = SN_Packet_Read(&g_client, &guarded[1], 4, 0);
+    ASSERT_EQ(MQTT_CODE_ERROR_OUT_OF_BUFFER, rc);
+    ASSERT_EQ(0xA5, guarded[0]);
+    ASSERT_EQ(0xA5, guarded[sizeof(guarded) - 1]);
+}
+
 /* Regression: on the non-DTLS transport SN_Packet_Read peeks the 2-byte header
  * without consuming it, so it must re-read the whole datagram from offset 0. It
  * previously subtracted the peeked header and short-read every frame longer
@@ -1631,6 +1694,8 @@ int main(int argc, char** argv)
     RUN_TEST(sn_publish_incoming_null_msg_cb_errors_no_ack);
     RUN_TEST(sn_ping_no_continue);
     RUN_TEST(sn_ping_null_no_continue);
+    RUN_TEST(sn_packet_read_bounds_fixed_header);
+    RUN_TEST(sn_packet_read_rejects_header_past_buffer);
     RUN_TEST(sn_nondtls_reads_full_frames);
 
     /* The non-blocking retry regression only exists under WOLFMQTT_NONBLOCK. */
