@@ -4281,7 +4281,15 @@ int MqttPacket_Read(MqttClient *client, byte* rx_buf, int rx_buf_len,
     int timeout_ms)
 {
     int rc, len, remain_read = 0;
-    MqttPacket* header = (MqttPacket*)rx_buf;
+    MqttPacket* header;
+
+    if (client == NULL || rx_buf == NULL) {
+        return MQTT_TRACE_ERROR(MQTT_CODE_ERROR_BAD_ARG);
+    }
+    if (rx_buf_len < MQTT_PACKET_MAX_LEN_BYTES + 1) {
+        return MQTT_TRACE_ERROR(MQTT_CODE_ERROR_OUT_OF_BUFFER);
+    }
+    header = (MqttPacket*)rx_buf;
 
     switch (client->packet.stat)
     {
@@ -4327,6 +4335,9 @@ int MqttPacket_Read(MqttClient *client, byte* rx_buf, int rx_buf_len,
                 }
 
                 /* Read next byte and try decode again */
+                if (client->packet.header_len >= rx_buf_len) {
+                    return MQTT_TRACE_ERROR(MQTT_CODE_ERROR_OUT_OF_BUFFER);
+                }
                 len = 1;
                 rc = MqttSocket_Read(client, &rx_buf[client->packet.header_len],
                         len, timeout_ms);

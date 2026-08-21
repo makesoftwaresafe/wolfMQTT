@@ -204,6 +204,23 @@ TEST(init_zero_rx_buf_len)
     ASSERT_EQ(MQTT_CODE_ERROR_BAD_ARG, rc);
 }
 
+TEST(init_positive_rx_buf_len_supported)
+{
+    int rx_len;
+    int rc;
+
+    /* MqttClient_Init is shared by MQTT and MQTT-SN, whose minimum headers
+     * differ. Protocol-specific packet readers enforce their own minimum. */
+    for (rx_len = 1; rx_len < MQTT_PACKET_MAX_LEN_BYTES + 1; rx_len++) {
+        rc = MqttClient_Init(&test_client, &test_net, NULL,
+                             test_tx_buf, TEST_TX_BUF_SIZE,
+                             test_rx_buf, rx_len,
+                             TEST_CMD_TIMEOUT_MS);
+        ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
+        MqttClient_DeInit(&test_client);
+    }
+}
+
 TEST(init_success)
 {
     int rc;
@@ -4674,6 +4691,7 @@ void run_mqtt_client_tests(void)
     RUN_TEST(init_zero_tx_buf_len);
     RUN_TEST(init_null_rx_buf);
     RUN_TEST(init_zero_rx_buf_len);
+    RUN_TEST(init_positive_rx_buf_len_supported);
     RUN_TEST(init_success);
     RUN_TEST(init_negative_tx_buf_len);
     RUN_TEST(init_negative_rx_buf_len);

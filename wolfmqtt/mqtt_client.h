@@ -341,7 +341,8 @@ typedef struct _MqttClient {
  *  \param      tx_buf      Pointer to transmit buffer used during encoding
  *  \param      tx_buf_len  Maximum length of the transmit buffer
  *  \param      rx_buf      Pointer to receive buffer used during decoding
- *  \param      rx_buf_len  Maximum length of the receive buffer
+ *  \param      rx_buf_len  Positive maximum length of the receive buffer;
+                            protocol packet readers enforce their minimum size
  *  \param      cmd_timeout_ms
                             Maximum command wait timeout in milliseconds
  *  \return     MQTT_CODE_SUCCESS or MQTT_CODE_ERROR_BAD_ARG

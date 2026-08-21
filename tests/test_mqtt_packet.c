@@ -307,6 +307,110 @@ TEST(encode_decode_vbi_roundtrip)
     }
 }
 
+typedef struct PacketReadFixture {
+    const byte* data;
+    int data_len;
+    int pos;
+    int calls;
+} PacketReadFixture;
+
+static int packet_read_fixture(void* context, byte* buf, int buf_len,
+    int timeout_ms)
+{
+    PacketReadFixture* fixture = (PacketReadFixture*)context;
+    int read_len = fixture->data_len - fixture->pos;
+
+    (void)timeout_ms;
+    fixture->calls++;
+    if (read_len > buf_len) {
+        read_len = buf_len;
+    }
+    if (read_len <= 0) {
+        return MQTT_CODE_ERROR_NETWORK;
+    }
+    XMEMCPY(buf, fixture->data + fixture->pos, (size_t)read_len);
+    fixture->pos += read_len;
+    return read_len;
+}
+
+static int packet_net_connect(void* context, const char* host, word16 port,
+    int timeout_ms)
+{
+    (void)context;
+    (void)host;
+    (void)port;
+    (void)timeout_ms;
+    return MQTT_CODE_SUCCESS;
+}
+
+static int packet_net_write(void* context, const byte* buf, int buf_len,
+    int timeout_ms)
+{
+    (void)context;
+    (void)buf;
+    (void)timeout_ms;
+    return buf_len;
+}
+
+static int packet_net_disconnect(void* context)
+{
+    (void)context;
+    return MQTT_CODE_SUCCESS;
+}
+
+TEST(packet_read_rejects_buffer_shorter_than_max_header)
+{
+    static const byte extended_header[] = {
+        0x30, 0x80, 0x80, 0x80, 0x00
+    };
+    static const byte short_header[] = { 0xD0, 0x00 };
+    byte guarded[7];
+    byte client_rx[16];
+    byte client_tx[16];
+    MqttClient client;
+    MqttNet net;
+    PacketReadFixture fixture;
+    int rx_len;
+    int rc;
+
+    XMEMSET(&net, 0, sizeof(net));
+    XMEMSET(&fixture, 0, sizeof(fixture));
+    net.context = &fixture;
+    net.connect = packet_net_connect;
+    net.read = packet_read_fixture;
+    net.write = packet_net_write;
+    net.disconnect = packet_net_disconnect;
+    rc = MqttClient_Init(&client, &net, NULL, client_tx,
+        (int)sizeof(client_tx), client_rx, (int)sizeof(client_rx), 0);
+    ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
+
+    for (rx_len = 1; rx_len < MQTT_PACKET_MAX_LEN_BYTES + 1; rx_len++) {
+        XMEMSET(guarded, 0xA5, sizeof(guarded));
+        XMEMSET(&fixture, 0, sizeof(fixture));
+        fixture.data = extended_header;
+        fixture.data_len = (int)sizeof(extended_header);
+
+        rc = MqttPacket_Read(&client, &guarded[1], rx_len, 0);
+        ASSERT_EQ(0xA5, guarded[0]);
+        ASSERT_EQ(0xA5, guarded[rx_len + 1]);
+        ASSERT_EQ(MQTT_CODE_ERROR_OUT_OF_BUFFER, rc);
+        ASSERT_EQ(0, fixture.calls);
+    }
+
+    XMEMSET(guarded, 0xA5, sizeof(guarded));
+    XMEMSET(&fixture, 0, sizeof(fixture));
+    fixture.data = short_header;
+    fixture.data_len = (int)sizeof(short_header);
+
+    rc = MqttPacket_Read(&client, &guarded[1],
+        MQTT_PACKET_MAX_LEN_BYTES + 1, 0);
+    ASSERT_EQ((int)sizeof(short_header), rc);
+    ASSERT_EQ(0xA5, guarded[0]);
+    ASSERT_EQ(0xA5, guarded[sizeof(guarded) - 1]);
+
+    MqttClient_DeInit(&client);
+}
+
 /* ============================================================================
  * UTF-8 well-formedness validation [MQTT-1.5.3-1]
  *
@@ -5896,6 +6000,7 @@ void run_mqtt_packet_tests(void)
     RUN_TEST(decode_vbi_overlong_4byte_zero);
     RUN_TEST(decode_vbi_overlong_2byte_127);
     RUN_TEST(encode_decode_vbi_roundtrip);
+    RUN_TEST(packet_read_rejects_buffer_shorter_than_max_header);
 
     /* UTF-8 well-formedness validation [MQTT-1.5.3-1] */
 #ifdef WOLFMQTT_BROKER

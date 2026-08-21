@@ -470,6 +470,19 @@ static void teardown(void)
     MqttClient_DeInit(&g_client);
 }
 
+TEST(sn_init_accepts_extended_header_minimum)
+{
+    int rc;
+
+    mock_net_init(&g_mock, &g_net, 0);
+    /* MQTT-SN 1.2 section 5.2 defines the extended-length header as the
+     * indicator, two length bytes, and the message type: four bytes total. */
+    rc = MqttClient_Init(&g_client, &g_net, NULL,
+        g_tx, (int)sizeof(g_tx), g_rx,
+        MQTT_PACKET_HEADER_MIN_SIZE + MQTT_DATA_LEN_SIZE, 1000);
+    ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
+}
+
 /* memcmp-style search: returns 1 if `needle` (nlen bytes) appears in `hay`. */
 static int sn_buf_contains(const byte* hay, int hlen,
         const byte* needle, int nlen)
@@ -1599,6 +1612,7 @@ int main(int argc, char** argv)
 #ifdef WOLFMQTT_SN
     TEST_SUITE_BEGIN("mqtt_sn_client", setup, teardown);
 
+    RUN_TEST(sn_init_accepts_extended_header_minimum);
     /* Happy path runs in every SN build (blocking and non-blocking). */
     RUN_TEST(sn_connect_lwt_no_continue);
     RUN_TEST(sn_connect_refused);
