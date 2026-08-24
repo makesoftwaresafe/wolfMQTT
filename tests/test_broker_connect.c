@@ -138,6 +138,13 @@ static int mock_read(void* ctx, BROKER_SOCKET_T sock,
     return buf_len;
 }
 
+#ifndef WOLFMQTT_STATIC_MEMORY
+/* One-shot hook run from inside the first PUBLISH the broker writes. The mock
+ * network has no lws_service, so this is how a test reproduces the mutation a
+ * re-entrant WebSocket close performs part way through a fan-out. */
+static void (*g_write_publish_hook)(void);
+#endif
+
 static int mock_write(void* ctx, BROKER_SOCKET_T sock,
     const byte* buf, int buf_len, int timeout_ms)
 {
@@ -156,6 +163,14 @@ static int mock_write(void* ctx, BROKER_SOCKET_T sock,
      * scrub target was actually written) before checking it was scrubbed. */
     XMEMCPY(mc->out_buf + mc->out_len, buf, (size_t)buf_len);
     mc->out_len += (size_t)buf_len;
+#ifndef WOLFMQTT_STATIC_MEMORY
+    if (g_write_publish_hook != NULL && buf_len > 0 &&
+            ((buf[0] & 0xF0) >> 4) == MQTT_PACKET_TYPE_PUBLISH) {
+        void (*hook)(void) = g_write_publish_hook;
+        g_write_publish_hook = NULL; /* one shot */
+        hook();
+    }
+#endif
     if (mc->write_err) {
         return MQTT_CODE_ERROR_NETWORK; /* simulate a hard write failure */
     }
@@ -184,6 +199,9 @@ static void reset_mock_clients(int n_clients)
     }
     g_clients_active = n_clients;
     g_accept_count = 0;
+#ifndef WOLFMQTT_STATIC_MEMORY
+    g_write_publish_hook = NULL;
+#endif
 }
 
 /* Append bytes to a client's input queue (i.e., what it appears to send to
@@ -1305,6 +1323,196 @@ TEST(fanout_subs_generation_bumped_on_unsubscribe)
     MqttBroker_Stop(&broker);
     MqttBroker_Free(&broker);
 }
+
+/* Broker under test for the re-entrant fan-out hooks below. */
+static MqttBroker* g_fanout_broker;
+
+/* Unlink and free the second subscription in broker->subs, mirroring what
+ * BrokerSubs_RemoveClient does to a peer whose WebSocket closes part way
+ * through another subscriber's fan-out write. The second node is exactly the
+ * successor a single-pass walk would have snapshotted before that write. */
+static void fanout_drop_second_sub(void)
+{
+    BrokerSub* first;
+    BrokerSub* victim;
+
+    if (g_fanout_broker == NULL) {
+        return;
+    }
+    first = g_fanout_broker->subs;
+    if (first == NULL || first->next == NULL) {
+        return;
+    }
+    victim = first->next;
+    first->next = victim->next;
+    if (victim->filter != NULL) {
+        WOLFMQTT_FREE(victim->filter);
+    }
+    if (victim->client_id != NULL) {
+        WOLFMQTT_FREE(victim->client_id);
+    }
+    WOLFMQTT_FREE(victim);
+    g_fanout_broker->subs_gen++;
+}
+
+/* A fan-out write can re-entrantly free BrokerSub nodes, including the one a
+ * single-pass walk saved as its successor. Abandoning the walk there is not
+ * safe either: every still-connected subscriber further down the list silently
+ * loses the message while the publisher is acknowledged as though delivery
+ * completed. Three subscribers share topic "x"; the subscription behind the
+ * first one written to is freed from inside that write, and all three must
+ * still receive exactly one PUBLISH. */
+TEST(fanout_survives_reentrant_sub_free)
+{
+    MqttBroker broker;
+    MqttBrokerNet net;
+    int i;
+    /* CONNECT for subscribers "A", "B", "C" and publisher "P". */
+    static const byte connect_a[] = {
+        0x10, 0x0D, 0x00, 0x04, 'M', 'Q', 'T', 'T', 0x04, 0x02, 0x00, 0x3C,
+        0x00, 0x01, 'A'
+    };
+    static const byte connect_b[] = {
+        0x10, 0x0D, 0x00, 0x04, 'M', 'Q', 'T', 'T', 0x04, 0x02, 0x00, 0x3C,
+        0x00, 0x01, 'B'
+    };
+    static const byte connect_c[] = {
+        0x10, 0x0D, 0x00, 0x04, 'M', 'Q', 'T', 'T', 0x04, 0x02, 0x00, 0x3C,
+        0x00, 0x01, 'C'
+    };
+    static const byte connect_p[] = {
+        0x10, 0x0D, 0x00, 0x04, 'M', 'Q', 'T', 'T', 0x04, 0x02, 0x00, 0x3C,
+        0x00, 0x01, 'P'
+    };
+    /* SUBSCRIBE packet_id=1, filter "x", QoS 0. */
+    static const byte subscribe_x[] = {
+        0x82, 0x06, 0x00, 0x01, 0x00, 0x01, 'x', 0x00
+    };
+    /* PUBLISH QoS 0, topic "x", payload "hi". */
+    static const byte publish_x[] = {
+        0x30, 0x05, 0x00, 0x01, 'x', 'h', 'i'
+    };
+
+    install_mock_net(&net);
+    XMEMSET(&broker, 0, sizeof(broker));
+    ASSERT_EQ(MQTT_CODE_SUCCESS, MqttBroker_Init(&broker, &net));
+    ASSERT_EQ(MQTT_CODE_SUCCESS, MqttBroker_Start(&broker));
+
+    reset_mock_clients(4);
+    mock_client_input_append(0, connect_a, sizeof(connect_a));
+    mock_client_input_append(0, subscribe_x, sizeof(subscribe_x));
+    mock_client_input_append(1, connect_b, sizeof(connect_b));
+    mock_client_input_append(1, subscribe_x, sizeof(subscribe_x));
+    mock_client_input_append(2, connect_c, sizeof(connect_c));
+    mock_client_input_append(2, subscribe_x, sizeof(subscribe_x));
+    mock_client_input_append(3, connect_p, sizeof(connect_p));
+    for (i = 0; i < 48; i++) {
+        MqttBroker_Step(&broker);
+    }
+
+    /* All three subscriptions are in place before the publish. */
+    ASSERT_NOT_NULL(broker.subs);
+    ASSERT_NOT_NULL(broker.subs->next);
+    ASSERT_NOT_NULL(broker.subs->next->next);
+
+    g_fanout_broker = &broker;
+    g_write_publish_hook = fanout_drop_second_sub;
+
+    mock_client_input_append(3, publish_x, sizeof(publish_x));
+    for (i = 0; i < 32; i++) {
+        MqttBroker_Step(&broker);
+    }
+
+    /* The hook fired, so the fan-out really did run over a mutated list. */
+    ASSERT_NULL(g_write_publish_hook);
+
+    /* Every subscriber collected before the write is served. Pre-fix the walk
+     * stopped at the freed successor and the trailing subscribers got 0. */
+    for (i = 0; i < 3; i++) {
+        ASSERT_EQ(1, count_packets_of_type(g_clients[i].out_buf,
+            g_clients[i].out_len, MQTT_PACKET_TYPE_PUBLISH));
+    }
+
+    g_fanout_broker = NULL;
+    MqttBroker_Stop(&broker);
+    MqttBroker_Free(&broker);
+}
+
+#ifdef WOLFMQTT_BROKER_WILL
+/* Same hazard on the Will fan-out, which runs its own subscription walk. The
+ * publisher's socket drops, the broker fans its Will out to three subscribers,
+ * and a subscription is freed from inside the first delivery write. */
+TEST(will_fanout_survives_reentrant_sub_free)
+{
+    MqttBroker broker;
+    MqttBrokerNet net;
+    int i;
+    static const byte connect_a[] = {
+        0x10, 0x0D, 0x00, 0x04, 'M', 'Q', 'T', 'T', 0x04, 0x02, 0x00, 0x3C,
+        0x00, 0x01, 'A'
+    };
+    static const byte connect_b[] = {
+        0x10, 0x0D, 0x00, 0x04, 'M', 'Q', 'T', 'T', 0x04, 0x02, 0x00, 0x3C,
+        0x00, 0x01, 'B'
+    };
+    static const byte connect_c[] = {
+        0x10, 0x0D, 0x00, 0x04, 'M', 'Q', 'T', 'T', 0x04, 0x02, 0x00, 0x3C,
+        0x00, 0x01, 'C'
+    };
+    /* Publisher "P" with LWT: flags 0x06 (will | clean), will_topic "lwt",
+     * will_payload "bye". */
+    static const byte connect_p_will[] = {
+        0x10, 0x17, 0x00, 0x04, 'M', 'Q', 'T', 'T', 0x04, 0x06, 0x00, 0x3C,
+        0x00, 0x01, 'P',
+        0x00, 0x03, 'l', 'w', 't',
+        0x00, 0x03, 'b', 'y', 'e'
+    };
+    /* SUBSCRIBE packet_id=1, filter "lwt", QoS 0. */
+    static const byte subscribe_lwt[] = {
+        0x82, 0x08, 0x00, 0x01, 0x00, 0x03, 'l', 'w', 't', 0x00
+    };
+
+    install_mock_net(&net);
+    XMEMSET(&broker, 0, sizeof(broker));
+    ASSERT_EQ(MQTT_CODE_SUCCESS, MqttBroker_Init(&broker, &net));
+    ASSERT_EQ(MQTT_CODE_SUCCESS, MqttBroker_Start(&broker));
+
+    reset_mock_clients(4);
+    mock_client_input_append(0, connect_a, sizeof(connect_a));
+    mock_client_input_append(0, subscribe_lwt, sizeof(subscribe_lwt));
+    mock_client_input_append(1, connect_b, sizeof(connect_b));
+    mock_client_input_append(1, subscribe_lwt, sizeof(subscribe_lwt));
+    mock_client_input_append(2, connect_c, sizeof(connect_c));
+    mock_client_input_append(2, subscribe_lwt, sizeof(subscribe_lwt));
+    mock_client_input_append(3, connect_p_will, sizeof(connect_p_will));
+    for (i = 0; i < 48; i++) {
+        MqttBroker_Step(&broker);
+    }
+
+    ASSERT_NOT_NULL(broker.subs);
+    ASSERT_NOT_NULL(broker.subs->next);
+    ASSERT_NOT_NULL(broker.subs->next->next);
+
+    g_fanout_broker = &broker;
+    g_write_publish_hook = fanout_drop_second_sub;
+
+    /* Drop the publisher's socket so its Will fans out. */
+    g_clients[3].read_err = 1;
+    for (i = 0; i < 32; i++) {
+        MqttBroker_Step(&broker);
+    }
+
+    ASSERT_NULL(g_write_publish_hook);
+    for (i = 0; i < 3; i++) {
+        ASSERT_EQ(1, count_packets_of_type(g_clients[i].out_buf,
+            g_clients[i].out_len, MQTT_PACKET_TYPE_PUBLISH));
+    }
+
+    g_fanout_broker = NULL;
+    MqttBroker_Stop(&broker);
+    MqttBroker_Free(&broker);
+}
+#endif /* WOLFMQTT_BROKER_WILL */
 #endif /* !WOLFMQTT_STATIC_MEMORY */
 
 TEST(qos2_duplicate_publish_dedup)
@@ -5047,6 +5255,10 @@ int main(int argc, char** argv)
 #endif
 #ifndef WOLFMQTT_STATIC_MEMORY
     RUN_TEST(fanout_subs_generation_bumped_on_unsubscribe);
+    RUN_TEST(fanout_survives_reentrant_sub_free);
+#ifdef WOLFMQTT_BROKER_WILL
+    RUN_TEST(will_fanout_survives_reentrant_sub_free);
+#endif
 #endif
     RUN_TEST(qos2_duplicate_publish_dedup);
     RUN_TEST(qos2_phantom_dup_publish_is_fresh);

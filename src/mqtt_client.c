@@ -1175,8 +1175,18 @@ static int MqttClient_HandlePacket(MqttClient* client,
             /* Record this QoS 2 packet id as delivered and awaiting PUBREL so a
              * retransmit is acknowledged again without a second delivery
              * [MQTT-4.3.3-10]. A no-op for the retransmit, which is already
-             * tracked. */
-            if (packet_qos == MQTT_QOS_2) {
+             * tracked. Skipped when the callback rejected the message and the
+             * PUBREC carries a reason code >= 0x80: that ends the exchange
+             * [MQTT-4.3.3], so no PUBREL will arrive to clear the entry and the
+             * sender is free to reuse the packet id - a tracked id would both
+             * hold a slot forever and suppress the next PUBLISH that reuses
+             * it. */
+            if (packet_qos == MQTT_QOS_2
+            #ifdef WOLFMQTT_V5
+                && (client->protocol_level < MQTT_CONNECT_PROTOCOL_LEVEL_5 ||
+                    (resp->reason_code & 0x80) == 0)
+            #endif
+                ) {
                 MqttClient_RecvQos2_Add(client, packet_id);
             }
         #endif
@@ -1221,11 +1231,13 @@ static int MqttClient_HandlePacket(MqttClient* client,
              * the broker will never send. The QoS 1 PUBACK and the QoS 2
              * PUBCOMP reason codes are checked by the caller after the wait.
              * Note (WOLFMQTT_MULTITHREAD): when a separate thread drives reads
-             * and processes this PUBREC, it receives this error directly and
-             * the publishing thread's PUBCOMP pending response is not marked
-             * done, so that publish blocks until cmd_timeout_ms. This matches
-             * the pre-existing behavior (which left the publisher waiting on a
-             * PUBCOMP after an illegal PUBREL) and is not made worse here. */
+             * and processes this PUBREC, that thread receives this error
+             * directly, and the publishing thread's PUBCOMP pending response is
+             * completed with it below, so its next poll returns
+             * MQTT_CODE_ERROR_PUBLISH_REJECTED rather than spinning on
+             * MQTT_CODE_CONTINUE until cmd_timeout_ms. This is the one
+             * rejection MqttClient_Publish_WriteOnly does surface; see its
+             * documentation in mqtt_client.h. */
             if (packet_type == MQTT_PACKET_TYPE_PUBLISH_REC &&
                 client->protocol_level >= MQTT_CONNECT_PROTOCOL_LEVEL_5 &&
                 (((MqttPublishResp*)packet_obj)->reason_code & 0x80)) {
@@ -2941,10 +2953,13 @@ static int MqttPublishMsg(MqttClient *client, MqttPublish *publish,
             /* if failure or no data was written yet */
             if (rc != xfer) {
                 MqttWriteStop(client, &publish->stat);
-                MqttClient_CancelMessage(client, (MqttObject*)publish);
             #ifdef WOLFMQTT_V5
+                /* Credit the unit before the cancel: nothing reached the wire,
+                 * so it is genuinely reclaimable, and the cancel drops this
+                 * message's ownership of it either way. */
                 MqttClient_RestoreRecvQuota(client, publish);
             #endif
+                MqttClient_CancelMessage(client, (MqttObject*)publish);
                 return rc;
             }
 
@@ -2967,10 +2982,12 @@ static int MqttPublishMsg(MqttClient *client, MqttPublish *publish,
         #endif
             MqttWriteStop(client, &publish->stat);
             if (rc < 0) {
-                MqttClient_CancelMessage(client, (MqttObject*)publish);
             #ifdef WOLFMQTT_V5
+                /* Credit before the cancel; see the header-write failure path
+                 * above. */
                 MqttClient_RestoreRecvQuota(client, publish);
             #endif
+                MqttClient_CancelMessage(client, (MqttObject*)publish);
                 break;
             }
 
@@ -3929,7 +3946,18 @@ int MqttClient_CancelMessage(MqttClient *client, MqttObject* msg)
      * unit while the connection stays open - the server still counts it against
      * Receive Maximum [MQTT-4.9], and crediting it would let the client exceed
      * the quota. The genuinely-unsent write-failure paths release explicitly via
-     * MqttClient_RestoreRecvQuota, so no quota leaks there. */
+     * MqttClient_RestoreRecvQuota, which they call before cancelling so the
+     * credit is not swallowed by the ownership reset below. */
+#ifdef WOLFMQTT_V5
+    /* The unit stays charged to the connection, but ownership of it must not
+     * stay on this message object: cancel resets the object for reuse, and a
+     * leftover recvQuotaHeld would make MqttClient_RecvQuotaReserve treat the
+     * next publish through it as already reserved and skip the decrement,
+     * putting one more PUBLISH in flight than Receive Maximum allows
+     * [MQTT-4.9]. Clear the flag without crediting server_recv_max; the unit is
+     * recovered when the next connect resets the quota. */
+    mms_stat->recvQuotaHeld = 0;
+#endif
 
 #ifdef WOLFMQTT_MULTITHREAD
     /* Remove any pending responses expected */
@@ -4071,7 +4099,16 @@ int MqttClient_NetDisconnect(MqttClient *client)
         #endif
             /* Reserved Receive Maximum units are not credited on disconnect
              * (the PUBLISH may be on the wire); the next connect resets
-             * server_recv_max to the newly negotiated value. */
+             * server_recv_max to the newly negotiated value. Ownership must
+             * still be dropped from the message object, though: the quota
+             * belonged to the connection being torn down, and a leftover
+             * recvQuotaHeld would let a reused publish object skip the
+             * decrement on the next connection [MQTT-4.9]. */
+        #ifdef WOLFMQTT_V5
+            if (tmpResp->recvQuotaStat != NULL) {
+                tmpResp->recvQuotaStat->recvQuotaHeld = 0;
+            }
+        #endif
             MqttClient_RespList_Remove(client, tmpResp);
         }
         wm_SemUnlock(&client->lockClient);

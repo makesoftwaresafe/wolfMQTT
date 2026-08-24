@@ -480,14 +480,16 @@ WOLFMQTT_API int MqttClient_Publish_ex(
  *                          Note: MqttPublish and MqttMessage are same
                             structure.
  *  \param      pubCb       Function pointer to callback routine
- *  \note       Because this call only writes and another thread processes the
-                ACK, it never returns MQTT_CODE_ERROR_PUBLISH_REJECTED. On the
-                reading thread only a QoS 2 PUBREC rejection is surfaced (as
-                MQTT_CODE_ERROR_PUBLISH_REJECTED, returned in order to suppress
-                an illegal PUBREL per [MQTT-4.3.3]); a QoS 1 PUBACK or QoS 2
-                PUBCOMP reason code >= 0x80 is NOT detected on this path and the
-                publish appears successful. Use MqttClient_Publish/_ex when
-                reliable v5 broker-rejection detection for QoS>0 is required.
+ *  \note       Only one v5 broker rejection is surfaced on this path: a QoS 2
+                PUBREC with a reason code >= 0x80. The reading thread returns
+                MQTT_CODE_ERROR_PUBLISH_REJECTED for it (suppressing an illegal
+                PUBREL per [MQTT-4.3.3]) and completes this publish's pending
+                response with the same code, so a later poll of this function
+                returns MQTT_CODE_ERROR_PUBLISH_REJECTED instead of spinning on
+                MQTT_CODE_CONTINUE. A QoS 1 PUBACK or QoS 2 PUBCOMP reason code
+                >= 0x80 is NOT detected on this path and the publish appears
+                successful. Use MqttClient_Publish/_ex when reliable v5
+                broker-rejection detection for QoS>0 is required.
  *  \return     MQTT_CODE_SUCCESS, MQTT_CODE_CONTINUE (for non-blocking) or
                 MQTT_CODE_ERROR_* (see enum MqttPacketResponseCodes)
     \sa         MqttClient_Publish

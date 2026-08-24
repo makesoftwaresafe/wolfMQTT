@@ -774,9 +774,51 @@ TEST(auth_without_connect_method_rejected)
     MqttClient_PropsFree(auth.props);
 }
 
+/* Run a v5 CONNECT against a canned accepted CONNACK, optionally carrying an
+ * Authentication Method property. Exercises MqttConnect_HasAuthMethod and its
+ * per-connection assignment in MqttClient_Connect rather than poking
+ * client->auth_method_set directly. */
+static int run_connect_v5_with_auth_method(int with_method)
+{
+    int rc;
+    int i;
+    MqttConnect connect;
+    MqttProp method_prop;
+    /* v5 CONNACK: accepted, Session Present = 0, no properties. */
+    static const byte connack[] = { 0x20, 0x03, 0x00, 0x00, 0x00 };
+
+    test_net.write = mock_net_write_accept;
+    test_net.read = mock_net_read_canned;
+    XMEMCPY(g_canned_buf, connack, sizeof(connack));
+    g_canned_len = (int)sizeof(connack);
+    g_canned_pos = 0;
+
+    XMEMSET(&connect, 0, sizeof(connect));
+    connect.keep_alive_sec = 60;
+    connect.clean_session = 1;
+    connect.client_id = "test_client";
+    if (with_method) {
+        XMEMSET(&method_prop, 0, sizeof(method_prop));
+        method_prop.type = MQTT_PROP_AUTH_METHOD;
+        method_prop.data_str.str = (char*)"SCRAM-SHA-256";
+        method_prop.data_str.len = (word16)XSTRLEN("SCRAM-SHA-256");
+        connect.props = &method_prop;
+    }
+
+    rc = MQTT_CODE_CONTINUE;
+    for (i = 0; i < 10 && rc == MQTT_CODE_CONTINUE; i++) {
+        rc = MqttClient_Connect(&test_client, &connect);
+    }
+    return rc;
+}
+
 /* Positive control: after a CONNECT that did carry an Authentication Method,
  * MqttClient_Auth must not be blocked by the new guard and the AUTH must reach
- * the wire. Guards against the guard over-rejecting legitimate re-auth. */
+ * the wire. Guards against the guard over-rejecting legitimate re-auth. The
+ * flag is set by driving a real CONNECT, so the detection helper and its
+ * assignment are covered too. A second CONNECT without the property must reset
+ * the flag, since enhanced authentication is negotiated per connection
+ * [MQTT-4.12.0-1]. */
 TEST(auth_with_connect_method_allowed)
 {
     int rc;
@@ -786,7 +828,10 @@ TEST(auth_with_connect_method_allowed)
     rc = test_init_client();
     ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
     test_client.protocol_level = MQTT_CONNECT_PROTOCOL_LEVEL_5;
-    test_client.auth_method_set = 1; /* CONNECT negotiated a method */
+
+    rc = run_connect_v5_with_auth_method(1);
+    ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
+    ASSERT_EQ(1, (int)test_client.auth_method_set);
 
     XMEMSET(&auth, 0, sizeof(auth));
     auth.reason_code = MQTT_REASON_CONT_AUTH;
@@ -805,6 +850,31 @@ TEST(auth_with_connect_method_allowed)
     /* Not blocked by the new guard, and the AUTH was written to the wire. */
     ASSERT_NE(MQTT_CODE_ERROR_BAD_ARG, rc);
     ASSERT_TRUE(g_frames_written > 0);
+
+    MqttClient_PropsFree(auth.props);
+
+    /* Reconnect without the property: the negotiation does not carry over, so
+     * the same AUTH must now be refused before anything reaches the wire. */
+    XMEMSET(&auth, 0, sizeof(auth));
+    rc = run_connect_v5_with_auth_method(0);
+    ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
+    ASSERT_EQ(0, (int)test_client.auth_method_set);
+
+    auth.reason_code = MQTT_REASON_CONT_AUTH;
+    prop = MqttClient_PropsAdd(&auth.props);
+    ASSERT_NOT_NULL(prop);
+    prop->type = MQTT_PROP_AUTH_METHOD;
+    prop->data_str.str = (char*)"SCRAM-SHA-256";
+    prop->data_str.len = (word16)XSTRLEN("SCRAM-SHA-256");
+
+    g_frames_written = 0;
+    test_net.write = mock_net_write_accept;
+    test_net.read = mock_net_read;
+
+    rc = MqttClient_Auth(&test_client, &auth);
+
+    ASSERT_EQ(MQTT_CODE_ERROR_BAD_ARG, rc);
+    ASSERT_EQ(0, g_frames_written);
 
     MqttClient_PropsFree(auth.props);
 }
@@ -1046,9 +1116,57 @@ TEST(cancel_message_retains_recv_quota_on_wire)
 
     rc = MqttClient_CancelMessage(&test_client, (MqttObject*)&publish);
     ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
-    /* Retained: the unit is not credited back and stays reserved. */
+    /* Retained: the unit is not credited back and stays charged against the
+     * connection. */
     ASSERT_EQ(4, test_client.server_recv_max);
-    ASSERT_EQ(1, (int)publish.stat.recvQuotaHeld);
+    /* But ownership leaves the message object, which cancel has just reset for
+     * reuse. Keeping the flag would make the next publish through this object
+     * skip its own reservation. */
+    ASSERT_EQ(0, (int)publish.stat.recvQuotaHeld);
+}
+
+/* [MQTT-4.9] Cancel resets the message object for reuse, so the next publish
+ * through it must reserve its own Receive Maximum unit. With a quota of 1 and
+ * one unit already charged to the canceled publish, reusing the object with a
+ * fresh packet id must be refused rather than put a second PUBLISH on the wire
+ * while the server still counts the first. */
+TEST(cancel_message_reuse_does_not_bypass_recv_quota)
+{
+    int rc;
+    MqttPublish publish;
+    static byte payload[] = "hello";
+
+    rc = test_init_client();
+    ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
+    test_client.protocol_level = MQTT_CONNECT_PROTOCOL_LEVEL_5;
+    test_client.server_recv_max_negotiated = 1;
+    test_client.server_recv_max = 0; /* the one unit is on the wire */
+
+    test_net.write = mock_net_write_accept;
+    test_net.read = mock_net_read;
+
+    XMEMSET(&publish, 0, sizeof(publish));
+    publish.qos = MQTT_QOS_1;
+    publish.packet_id = 1;
+    publish.topic_name = "test/topic";
+    publish.buffer = payload;
+    publish.total_len = (word32)(sizeof(payload) - 1);
+    publish.buffer_len = publish.total_len;
+    publish.stat.recvQuotaHeld = 1;
+
+    rc = MqttClient_CancelMessage(&test_client, (MqttObject*)&publish);
+    ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
+
+    /* Reuse the canceled object for a different message. */
+    publish.packet_id = 2;
+    publish.buffer_pos = 0;
+
+    g_frames_written = 0;
+    rc = MqttClient_Publish(&test_client, &publish);
+
+    /* Quota exhausted, so nothing may reach the wire. */
+    ASSERT_EQ(MQTT_CODE_ERROR_SERVER_PROP, rc);
+    ASSERT_EQ(0, g_frames_written);
 }
 
 /* Cancelling the same abandoned publish twice is stable: the retained unit is
@@ -2697,6 +2815,15 @@ TEST(publish_writeonly_v5_receive_max_released_on_pubrec_reject)
     ASSERT_EQ(MQTT_CODE_ERROR_PUBLISH_REJECTED,
         test_client.firstPendResp->packet_ret);
     ASSERT_NULL(test_client.firstPendResp->recvQuotaStat);
+
+    /* The documented contract, exercised through the public API rather than the
+     * internal node: the publisher's next poll must return the rejection, not
+     * another MQTT_CODE_CONTINUE. */
+    rc = MQTT_CODE_CONTINUE;
+    for (i = 0; i < 20 && rc == MQTT_CODE_CONTINUE; i++) {
+        rc = MqttClient_Publish_WriteOnly(&test_client, &publish, NULL);
+    }
+    ASSERT_EQ(MQTT_CODE_ERROR_PUBLISH_REJECTED, rc);
 #endif
 }
 #endif /* WOLFMQTT_MAX_QOS >= 2 */
@@ -2785,6 +2912,68 @@ TEST(publish_writeonly_v5_cancel_holds_receive_max)
      * PUBLISH may be on the wire, so the quota stays held (conservative). */
     ASSERT_EQ(0, test_client.server_recv_max);
     ASSERT_NULL(test_client.firstPendResp);
+
+    /* Ownership of that unit left the message object, so reusing it does not
+     * inherit a reservation it no longer owns. */
+    ASSERT_EQ(0, (int)publish.stat.recvQuotaHeld);
+}
+
+/* [MQTT-4.9] A reserved Receive Maximum unit belongs to the connection that
+ * charged it. MqttClient_NetDisconnect drops the pending responses without
+ * crediting - the next connect re-negotiates the quota - so it must also drop
+ * ownership from the message objects. A publish object reused after a
+ * reconnect that kept its recvQuotaHeld would skip the decrement and put one
+ * more PUBLISH in flight than the new connection allows. */
+TEST(disconnect_clears_recv_quota_ownership)
+{
+    int rc;
+    int i;
+    static MqttPublish publish;
+    static byte payload[] = "hello";
+
+    rc = test_init_client();
+    ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
+    test_client.protocol_level = MQTT_CONNECT_PROTOCOL_LEVEL_5;
+    test_client.server_recv_max = 1;
+    test_client.server_recv_max_negotiated = 1;
+
+    test_net.write = mock_net_write_accept;
+    test_net.read = mock_net_read;
+
+    XMEMSET(&publish, 0, sizeof(publish));
+    publish.qos = MQTT_QOS_1;
+    publish.packet_id = 30;
+    publish.topic_name = "test/topic";
+    publish.buffer = payload;
+    publish.total_len = (word32)(sizeof(payload) - 1);
+    publish.buffer_len = publish.total_len;
+
+    rc = MQTT_CODE_CONTINUE;
+    for (i = 0; i < 20 && rc == MQTT_CODE_CONTINUE; i++) {
+        rc = MqttClient_Publish_WriteOnly(&test_client, &publish, NULL);
+    }
+    ASSERT_EQ(0, test_client.server_recv_max);
+    ASSERT_EQ(1, (int)publish.stat.recvQuotaHeld);
+
+    rc = MqttClient_NetDisconnect(&test_client);
+    ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
+    ASSERT_NULL(test_client.firstPendResp);
+    ASSERT_EQ(0, (int)publish.stat.recvQuotaHeld);
+
+    /* Stand in for the reconnect that re-negotiates the quota, then reuse the
+     * same object: it must reserve again rather than ride the stale flag. */
+    test_client.server_recv_max = 1;
+    test_client.server_recv_max_negotiated = 1;
+    publish.stat.write = MQTT_MSG_BEGIN;
+    publish.stat.read = MQTT_MSG_BEGIN;
+    publish.packet_id = 31;
+    publish.buffer_pos = 0;
+
+    rc = MQTT_CODE_CONTINUE;
+    for (i = 0; i < 20 && rc == MQTT_CODE_CONTINUE; i++) {
+        rc = MqttClient_Publish_WriteOnly(&test_client, &publish, NULL);
+    }
+    ASSERT_EQ(0, test_client.server_recv_max);
 }
 #endif /* WOLFMQTT_NONBLOCK */
 #endif /* WOLFMQTT_MULTITHREAD */
@@ -3298,6 +3487,73 @@ TEST(wait_message_qos2_duplicate_publish_delivered_once)
     ASSERT_TRUE(g_pubresp_written);
     ASSERT_EQ(1, g_msg_cb_calls);
 }
+
+#ifdef WOLFMQTT_V5
+/* Rejects every delivery with a v5 failure reason, which HandlePacket copies
+ * into the outgoing PUBREC. */
+static int test_reject_message_cb(MqttClient* client, MqttMessage* msg,
+    byte msg_new, byte msg_done)
+{
+    (void)client; (void)msg_new; (void)msg_done;
+    g_msg_cb_calls++;
+    msg->resp.reason_code = MQTT_REASON_NOT_AUTHORIZED;
+    return MQTT_CODE_SUCCESS;
+}
+
+/* [MQTT-4.3.3] A PUBREC carrying a reason code >= 0x80 ends the QoS 2 exchange:
+ * no PUBREL follows, and the sender may reuse the packet id immediately. The
+ * receiver must therefore NOT record that id as awaiting PUBREL - the entry
+ * would never be cleared, holding a dedup slot forever and suppressing the next
+ * PUBLISH that legitimately reuses the id. Two v5 QoS 2 PUBLISHes share packet
+ * id 9; the callback rejects both, so both must reach the application. */
+TEST(wait_message_qos2_rejected_publish_not_deduped)
+{
+    int rc = MQTT_CODE_SUCCESS;
+    int i;
+    /* Two v5 QoS2 PUBLISH frames, both packet_id=9, topic "a", prop_len=0,
+     * payload "hi": type|qos2=0x34, remain=8. */
+    static const byte publish_v5_qos2[] = {
+        0x34, 0x08, 0x00, 0x01, 'a', 0x00, 0x09, 0x00, 'h', 'i',
+        0x34, 0x08, 0x00, 0x01, 'a', 0x00, 0x09, 0x00, 'h', 'i'
+    };
+
+    rc = test_init_client();
+    ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
+    test_client.protocol_level = MQTT_CONNECT_PROTOCOL_LEVEL_5;
+    test_client.msg_cb = test_reject_message_cb;
+    g_msg_cb_calls = 0;
+
+    g_pubresp_written = 0;
+    g_last_ack_written = MQTT_PACKET_TYPE_RESERVED;
+    test_net.write = mock_net_write_accept;
+    test_net.read = mock_net_read_canned;
+    XMEMCPY(g_canned_buf, publish_v5_qos2, sizeof(publish_v5_qos2));
+    g_canned_len = (int)sizeof(publish_v5_qos2);
+    g_canned_pos = 0;
+
+    for (i = 0; i < 40 && g_canned_pos < g_canned_len; i++) {
+        rc = MqttClient_WaitMessage(&test_client, TEST_CMD_TIMEOUT_MS);
+        if (rc != MQTT_CODE_SUCCESS && rc != MQTT_CODE_CONTINUE) {
+            break;
+        }
+    }
+
+    /* The rejected id was never tracked, so the second PUBLISH is a fresh
+     * message and must be delivered, not suppressed as a duplicate. */
+    ASSERT_EQ(2, g_msg_cb_calls);
+    ASSERT_EQ(0, test_client.recv_qos2_pending[0]);
+
+    /* Both were answered with a rejecting PUBREC. The second one carries the
+     * reason only because its delivery actually happened; a suppressed
+     * redelivery would leave the reason at success and shorten the frame. */
+    ASSERT_TRUE(g_pubresp_written);
+    ASSERT_EQ(MQTT_PACKET_TYPE_PUBLISH_REC, g_last_ack_written);
+    ASSERT_EQ(9, g_last_ack_id);
+    /* v5 PUBREC: type, remain, id hi, id lo, reason. */
+    ASSERT_EQ(5, connect_mock_xfer);
+    ASSERT_EQ(MQTT_REASON_NOT_AUTHORIZED, connect_mock_sent[4]);
+}
+#endif /* WOLFMQTT_V5 */
 #endif /* WOLFMQTT_MAX_QOS >= 2 */
 
 /* The four PUBLISH-response packet types (PUBACK 4, PUBREC 5, PUBREL 6,
@@ -4077,6 +4333,7 @@ void run_mqtt_client_tests(void)
 #if defined(WOLFMQTT_MULTITHREAD) || defined(WOLFMQTT_NONBLOCK)
     RUN_TEST(cancel_message_retains_recv_quota_on_wire);
     RUN_TEST(cancel_message_retain_is_idempotent);
+    RUN_TEST(cancel_message_reuse_does_not_bypass_recv_quota);
 #endif
     RUN_TEST(publish_qos1_v5_write_failure_restores_recv_quota);
 #if defined(WOLFMQTT_MULTITHREAD) && defined(WOLFMQTT_NONBLOCK) && \
@@ -4091,6 +4348,7 @@ void run_mqtt_client_tests(void)
     RUN_TEST(publish_writeonly_v5_receive_max_released_on_pubrec_reject);
 #endif
     RUN_TEST(publish_writeonly_v5_cancel_holds_receive_max);
+    RUN_TEST(disconnect_clears_recv_quota_ownership);
 #else
     RUN_TEST(publish_writeonly_v5_no_dangling_pendresp_on_success);
 #endif
@@ -4115,6 +4373,9 @@ void run_mqtt_client_tests(void)
     RUN_TEST(wait_message_qos2_publish_acks_pubrec);
 #if WOLFMQTT_MAX_QOS >= 2
     RUN_TEST(wait_message_qos2_duplicate_publish_delivered_once);
+#ifdef WOLFMQTT_V5
+    RUN_TEST(wait_message_qos2_rejected_publish_not_deduped);
+#endif
 #endif
     RUN_TEST(wait_message_pubrec_emits_pubrel);
     RUN_TEST(wait_message_pubrel_emits_pubcomp);

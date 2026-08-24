@@ -28,6 +28,25 @@
       `mqttclient` example now relies on the automatic ping, keeping its
       previous manual keep-alive loop under `WOLFMQTT_NO_TIME` (#501)
 
+* API / Behavior Changes
+    - A v5 `CONNECT` now advertises `Receive Maximum` set to
+      `MQTT_MAX_RECV_QOS2` (16 by default) unless the application supplied its
+      own `MQTT_PROP_RECEIVE_MAX`. This bounds the QoS 1 and QoS 2 PUBLISH
+      packets a conforming server may have in flight toward the client
+      [MQTT-3.3.4], keeping inbound QoS 2 within the client's de-duplication
+      table so a retransmitted PUBLISH cannot be delivered twice
+      [MQTT-4.3.3-10]. Override `MQTT_MAX_RECV_QOS2` in `user_settings.h` to
+      trade memory for a larger window, or set the property explicitly to keep
+      full control.
+    - In `WOLFMQTT_MULTITHREAD` builds, a QoS 2 PUBREC rejection processed by
+      the reading thread now also completes the originating
+      `MqttClient_Publish_WriteOnly` pending response with
+      `MQTT_CODE_ERROR_PUBLISH_REJECTED`, so the publisher's next poll returns
+      that error instead of spinning on `MQTT_CODE_CONTINUE` until
+      `cmd_timeout_ms`. This is the only v5 rejection surfaced on the write-only
+      path; a QoS 1 PUBACK or QoS 2 PUBCOMP reason code >= 0x80 is still not
+      detected there. Supersedes the v2.1.0 note below.
+
 ### v2.1.0 (07/02/2026)
 Release 2.1.0 has been developed according to wolfSSL's development and QA
 process (see link below) and successfully passed the quality criteria.
