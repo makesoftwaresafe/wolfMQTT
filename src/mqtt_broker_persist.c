@@ -1285,6 +1285,10 @@ struct wmqb_ended_session {
 };
 #endif
 
+/* wmqb_decode_and_insert_retained: record elapsed, distinct from the cap skip
+ * (1) so only genuinely dead keys are dropped from the store. */
+#define WMQB_RETAINED_EXPIRED 2
+
 /* Restore iterator context. Used for retained-msg, subs, session,
  * and OUTQ callbacks. */
 struct wmqb_restore_ctx {
@@ -1296,6 +1300,13 @@ struct wmqb_restore_ctx {
     /* Session keys whose zero Session Expiry ended them before this restart */
     struct wmqb_ended_session* ended;
     int         ended_count;
+#endif
+    /* Retained keys whose Message Expiry Interval elapsed before this restart */
+#ifdef WOLFMQTT_STATIC_MEMORY
+    byte        expired_key[BROKER_MAX_TOPIC_LEN];
+    word16      expired_key_len;
+#else
+    struct wmqb_wipe_key* expired;
 #endif
 };
 
@@ -1563,7 +1574,7 @@ static int wmqb_decode_and_insert_retained(MqttBroker* broker,
     if (expiry > 0 &&
             now >= (WOLFMQTT_BROKER_TIME_T)store_time &&
             (now - (WOLFMQTT_BROKER_TIME_T)store_time) >= expiry) {
-        return 1;
+        return WMQB_RETAINED_EXPIRED;
     }
 
 #ifdef WOLFMQTT_STATIC_MEMORY
@@ -1660,15 +1671,75 @@ static int wmqb_iter_retained_cb(const byte* key, word16 key_len,
 {
     struct wmqb_restore_ctx* c = (struct wmqb_restore_ctx*)cb_ctx;
     int rc;
-    (void)key; (void)key_len;
+#ifndef WOLFMQTT_STATIC_MEMORY
+    struct wmqb_wipe_key* node;
+#endif
+
     rc = wmqb_decode_and_insert_retained(c->broker, blob, blob_len);
     if (rc == 0) {
         c->loaded++;
+        return 0;
     }
-    else {
-        c->skipped++;
+    c->skipped++;
+    /* Elapsed while the broker was down: restore drops it from memory, so its
+     * record has to go too. Stash the key - the backend iterator must not be
+     * mutated while it runs. */
+    if (rc != WMQB_RETAINED_EXPIRED || key == NULL || key_len == 0) {
+        return 0;
     }
+#ifdef WOLFMQTT_STATIC_MEMORY
+    /* No allocator: carry one key per restore, the rest drain on later ones. */
+    if (c->expired_key_len == 0 && key_len <= sizeof(c->expired_key)) {
+        XMEMCPY(c->expired_key, key, key_len);
+        c->expired_key_len = key_len;
+    }
+#else
+    node = (struct wmqb_wipe_key*)WOLFMQTT_MALLOC(sizeof(*node));
+    if (node != NULL) {
+        node->key = (byte*)WOLFMQTT_MALLOC(key_len);
+        if (node->key == NULL) {
+            WOLFMQTT_FREE(node);
+        }
+        else {
+            XMEMCPY(node->key, key, key_len);
+            node->key_len = key_len;
+            node->next = c->expired;
+            c->expired = node;
+        }
+    }
+#endif
     return 0; /* always continue */
+}
+
+/* Retire the keys wmqb_iter_retained_cb stashed. del==0 just releases them,
+ * for the abort path where no on-disk state may change. */
+static void wmqb_restore_drop_expired_retained(MqttBroker* broker,
+    struct wmqb_restore_ctx* c, byte del)
+{
+#ifdef WOLFMQTT_STATIC_MEMORY
+    if (del && c->expired_key_len > 0 &&
+            wmqb_kv_del_commit(broker, BROKER_PERSIST_NS_RETAINED,
+                c->expired_key, c->expired_key_len) != 0) {
+        WMQB_LOG_ERR(broker, "broker: persist expired retained delete "
+            "failed - deferred to next restore");
+    }
+    c->expired_key_len = 0;
+#else
+    struct wmqb_wipe_key* cur = c->expired;
+
+    while (cur != NULL) {
+        struct wmqb_wipe_key* next = cur->next;
+        if (del && wmqb_kv_del_commit(broker, BROKER_PERSIST_NS_RETAINED,
+                cur->key, cur->key_len) != 0) {
+            WMQB_LOG_ERR(broker, "broker: persist expired retained delete "
+                "failed - deferred to next restore");
+        }
+        WOLFMQTT_FREE(cur->key);
+        WOLFMQTT_FREE(cur);
+        cur = next;
+    }
+    c->expired = NULL;
+#endif
 }
 
 /* Allocate orphan subs from a decoded NS_SUBS blob. The blob key carries
@@ -2561,9 +2632,11 @@ int BrokerPersist_Restore(MqttBroker* broker)
         if (rc != 0) {
             WMQB_LOG_ERR(broker,
                 "broker: persist restore retained failed rc=%d", rc);
+            wmqb_restore_drop_expired_retained(broker, &ctx, 0);
             BrokerPersist_RestoreRollback(broker);
             return rc;
         }
+        wmqb_restore_drop_expired_retained(broker, &ctx, 1);
         WMQB_LOG_INFO(broker,
             "broker: persist restore retained loaded=%d skipped=%d",
             ctx.loaded, ctx.skipped);
