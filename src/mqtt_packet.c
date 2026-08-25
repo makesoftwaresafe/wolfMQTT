@@ -251,6 +251,46 @@ int MqttPacket_SubAckReturnCodeValid(byte code, byte protocol_level)
 }
 
 #ifdef WOLFMQTT_V5
+/* [MQTT-3.14.2-1] Validate a DISCONNECT Reason Code against Table 3-10. */
+static int MqttPacket_DisconnectReasonCodeValid(byte code)
+{
+    switch (code) {
+        case MQTT_REASON_SUCCESS:                 /* 0x00 */
+        case MQTT_REASON_DISCONNECT_W_WILL_MSG:   /* 0x04 */
+        case MQTT_REASON_UNSPECIFIED_ERR:         /* 0x80 */
+        case MQTT_REASON_MALFORMED_PACKET:        /* 0x81 */
+        case MQTT_REASON_PROTOCOL_ERR:            /* 0x82 */
+        case MQTT_REASON_IMPL_SPECIFIC_ERR:       /* 0x83 */
+        case MQTT_REASON_NOT_AUTHORIZED:          /* 0x87 */
+        case MQTT_REASON_SERVER_BUSY:             /* 0x89 */
+        case MQTT_REASON_SERVER_SHUTTING_DOWN:    /* 0x8B */
+        case MQTT_REASON_KEEP_ALIVE_TIMEOUT:      /* 0x8D */
+        case MQTT_REASON_SESSION_TAKEN_OVER:      /* 0x8E */
+        case MQTT_REASON_TOPIC_FILTER_INVALID:    /* 0x8F */
+        case MQTT_REASON_TOPIC_NAME_INVALID:      /* 0x90 */
+        case MQTT_REASON_RX_MAX_EXCEEDED:         /* 0x93 */
+        case MQTT_REASON_TOPIC_ALIAS_INVALID:     /* 0x94 */
+        case MQTT_REASON_PACKET_TOO_LARGE:        /* 0x95 */
+        case MQTT_REASON_MSG_RATE_TOO_HIGH:       /* 0x96 */
+        case MQTT_REASON_QUOTA_EXCEEDED:          /* 0x97 */
+        case MQTT_REASON_ADMIN_ACTION:            /* 0x98 */
+        case MQTT_REASON_PAYLOAD_FORMAT_INVALID:  /* 0x99 */
+        case MQTT_REASON_RETAIN_NOT_SUPPORTED:    /* 0x9A */
+        case MQTT_REASON_QOS_NOT_SUPPORTED:       /* 0x9B */
+        case MQTT_REASON_USE_ANOTHER_SERVER:      /* 0x9C */
+        case MQTT_REASON_SERVER_MOVED:            /* 0x9D */
+        case MQTT_REASON_SS_NOT_SUPPORTED:        /* 0x9E */
+        case MQTT_REASON_CON_RATE_EXCEED:         /* 0x9F */
+        case MQTT_REASON_MAX_CON_TIME:            /* 0xA0 */
+        case MQTT_REASON_SUB_ID_NOT_SUP:           /* 0xA1 */
+        case MQTT_REASON_WILDCARD_SUB_NOT_SUP:     /* 0xA2 */
+            return 1;
+        default:
+            break;
+    }
+    return 0;
+}
+
 /* [MQTT-4.8.0-1] Validate a v5 UNSUBACK Reason Code against the fixed set in
  * MQTT 5.0 section 3.11.3. Returns 1 if allowed, 0 if reserved. */
 static int MqttPacket_UnsubAckReasonCodeValid(byte code)
@@ -817,6 +857,7 @@ int MqttEncode_Props(MqttPacketType packet, MqttProp* props, byte* buf)
 {
     int rc = 0, tmp;
     int prop_count = 0;
+    word32 seen_lo = 0, seen_hi = 0;
     MqttProp* cur_prop = props;
 
     /* loop through the list properties */
@@ -836,6 +877,29 @@ int MqttEncode_Props(MqttPacketType packet, MqttProp* props, byte* buf)
         if (!(gPropMatrix[cur_prop->type].packet_type_mask & (1 << packet))) {
             rc = MQTT_TRACE_ERROR(MQTT_CODE_ERROR_PROPERTY_MISMATCH);
             break;
+        }
+
+        /* MQTT 5.0 section 2.2.2.2 limits repeated properties. */
+        if (cur_prop->type != MQTT_PROP_USER_PROP &&
+                !(cur_prop->type == MQTT_PROP_SUBSCRIPTION_ID &&
+                  packet == MQTT_PACKET_TYPE_PUBLISH)) {
+            word32 bit;
+            if (cur_prop->type < 32) {
+                bit = (word32)1 << cur_prop->type;
+                if (seen_lo & bit) {
+                    rc = MQTT_TRACE_ERROR(MQTT_CODE_ERROR_PROPERTY);
+                    break;
+                }
+                seen_lo |= bit;
+            }
+            else {
+                bit = (word32)1 << (cur_prop->type - 32);
+                if (seen_hi & bit) {
+                    rc = MQTT_TRACE_ERROR(MQTT_CODE_ERROR_PROPERTY);
+                    break;
+                }
+                seen_hi |= bit;
+            }
         }
 
         /* Encode the Identifier */
@@ -1341,6 +1405,20 @@ int MqttDecode_Props(MqttPacketType packet, MqttProp** props, byte* pbuf,
 }
 #endif
 
+#ifdef WOLFMQTT_V5
+/* [MQTT-3.1.3.2] Will Properties allow-list, tighter than CONNECT's. */
+static int MqttWillProps_ValidateType(MqttPropertyType type)
+{
+    return (type == MQTT_PROP_WILL_DELAY_INTERVAL) ||
+           (type == MQTT_PROP_PAYLOAD_FORMAT_IND) ||
+           (type == MQTT_PROP_MSG_EXPIRY_INTERVAL) ||
+           (type == MQTT_PROP_CONTENT_TYPE) ||
+           (type == MQTT_PROP_RESP_TOPIC) ||
+           (type == MQTT_PROP_CORRELATION_DATA) ||
+           (type == MQTT_PROP_USER_PROP);
+}
+#endif /* WOLFMQTT_V5 */
+
 /* Packet Type Encoders/Decoders */
 int MqttEncode_Connect(byte *tx_buf, int tx_buf_len, MqttConnect *mc_connect)
 {
@@ -1457,6 +1535,19 @@ int MqttEncode_Connect(byte *tx_buf, int tx_buf_len, MqttConnect *mc_connect)
         remain_len += MQTT_DATA_LEN_SIZE;
 #ifdef WOLFMQTT_V5
     if (mc_connect->protocol_level >= MQTT_CONNECT_PROTOCOL_LEVEL_5) {
+        MqttProp* will_prop;
+        int will_prop_count = 0;
+
+        /* CONNECT and Will Properties have distinct allow-lists. Validate the
+         * Will context before the generic CONNECT property encoder writes. */
+        for (will_prop = mc_connect->lwt_msg->props; will_prop != NULL;
+                will_prop = will_prop->next) {
+            if (++will_prop_count > MQTT_MAX_PROPS ||
+                    !MqttWillProps_ValidateType(will_prop->type)) {
+                return MQTT_TRACE_ERROR(MQTT_CODE_ERROR_PROPERTY);
+            }
+        }
+
         /* Determine length of properties */
         lwt_props_len = MqttEncode_Props(MQTT_PACKET_TYPE_CONNECT,
                 mc_connect->lwt_msg->props, NULL);
@@ -1601,20 +1692,6 @@ int MqttEncode_Connect(byte *tx_buf, int tx_buf_len, MqttConnect *mc_connect)
     /* Return total length of packet */
     return header_len + remain_len;
 }
-
-#if defined(WOLFMQTT_BROKER) && defined(WOLFMQTT_V5)
-/* [MQTT-3.1.3.2] Will Properties allow-list, tighter than CONNECT's. */
-static int MqttWillProps_ValidateType(MqttPropertyType type)
-{
-    return (type == MQTT_PROP_WILL_DELAY_INTERVAL) ||
-           (type == MQTT_PROP_PAYLOAD_FORMAT_IND) ||
-           (type == MQTT_PROP_MSG_EXPIRY_INTERVAL) ||
-           (type == MQTT_PROP_CONTENT_TYPE) ||
-           (type == MQTT_PROP_RESP_TOPIC) ||
-           (type == MQTT_PROP_CORRELATION_DATA) ||
-           (type == MQTT_PROP_USER_PROP);
-}
-#endif /* WOLFMQTT_BROKER && WOLFMQTT_V5 */
 
 #ifdef WOLFMQTT_BROKER
 int MqttDecode_Connect(byte *rx_buf, int rx_buf_len, MqttConnect *mc_connect)
@@ -1853,6 +1930,15 @@ int MqttDecode_Connect(byte *rx_buf, int rx_buf_len, MqttConnect *mc_connect)
             rc = MQTT_TRACE_ERROR(MQTT_CODE_ERROR_OUT_OF_BUFFER);
             goto cleanup;
         }
+        /* [MQTT-3.1.3.3] Will Topic is a non-empty Topic Name. */
+        if (mc_connect->lwt_msg->topic_name_len == 0 ||
+                !MqttPacket_TopicNameValid(
+                    mc_connect->lwt_msg->topic_name,
+                    mc_connect->lwt_msg->topic_name_len,
+                    mc_connect->protocol_level)) {
+            rc = MQTT_TRACE_ERROR(MQTT_CODE_ERROR_MALFORMED_DATA);
+            goto cleanup;
+        }
         rx_payload += tmp;
 
         {
@@ -2004,27 +2090,39 @@ int MqttDecode_ConnectAck(byte *rx_buf, int rx_buf_len,
 #ifdef WOLFMQTT_V5
         connect_ack->props = NULL;
         if (connect_ack->protocol_level >= MQTT_CONNECT_PROTOCOL_LEVEL_5) {
+            byte* packet_end = &rx_buf[header_len + remain_len];
             word32 props_len = 0;
             int props_tmp;
+
             /* Decode Length of Properties */
-            if (rx_buf_len < (rx_payload - rx_buf)) {
-                return MQTT_TRACE_ERROR(MQTT_CODE_ERROR_OUT_OF_BUFFER);
-            }
             props_tmp = MqttDecode_Vbi(rx_payload, &props_len,
-                    (word32)(rx_buf_len - (rx_payload - rx_buf)));
+                    (word32)(packet_end - rx_payload));
             if (props_tmp < 0) {
                 return props_tmp;
             }
             rx_payload += props_tmp;
+            if (props_len > (word32)(packet_end - rx_payload)) {
+                return MQTT_TRACE_ERROR(MQTT_CODE_ERROR_OUT_OF_BUFFER);
+            }
             if (props_len > 0) {
                 /* Decode the Properties */
                 props_tmp = MqttDecode_Props(MQTT_PACKET_TYPE_CONNECT_ACK,
                                &connect_ack->props, rx_payload,
-                               (word32)(rx_buf_len - (rx_payload - rx_buf)),
+                               (word32)(packet_end - rx_payload),
                                props_len);
-                if (props_tmp < 0)
+                if (props_tmp < 0) {
                     return props_tmp;
+                }
                 rx_payload += props_tmp;
+            }
+            /* MQTT 5.0 section 3.2.2: the property block must consume the
+             * complete CONNACK variable header. */
+            if (rx_payload != packet_end) {
+                if (connect_ack->props != NULL) {
+                    (void)MqttProps_Free(connect_ack->props);
+                    connect_ack->props = NULL;
+                }
+                return MQTT_TRACE_ERROR(MQTT_CODE_ERROR_MALFORMED_DATA);
             }
         }
 #endif
@@ -2037,6 +2135,48 @@ int MqttDecode_ConnectAck(byte *rx_buf, int rx_buf_len,
 }
 
 #ifdef WOLFMQTT_BROKER
+/* Validate against MQTT v3.1.1 section 3.2.2.3 or the MQTT 5.0 CONNACK
+ * Reason Code table in section 3.2.2.2. */
+static int MqttPacket_ConnectAckReturnCodeValid(byte code,
+    byte protocol_level)
+{
+#ifdef WOLFMQTT_V5
+    if (protocol_level >= MQTT_CONNECT_PROTOCOL_LEVEL_5) {
+        switch (code) {
+            case MQTT_REASON_SUCCESS:
+            case MQTT_REASON_UNSPECIFIED_ERR:
+            case MQTT_REASON_MALFORMED_PACKET:
+            case MQTT_REASON_PROTOCOL_ERR:
+            case MQTT_REASON_IMPL_SPECIFIC_ERR:
+            case MQTT_REASON_UNSUP_PROTO_VER:
+            case MQTT_REASON_CLIENT_ID_NOT_VALID:
+            case MQTT_REASON_BAD_USER_OR_PASS:
+            case MQTT_REASON_NOT_AUTHORIZED:
+            case MQTT_REASON_SERVER_UNAVAILABLE:
+            case MQTT_REASON_SERVER_BUSY:
+            case MQTT_REASON_BANNED:
+            case MQTT_REASON_BAD_AUTH_METHOD:
+            case MQTT_REASON_TOPIC_NAME_INVALID:
+            case MQTT_REASON_PACKET_TOO_LARGE:
+            case MQTT_REASON_QUOTA_EXCEEDED:
+            case MQTT_REASON_PAYLOAD_FORMAT_INVALID:
+            case MQTT_REASON_RETAIN_NOT_SUPPORTED:
+            case MQTT_REASON_QOS_NOT_SUPPORTED:
+            case MQTT_REASON_USE_ANOTHER_SERVER:
+            case MQTT_REASON_SERVER_MOVED:
+            case MQTT_REASON_CON_RATE_EXCEED:
+                return 1;
+            default:
+                return 0;
+        }
+    }
+#else
+    (void)protocol_level;
+#endif
+
+    return code <= MQTT_CONNECT_ACK_CODE_REFUSED_NOT_AUTH;
+}
+
 int MqttEncode_ConnectAck(byte *tx_buf, int tx_buf_len,
     MqttConnectAck *connect_ack)
 {
@@ -2053,6 +2193,23 @@ int MqttEncode_ConnectAck(byte *tx_buf, int tx_buf_len,
 
     /* [MQTT-3.2.2-1] Connect Acknowledge Flags bits 1-7 are reserved (0) */
     if (connect_ack->flags & 0xFE) {
+        return MQTT_TRACE_ERROR(MQTT_CODE_ERROR_BAD_ARG);
+    }
+
+#ifdef WOLFMQTT_V5
+    if (!MqttPacket_ConnectAckReturnCodeValid(connect_ack->return_code,
+            connect_ack->protocol_level)) {
+#else
+    if (!MqttPacket_ConnectAckReturnCodeValid(connect_ack->return_code,
+            MQTT_CONNECT_PROTOCOL_LEVEL_4)) {
+#endif
+        return MQTT_TRACE_ERROR(MQTT_CODE_ERROR_BAD_ARG);
+    }
+
+    /* MQTT v3.1.1 [MQTT-3.2.2-4] and MQTT v5 [MQTT-3.2.2-6]:
+     * Session Present must be zero when the connection is refused. */
+    if ((connect_ack->flags & 0x01) != 0 &&
+            connect_ack->return_code != MQTT_CONNECT_ACK_CODE_ACCEPTED) {
         return MQTT_TRACE_ERROR(MQTT_CODE_ERROR_BAD_ARG);
     }
 
@@ -2849,7 +3006,8 @@ int MqttDecode_Subscribe(byte *rx_buf, int rx_buf_len, MqttSubscribe *subscribe)
     byte *rx_end;
 
     /* Validate required arguments */
-    if (rx_buf == NULL || rx_buf_len <= 0 || subscribe == NULL) {
+    if (rx_buf == NULL || rx_buf_len <= 0 || subscribe == NULL ||
+            subscribe->topics == NULL) {
         return MQTT_TRACE_ERROR(MQTT_CODE_ERROR_BAD_ARG);
     }
 
@@ -2911,9 +3069,6 @@ int MqttDecode_Subscribe(byte *rx_buf, int rx_buf_len, MqttSubscribe *subscribe)
 #endif
 
         subscribe->topic_count = 0;
-        if (subscribe->topics == NULL) {
-            return MQTT_TRACE_ERROR(MQTT_CODE_ERROR_BAD_ARG);
-        }
 
         while (rx_payload < rx_end) {
             MqttTopic *topic;
@@ -3282,7 +3437,8 @@ int MqttDecode_Unsubscribe(byte *rx_buf, int rx_buf_len, MqttUnsubscribe *unsubs
     byte *rx_end;
 
     /* Validate required arguments */
-    if (rx_buf == NULL || rx_buf_len <= 0 || unsubscribe == NULL) {
+    if (rx_buf == NULL || rx_buf_len <= 0 || unsubscribe == NULL ||
+            unsubscribe->topics == NULL) {
         return MQTT_TRACE_ERROR(MQTT_CODE_ERROR_BAD_ARG);
     }
 
@@ -3344,9 +3500,6 @@ int MqttDecode_Unsubscribe(byte *rx_buf, int rx_buf_len, MqttUnsubscribe *unsubs
 #endif
 
         unsubscribe->topic_count = 0;
-        if (unsubscribe->topics == NULL) {
-            return MQTT_TRACE_ERROR(MQTT_CODE_ERROR_BAD_ARG);
-        }
 
         while (rx_payload < rx_end) {
             MqttTopic *topic;
@@ -3533,6 +3686,11 @@ int MqttEncode_UnsubscribeAck(byte *tx_buf, int tx_buf_len, MqttUnsubscribeAck *
         return MQTT_TRACE_ERROR(MQTT_CODE_ERROR_BAD_ARG);
     }
 
+    /* [MQTT-2.3.1-1] UNSUBACK requires a non-zero Packet Identifier. */
+    if (unsubscribe_ack->packet_id == 0) {
+        return MQTT_TRACE_ERROR(MQTT_CODE_ERROR_PACKET_ID);
+    }
+
     /* Determine packet length */
     remain_len = MQTT_DATA_LEN_SIZE; /* For packet_id */
 #ifdef WOLFMQTT_V5
@@ -3554,6 +3712,15 @@ int MqttEncode_UnsubscribeAck(byte *tx_buf, int tx_buf_len, MqttUnsubscribeAck *
 
         if (unsubscribe_ack->reason_codes != NULL &&
             unsubscribe_ack->reason_code_count > 0) {
+            int i;
+
+            /* [MQTT-3.11.3-2] Do not serialize a reserved Reason Code. */
+            for (i = 0; i < unsubscribe_ack->reason_code_count; i++) {
+                if (!MqttPacket_UnsubAckReasonCodeValid(
+                        unsubscribe_ack->reason_codes[i])) {
+                    return MQTT_TRACE_ERROR(MQTT_CODE_ERROR_BAD_ARG);
+                }
+            }
             reason_code_count = unsubscribe_ack->reason_code_count;
             remain_len += reason_code_count;
         }
@@ -3681,6 +3848,9 @@ int MqttEncode_Disconnect(byte *tx_buf, int tx_buf_len,
     if ((disconnect != NULL) &&
         (disconnect->protocol_level >= MQTT_CONNECT_PROTOCOL_LEVEL_5)) {
 
+        if (!MqttPacket_DisconnectReasonCodeValid(disconnect->reason_code)) {
+            return MQTT_TRACE_ERROR(MQTT_CODE_ERROR_BAD_ARG);
+        }
         if (disconnect->props != NULL) {
             /* Determine length of properties */
             props_len = MqttEncode_Props(MQTT_PACKET_TYPE_DISCONNECT,
@@ -4053,7 +4223,9 @@ int MqttProps_Init(void)
     if (clientPropStack_lockInit == 0) {
         ret = wm_SemInit(&clientPropStack_lock);
     }
-    clientPropStack_lockInit++;
+    if (ret == MQTT_CODE_SUCCESS) {
+        clientPropStack_lockInit++;
+    }
 #endif
     return  ret;
 }
@@ -4065,9 +4237,14 @@ int MqttProps_ShutDown(void)
 {
     int ret = MQTT_CODE_SUCCESS;
 #if !defined(WOLFMQTT_DYN_PROP) && defined(WOLFMQTT_MULTITHREAD)
-    clientPropStack_lockInit--;
-    if (clientPropStack_lockInit == 0) {
+    if (clientPropStack_lockInit > 1) {
+        clientPropStack_lockInit--;
+    }
+    else if (clientPropStack_lockInit == 1) {
         ret = wm_SemFree(&clientPropStack_lock);
+        if (ret == MQTT_CODE_SUCCESS) {
+            clientPropStack_lockInit = 0;
+        }
     }
 #endif
     return ret;
@@ -4222,7 +4399,15 @@ int MqttPacket_Read(MqttClient *client, byte* rx_buf, int rx_buf_len,
     int timeout_ms)
 {
     int rc, len, remain_read = 0;
-    MqttPacket* header = (MqttPacket*)rx_buf;
+    MqttPacket* header;
+
+    if (client == NULL || rx_buf == NULL) {
+        return MQTT_TRACE_ERROR(MQTT_CODE_ERROR_BAD_ARG);
+    }
+    if (rx_buf_len < MQTT_PACKET_MAX_LEN_BYTES + 1) {
+        return MQTT_TRACE_ERROR(MQTT_CODE_ERROR_OUT_OF_BUFFER);
+    }
+    header = (MqttPacket*)rx_buf;
 
     switch (client->packet.stat)
     {
@@ -4268,6 +4453,9 @@ int MqttPacket_Read(MqttClient *client, byte* rx_buf, int rx_buf_len,
                 }
 
                 /* Read next byte and try decode again */
+                if (client->packet.header_len >= rx_buf_len) {
+                    return MQTT_TRACE_ERROR(MQTT_CODE_ERROR_OUT_OF_BUFFER);
+                }
                 len = 1;
                 rc = MqttSocket_Read(client, &rx_buf[client->packet.header_len],
                         len, timeout_ms);

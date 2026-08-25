@@ -66,7 +66,7 @@ usage: mqtt_broker [-p port] [-v level] [-u user] [-P pass]
 | `-K <file>` | TLS build | Server private key file (PEM) |
 | `-A <file>` | TLS build | CA certificate for mutual TLS (PEM) |
 | `-w <port>` | WebSocket build | WebSocket listen port (enables WebSocket) |
-| `-D <dir>` | persist build | Persistent storage directory (enables persistence; default `/var/lib/wolfmqtt`) |
+| `-D <dir>` | persist build | Persistent storage directory (enables persistence; default `/var/lib/wolfmqtt` on Linux or `/private/var/lib/wolfmqtt` on macOS) |
 | `-E <source>` | encrypt + dev-key build | Encryption key source. Only `dev` is recognized, selecting the development hard-coded key. NOT FOR PRODUCTION. |
 
 ## Build options
@@ -136,14 +136,15 @@ retained messages, and dynamic-memory offline queues across restarts. Static
 Session queues are RAM-only, so their queued QoS 1/2 publications do not
 survive a broker restart. The persistence layer is hook-based: a default POSIX
 backend stores records as files under the directory given with `-D` (default
-`/var/lib/wolfmqtt`). Embedded targets can supply their own storage backend
+`/var/lib/wolfmqtt` on Linux or `/private/var/lib/wolfmqtt` on macOS). Embedded
+targets can supply their own storage backend
 through `MqttBroker_SetPersistHooks()`.
 
 | Macro | Default | Description |
 |---|---|---|
 | `BROKER_MAX_PERSIST_SESSIONS` | 64 | Dynamic-memory persistent sessions retained across restarts |
 | `BROKER_MAX_OFFLINE_MSGS_PER_SUB` | 32 | Offline queue depth per session |
-| `WOLFMQTT_BROKER_PERSIST_SCHEMA_VER` | 3 | On-disk record schema version |
+| `WOLFMQTT_BROKER_PERSIST_SCHEMA_VER` | 5 | On-disk record schema version |
 
 ### Encryption at rest
 

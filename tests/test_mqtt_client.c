@@ -26,6 +26,13 @@
 #include "wolfmqtt/mqtt_client.h"
 #include "tests/unit_test.h"
 
+#if defined(WOLFMQTT_MULTITHREAD) && \
+    (defined(__MACH__) || defined(WOLFMQTT_POSIX_SEMAPHORES))
+    #include <errno.h>
+    #include <pthread.h>
+    #include <time.h>
+#endif
+
 void run_mqtt_client_tests(void);
 
 /* ============================================================================
@@ -89,6 +96,15 @@ static int mock_net_read_wouldblock(void *context, byte* buf, int buf_len,
     (void)context; (void)buf; (void)buf_len; (void)timeout_ms;
     return MQTT_CODE_CONTINUE;
 }
+
+#ifdef WOLFMQTT_V5
+static int mock_net_write_wouldblock(void *context, const byte* buf,
+    int buf_len, int timeout_ms)
+{
+    (void)context; (void)buf; (void)buf_len; (void)timeout_ms;
+    return MQTT_CODE_CONTINUE;
+}
+#endif
 #endif
 
 static int test_client_inited;
@@ -186,6 +202,23 @@ TEST(init_zero_rx_buf_len)
                          test_rx_buf, 0,
                          TEST_CMD_TIMEOUT_MS);
     ASSERT_EQ(MQTT_CODE_ERROR_BAD_ARG, rc);
+}
+
+TEST(init_positive_rx_buf_len_supported)
+{
+    int rx_len;
+    int rc;
+
+    /* MqttClient_Init is shared by MQTT and MQTT-SN, whose minimum headers
+     * differ. Protocol-specific packet readers enforce their own minimum. */
+    for (rx_len = 1; rx_len < MQTT_PACKET_MAX_LEN_BYTES + 1; rx_len++) {
+        rc = MqttClient_Init(&test_client, &test_net, NULL,
+                             test_tx_buf, TEST_TX_BUF_SIZE,
+                             test_rx_buf, rx_len,
+                             TEST_CMD_TIMEOUT_MS);
+        ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
+        MqttClient_DeInit(&test_client);
+    }
 }
 
 TEST(init_success)
@@ -1314,6 +1347,10 @@ static void drive_fatal_proto_teardown(const byte* frame, int frame_len,
     ASSERT_EQ(expected_rc, rc);
     ASSERT_EQ(0, (int)(MqttClient_Flags(&test_client, 0, 0) &
                        MQTT_CLIENT_FLAG_IS_CONNECTED));
+    /* A terminal receive error releases lockRecv and must also reset the wait
+     * object so its next use starts by reacquiring that lock. */
+    ASSERT_EQ(MQTT_MSG_BEGIN, test_client.msg.stat.read);
+    ASSERT_EQ(0, test_client.msg.stat.isReadActive);
 }
 
 /* An unexpected client-only packet type (CONNECT) arriving from the peer is a
@@ -1330,6 +1367,7 @@ TEST(wait_message_fatal_packet_type_clears_is_connected)
  * Method is a fatal PROPERTY error and must clear IS_CONNECTED. */
 TEST(wait_message_fatal_property_clears_is_connected)
 {
+    int i;
     /* AUTH, remain=6, reason=0x18 (Continue Auth), prop_len=4,
      * AUTH_DATA(0x16)="x" with no Auth Method. */
     static const byte frame[] = {
@@ -1337,7 +1375,61 @@ TEST(wait_message_fatal_property_clears_is_connected)
     };
     drive_fatal_proto_teardown(frame, (int)sizeof(frame),
         MQTT_CODE_ERROR_PROPERTY);
+    for (i = 0; i < TEST_RX_BUF_SIZE; i++) {
+        ASSERT_EQ(0, test_rx_buf[i]);
+    }
 }
+
+#ifdef WOLFMQTT_NONBLOCK
+TEST(wait_message_fatal_property_pending_ack_scrubs_rx_buf)
+{
+    MqttMsgStat next_stat;
+    int rc;
+    int i;
+    static const byte frame[] = {
+        0xF0, 0x06, 0x18, 0x04, 0x16, 0x00, 0x01, 'x'
+    };
+
+    ASSERT_EQ(MQTT_CODE_SUCCESS, test_init_client());
+    test_client.protocol_level = MQTT_CONNECT_PROTOCOL_LEVEL_5;
+    test_net.write = mock_net_write_wouldblock;
+    test_net.read = mock_net_read_canned;
+    XMEMCPY(g_canned_buf, frame, sizeof(frame));
+    g_canned_len = (int)sizeof(frame);
+    g_canned_pos = 0;
+
+    test_client.packetAck.packet_type = MQTT_PACKET_TYPE_PUBLISH_ACK;
+    test_client.packetAck.packet_id = 1;
+    test_client.packetAck.protocol_level = MQTT_CONNECT_PROTOCOL_LEVEL_5;
+
+    ASSERT_EQ(MQTT_CODE_SUCCESS,
+        MqttWriteStart(&test_client, &test_client.msg.stat));
+    rc = MqttEncode_PublishResp(test_client.tx_buf, test_client.tx_buf_len,
+        test_client.packetAck.packet_type, &test_client.packetAck);
+    ASSERT_TRUE(rc > 0);
+    test_client.write.len = rc;
+    test_client.msg.stat.ack = MQTT_MSG_HEADER;
+    ASSERT_EQ(MQTT_CODE_CONTINUE,
+        MqttPacket_Write(&test_client, test_client.tx_buf,
+            test_client.write.len));
+
+    rc = MqttClient_WaitMessage(&test_client, TEST_CMD_TIMEOUT_MS);
+    ASSERT_EQ(MQTT_CODE_ERROR_PROPERTY, rc);
+    ASSERT_EQ(0, test_client.msg.stat.isWriteActive);
+    ASSERT_EQ(0, test_client.write.isActive);
+    ASSERT_EQ(MQTT_MSG_BEGIN, test_client.msg.stat.ack);
+    for (i = 0; i < TEST_RX_BUF_SIZE; i++) {
+        ASSERT_EQ(0, test_rx_buf[i]);
+    }
+    for (i = 0; i < TEST_TX_BUF_SIZE; i++) {
+        ASSERT_EQ(0, test_tx_buf[i]);
+    }
+
+    XMEMSET(&next_stat, 0, sizeof(next_stat));
+    ASSERT_EQ(MQTT_CODE_SUCCESS, MqttWriteStart(&test_client, &next_stat));
+    MqttWriteStop(&test_client, &next_stat);
+}
+#endif
 #endif /* WOLFMQTT_V5 */
 
 #ifdef WOLFMQTT_V5
@@ -1567,12 +1659,10 @@ TEST(publish_v5_within_max_packet_size_allowed)
     ASSERT_TRUE(g_frames_written > 0);
 }
 
-/* MQTT v5 [3.1.2.11.6]: only Max QoS 0 or 1 are legal. A non-conforming or
- * malicious broker that advertises a larger value (2 here) must be clamped to
- * MQTT_QOS_1 before being narrowed against this build's WOLFMQTT_MAX_QOS, so the
- * client-side publish guard cannot be tricked into permitting QoS 2. Exercises
- * the clamp branch that the in-spec acceptance test above does not reach. */
-TEST(connect_accepted_connack_clamps_illegal_max_qos)
+/* MQTT 5.0 section 3.2.2.3.4: Maximum QoS can only be 0 or 1. Feed an
+ * independently constructed CONNACK containing 2 and require the client to
+ * reject the connection instead of normalizing the invalid wire value. */
+TEST(connect_accepted_connack_rejects_illegal_max_qos)
 {
     int rc;
     int i;
@@ -1604,11 +1694,50 @@ TEST(connect_accepted_connack_clamps_illegal_max_qos)
         rc = MqttClient_Connect(&test_client, &connect);
     }
 
-    ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
+    ASSERT_EQ(MQTT_CODE_ERROR_SERVER_PROP, rc);
     ASSERT_EQ(MQTT_CONNECT_ACK_CODE_ACCEPTED, connect.ack.return_code);
-    /* Illegal QoS 2 is clamped to 1, then narrowed against WOLFMQTT_MAX_QOS. */
-    ASSERT_EQ((WOLFMQTT_MAX_QOS < MQTT_QOS_1) ? (byte)WOLFMQTT_MAX_QOS :
-              MQTT_QOS_1, test_client.max_qos);
+    ASSERT_EQ(WOLFMQTT_MAX_QOS, test_client.max_qos);
+}
+
+/* MQTT 5.0 section 3.2.2.3.5: Retain Available can only be 0 or 1. Feed an
+ * independently constructed CONNACK containing 2 and require a protocol
+ * failure rather than accepting it as Retain Available=1. */
+TEST(connect_accepted_connack_rejects_illegal_retain_available)
+{
+    int rc;
+    int i;
+    MqttConnect connect;
+    /* CONNACK v5 with an out-of-spec Retain Available of 2: type=0x20,
+     * remain=0x05, flags=0x00, return_code=0x00, prop_len=0x02,
+     * [0x25 0x02]=Retain Available 2. */
+    static const byte connack[] = {
+        0x20, 0x05, 0x00, 0x00, 0x02,
+        0x25, 0x02
+    };
+
+    rc = test_init_client();
+    ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
+    test_client.protocol_level = MQTT_CONNECT_PROTOCOL_LEVEL_5;
+
+    test_net.write = mock_net_write_accept;
+    test_net.read = mock_net_read_canned;
+    XMEMCPY(g_canned_buf, connack, sizeof(connack));
+    g_canned_len = (int)sizeof(connack);
+    g_canned_pos = 0;
+
+    XMEMSET(&connect, 0, sizeof(connect));
+    connect.keep_alive_sec = 60;
+    connect.clean_session = 1;
+    connect.client_id = "test_client";
+
+    rc = MQTT_CODE_CONTINUE;
+    for (i = 0; i < 10 && rc == MQTT_CODE_CONTINUE; i++) {
+        rc = MqttClient_Connect(&test_client, &connect);
+    }
+
+    ASSERT_EQ(MQTT_CODE_ERROR_SERVER_PROP, rc);
+    ASSERT_EQ(MQTT_CONNECT_ACK_CODE_ACCEPTED, connect.ack.return_code);
+    ASSERT_EQ(1, test_client.retain_avail);
 }
 #endif /* WOLFMQTT_V5 */
 
@@ -1695,6 +1824,93 @@ TEST(unsubscribe_broker_rejection_returns_unsubscribe_rejected)
 
     ASSERT_EQ(MQTT_CODE_ERROR_UNSUBSCRIBE_REJECTED, rc);
 }
+
+/* [MQTT-3.11.3-1] A v5 UNSUBACK must contain exactly one Reason Code for
+ * each Topic Filter in the matching UNSUBSCRIBE. Missing codes must not be
+ * interpreted as successful removals. */
+TEST(unsubscribe_too_few_reason_codes_is_malformed)
+{
+    int rc;
+    int i;
+    MqttUnsubscribe unsub;
+    MqttTopic topics[2];
+    /* Hand-built v5 UNSUBACK: one reason code for two requested filters. */
+    static const byte unsuback[] = {
+        0xB0, 0x04, 0x00, 0x2C, 0x00, 0x00
+    };
+
+    rc = test_init_client();
+    ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
+    test_client.protocol_level = MQTT_CONNECT_PROTOCOL_LEVEL_5;
+    (void)MqttClient_Flags(&test_client, 0,
+        MQTT_CLIENT_FLAG_IS_CONNECTED);
+
+    test_net.write = mock_net_write_accept;
+    test_net.read = mock_net_read_canned;
+    XMEMCPY(g_canned_buf, unsuback, sizeof(unsuback));
+    g_canned_len = (int)sizeof(unsuback);
+    g_canned_pos = 0;
+
+    XMEMSET(&unsub, 0, sizeof(unsub));
+    XMEMSET(topics, 0, sizeof(topics));
+    topics[0].topic_filter = "test/one";
+    topics[1].topic_filter = "test/two";
+    unsub.packet_id = 44;
+    unsub.topic_count = 2;
+    unsub.topics = topics;
+
+    rc = MQTT_CODE_CONTINUE;
+    for (i = 0; i < 10 && rc == MQTT_CODE_CONTINUE; i++) {
+        rc = MqttClient_Unsubscribe(&test_client, &unsub);
+    }
+
+    ASSERT_EQ(MQTT_CODE_ERROR_MALFORMED_DATA, rc);
+    ASSERT_EQ(0, (int)(MqttClient_Flags(&test_client, 0, 0) &
+                       MQTT_CLIENT_FLAG_IS_CONNECTED));
+}
+
+/* [MQTT-3.11.3-1] Extra Reason Codes are also malformed because they cannot
+ * correspond one-for-one with the Topic Filters in the request. */
+TEST(unsubscribe_too_many_reason_codes_is_malformed)
+{
+    int rc;
+    int i;
+    MqttUnsubscribe unsub;
+    MqttTopic topics[2];
+    /* Hand-built v5 UNSUBACK: three reason codes for two requested filters. */
+    static const byte unsuback[] = {
+        0xB0, 0x06, 0x00, 0x2D, 0x00, 0x00, 0x00, 0x00
+    };
+
+    rc = test_init_client();
+    ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
+    test_client.protocol_level = MQTT_CONNECT_PROTOCOL_LEVEL_5;
+    (void)MqttClient_Flags(&test_client, 0,
+        MQTT_CLIENT_FLAG_IS_CONNECTED);
+
+    test_net.write = mock_net_write_accept;
+    test_net.read = mock_net_read_canned;
+    XMEMCPY(g_canned_buf, unsuback, sizeof(unsuback));
+    g_canned_len = (int)sizeof(unsuback);
+    g_canned_pos = 0;
+
+    XMEMSET(&unsub, 0, sizeof(unsub));
+    XMEMSET(topics, 0, sizeof(topics));
+    topics[0].topic_filter = "test/one";
+    topics[1].topic_filter = "test/two";
+    unsub.packet_id = 45;
+    unsub.topic_count = 2;
+    unsub.topics = topics;
+
+    rc = MQTT_CODE_CONTINUE;
+    for (i = 0; i < 10 && rc == MQTT_CODE_CONTINUE; i++) {
+        rc = MqttClient_Unsubscribe(&test_client, &unsub);
+    }
+
+    ASSERT_EQ(MQTT_CODE_ERROR_MALFORMED_DATA, rc);
+    ASSERT_EQ(0, (int)(MqttClient_Flags(&test_client, 0, 0) &
+                       MQTT_CLIENT_FLAG_IS_CONNECTED));
+}
 #endif /* WOLFMQTT_V5 */
 
 /* ============================================================================
@@ -1760,6 +1976,209 @@ TEST(ping_null_client)
     rc = MqttClient_Ping(NULL);
     ASSERT_EQ(MQTT_CODE_ERROR_BAD_ARG, rc);
 }
+
+static int mock_net_read_ping_timeout(void *context, byte* buf, int buf_len,
+    int timeout_ms)
+{
+    (void)context;
+    (void)buf;
+    (void)buf_len;
+    (void)timeout_ms;
+    return MQTT_CODE_ERROR_TIMEOUT;
+}
+
+TEST(ping_response_timeout_disconnects_network)
+{
+    int rc;
+
+    rc = test_init_client();
+    ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
+
+    (void)MqttClient_Flags(&test_client, 0, MQTT_CLIENT_FLAG_IS_CONNECTED);
+    g_disconnect_calls = 0;
+    g_frames_written = 0;
+    test_net.write = mock_net_write_accept;
+    test_net.read = mock_net_read_ping_timeout;
+    test_net.disconnect = mock_net_disconnect_counting;
+
+    rc = MqttClient_Ping(&test_client);
+
+    ASSERT_EQ(MQTT_CODE_ERROR_TIMEOUT, rc);
+    ASSERT_EQ(1, g_frames_written);
+    ASSERT_EQ(1, g_disconnect_calls);
+    ASSERT_EQ(0, (int)(MqttClient_Flags(&test_client, 0, 0) &
+                       MQTT_CLIENT_FLAG_IS_CONNECTED));
+}
+
+#if defined(WOLFMQTT_MULTITHREAD) && \
+    (defined(__MACH__) || defined(WOLFMQTT_POSIX_SEMAPHORES))
+typedef struct PingTimeoutRaceCtx {
+    pthread_mutex_t mutex;
+    pthread_cond_t cond;
+    MqttPublish publish;
+    byte payload;
+    int read_waiting;
+    int writer_active;
+    int disconnect_calls;
+    int disconnect_during_write;
+    int sync_error;
+    int ping_rc;
+    int publish_rc;
+} PingTimeoutRaceCtx;
+
+static int mock_net_write_ping_timeout_race(void *context, const byte* buf,
+    int buf_len, int timeout_ms)
+{
+    PingTimeoutRaceCtx* race = (PingTimeoutRaceCtx*)context;
+    struct timespec deadline;
+    int wait_rc = 0;
+
+    (void)timeout_ms;
+    if (buf_len > 0 && (buf[0] >> 4) == MQTT_PACKET_TYPE_PING_REQ) {
+        return buf_len;
+    }
+
+    if (pthread_mutex_lock(&race->mutex) != 0) {
+        race->sync_error = 1;
+        return MQTT_CODE_ERROR_SYSTEM;
+    }
+    race->writer_active = 1;
+    if (pthread_cond_broadcast(&race->cond) != 0 ||
+            clock_gettime(CLOCK_REALTIME, &deadline) != 0) {
+        race->sync_error = 1;
+        race->writer_active = 0;
+        (void)pthread_mutex_unlock(&race->mutex);
+        return MQTT_CODE_ERROR_SYSTEM;
+    }
+    deadline.tv_sec++;
+    while (race->disconnect_calls == 0 && wait_rc == 0) {
+        wait_rc = pthread_cond_timedwait(&race->cond, &race->mutex,
+            &deadline);
+    }
+    if (wait_rc != 0 && wait_rc != ETIMEDOUT) {
+        race->sync_error = 1;
+    }
+    race->writer_active = 0;
+    if (pthread_mutex_unlock(&race->mutex) != 0) {
+        race->sync_error = 1;
+        return MQTT_CODE_ERROR_SYSTEM;
+    }
+    return buf_len;
+}
+
+static int mock_net_read_ping_timeout_race(void *context, byte* buf,
+    int buf_len, int timeout_ms)
+{
+    PingTimeoutRaceCtx* race = (PingTimeoutRaceCtx*)context;
+
+    (void)buf;
+    (void)buf_len;
+    (void)timeout_ms;
+    if (pthread_mutex_lock(&race->mutex) != 0) {
+        race->sync_error = 1;
+        return MQTT_CODE_ERROR_SYSTEM;
+    }
+    race->read_waiting = 1;
+    if (pthread_cond_broadcast(&race->cond) != 0) {
+        race->sync_error = 1;
+        (void)pthread_mutex_unlock(&race->mutex);
+        return MQTT_CODE_ERROR_SYSTEM;
+    }
+    while (race->writer_active == 0) {
+        if (pthread_cond_wait(&race->cond, &race->mutex) != 0) {
+            race->sync_error = 1;
+            (void)pthread_mutex_unlock(&race->mutex);
+            return MQTT_CODE_ERROR_SYSTEM;
+        }
+    }
+    if (pthread_mutex_unlock(&race->mutex) != 0) {
+        race->sync_error = 1;
+        return MQTT_CODE_ERROR_SYSTEM;
+    }
+    return MQTT_CODE_ERROR_TIMEOUT;
+}
+
+static int mock_net_disconnect_ping_timeout_race(void *context)
+{
+    PingTimeoutRaceCtx* race = (PingTimeoutRaceCtx*)context;
+
+    if (pthread_mutex_lock(&race->mutex) != 0) {
+        race->sync_error = 1;
+        return MQTT_CODE_ERROR_SYSTEM;
+    }
+    race->disconnect_calls++;
+    if (race->writer_active != 0) {
+        race->disconnect_during_write = 1;
+    }
+    if (pthread_cond_broadcast(&race->cond) != 0 ||
+            pthread_mutex_unlock(&race->mutex) != 0) {
+        race->sync_error = 1;
+        return MQTT_CODE_ERROR_SYSTEM;
+    }
+    return MQTT_CODE_SUCCESS;
+}
+
+static void* ping_timeout_race_ping_thread(void* arg)
+{
+    PingTimeoutRaceCtx* race = (PingTimeoutRaceCtx*)arg;
+
+    race->ping_rc = MqttClient_Ping(&test_client);
+    return NULL;
+}
+
+static void* ping_timeout_race_publish_thread(void* arg)
+{
+    PingTimeoutRaceCtx* race = (PingTimeoutRaceCtx*)arg;
+
+    race->publish_rc = MqttClient_Publish(&test_client, &race->publish);
+    return NULL;
+}
+
+TEST(ping_timeout_waits_for_concurrent_writer)
+{
+    PingTimeoutRaceCtx race;
+    pthread_t ping_thread;
+    pthread_t publish_thread;
+    int rc;
+
+    rc = test_init_client();
+    ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
+    XMEMSET(&race, 0, sizeof(race));
+    ASSERT_EQ(0, pthread_mutex_init(&race.mutex, NULL));
+    ASSERT_EQ(0, pthread_cond_init(&race.cond, NULL));
+
+    race.publish.topic_name = "race/topic";
+    race.publish.qos = MQTT_QOS_0;
+    race.publish.buffer = &race.payload;
+    race.publish.total_len = 1;
+    test_net.context = &race;
+    test_net.write = mock_net_write_ping_timeout_race;
+    test_net.read = mock_net_read_ping_timeout_race;
+    test_net.disconnect = mock_net_disconnect_ping_timeout_race;
+    (void)MqttClient_Flags(&test_client, 0, MQTT_CLIENT_FLAG_IS_CONNECTED);
+
+    ASSERT_EQ(0, pthread_create(&ping_thread, NULL,
+        ping_timeout_race_ping_thread, &race));
+    ASSERT_EQ(0, pthread_mutex_lock(&race.mutex));
+    while (race.read_waiting == 0) {
+        ASSERT_EQ(0, pthread_cond_wait(&race.cond, &race.mutex));
+    }
+    ASSERT_EQ(0, pthread_mutex_unlock(&race.mutex));
+    ASSERT_EQ(0, pthread_create(&publish_thread, NULL,
+        ping_timeout_race_publish_thread, &race));
+
+    ASSERT_EQ(0, pthread_join(ping_thread, NULL));
+    ASSERT_EQ(0, pthread_join(publish_thread, NULL));
+    ASSERT_EQ(MQTT_CODE_ERROR_TIMEOUT, race.ping_rc);
+    ASSERT_EQ(MQTT_CODE_SUCCESS, race.publish_rc);
+    ASSERT_EQ(1, race.disconnect_calls);
+    ASSERT_EQ(0, race.disconnect_during_write);
+    ASSERT_EQ(0, race.sync_error);
+
+    ASSERT_EQ(0, pthread_cond_destroy(&race.cond));
+    ASSERT_EQ(0, pthread_mutex_destroy(&race.mutex));
+}
+#endif
 
 /* ============================================================================
  * MqttClient_Subscribe Tests
@@ -1884,6 +2303,12 @@ static int pub_multifill_cb(MqttPublish* publish)
     return (int)n;
 }
 
+static int pub_full_buffer_cb(MqttPublish* publish)
+{
+    XMEMSET(publish->buffer, PUB_STREAM_FILL, publish->buffer_len);
+    return (int)publish->buffer_len;
+}
+
 /* Fills only the valid region of the callback buffer, leaving the guard bytes
  * that follow it untouched. */
 static int pub_stream_cb(MqttPublish* publish)
@@ -1976,6 +2401,40 @@ TEST(publish_stream_cb_multifill_full_payload)
     }
     ASSERT_EQ(PUB_MULTI_TOTAL_LEN, fill_seen);
     ASSERT_EQ(0, guard_seen);
+}
+
+/* A callback may fill its whole buffer on every invocation. The library must
+ * limit the final fill to the remaining declared payload length. */
+TEST(publish_stream_cb_overreturn_clamped_to_total)
+{
+    int rc;
+    int i;
+    MqttPublish publish;
+
+    rc = test_init_client();
+    ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
+
+    pub_stream_wire_len = 0;
+    pub_stream_hdr_len = 0;
+    XMEMSET(pub_stream_wire, 0, sizeof(pub_stream_wire));
+    XMEMSET(pub_stream_backing, 0, sizeof(pub_stream_backing));
+    test_net.write = mock_net_write_accum;
+
+    XMEMSET(&publish, 0, sizeof(publish));
+    publish.qos = MQTT_QOS_0;
+    publish.topic_name = "t";
+    publish.buffer = pub_stream_backing;
+    publish.buffer_len = PUB_STREAM_VALID_LEN;
+    publish.total_len = PUB_MULTI_TOTAL_LEN;
+
+    rc = MQTT_CODE_CONTINUE;
+    for (i = 0; i < 40 && rc == MQTT_CODE_CONTINUE; i++) {
+        rc = MqttClient_Publish_ex(&test_client, &publish,
+            pub_full_buffer_cb);
+    }
+    ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
+    ASSERT_EQ(PUB_MULTI_TOTAL_LEN,
+        pub_stream_wire_len - pub_stream_hdr_len);
 }
 
 #ifdef WOLFMQTT_NONBLOCK
@@ -2208,6 +2667,7 @@ TEST(publish_qos2_v5_broker_rejection_returns_publish_rejected)
 TEST(publish_qos2_v5_success_returns_success)
 {
     int rc;
+    int i;
     MqttPublish publish;
     static byte payload[] = "hello";
     /* PUBREC success (no reason byte): type=0x50, remain=2, packet_id=14.
@@ -2215,6 +2675,11 @@ TEST(publish_qos2_v5_success_returns_success)
     static const byte resp[] = {
         0x50, 0x02, 0x00, 0x0E,
         0x70, 0x02, 0x00, 0x0E
+    };
+    static const byte success_pubrel[] = { 0x62, 0x02, 0x00, 0x0E };
+    static const byte stray_pubrec[] = { 0x50, 0x02, 0x00, 0x0E };
+    static const byte unknown_pubrel[] = {
+        0x62, 0x03, 0x00, 0x0E, MQTT_REASON_PACKET_ID_NOT_FOUND
     };
 
     XMEMSET(&publish, 0, sizeof(publish));
@@ -2231,6 +2696,25 @@ TEST(publish_qos2_v5_success_returns_success)
     ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
     ASSERT_EQ(MQTT_REASON_SUCCESS, publish.resp.reason_code);
     ASSERT_TRUE(g_pubrel_written);
+    ASSERT_EQ((int)sizeof(success_pubrel), connect_mock_xfer);
+    ASSERT_MEM_EQ(success_pubrel, connect_mock_sent, sizeof(success_pubrel));
+
+    /* The matching PUBCOMP completed the tracked flow. Repeating its PUBREC
+     * through the generic receive path must now report the ID as unknown. */
+    XMEMCPY(g_canned_buf, stray_pubrec, sizeof(stray_pubrec));
+    g_canned_len = (int)sizeof(stray_pubrec);
+    g_canned_pos = 0;
+    connect_mock_xfer = 0;
+    XMEMSET(connect_mock_sent, 0, sizeof(connect_mock_sent));
+
+    rc = MQTT_CODE_CONTINUE;
+    for (i = 0; i < 20 && rc == MQTT_CODE_CONTINUE; i++) {
+        rc = MqttClient_WaitMessage(&test_client, TEST_CMD_TIMEOUT_MS);
+    }
+
+    ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
+    ASSERT_EQ((int)sizeof(unknown_pubrel), connect_mock_xfer);
+    ASSERT_MEM_EQ(unknown_pubrel, connect_mock_sent, sizeof(unknown_pubrel));
 }
 
 /* The primary QoS 2 rejection point is the PUBREC: a v5 broker reports
@@ -2656,6 +3140,72 @@ TEST(publish_qos2_v5_pubrec_rejection_multithread_reader)
     ASSERT_FALSE(g_pubrel_written);
     /* The publisher's own struct is NOT updated on this path. */
     ASSERT_EQ(MQTT_REASON_SUCCESS, publish.resp.reason_code);
+}
+
+/* A reader thread must recognize the PUBCOMP-keyed pending entry as the
+ * outbound state for an intermediate PUBREC, then stop recognizing it after
+ * the matching PUBCOMP completes and the publisher consumes that response. */
+TEST(publish_qos2_v5_pubrec_state_multithread_reader)
+{
+    int rc;
+    int i;
+    static MqttPublish publish;
+    static byte payload[] = "hello";
+    static const byte pubrec[] = { 0x50, 0x02, 0x00, 0x0F };
+    static const byte pubcomp[] = { 0x70, 0x02, 0x00, 0x0F };
+    static const byte success_pubrel[] = { 0x62, 0x02, 0x00, 0x0F };
+    static const byte unknown_pubrel[] = {
+        0x62, 0x03, 0x00, 0x0F, MQTT_REASON_PACKET_ID_NOT_FOUND
+    };
+
+    rc = test_init_client();
+    ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
+    test_client.protocol_level = MQTT_CONNECT_PROTOCOL_LEVEL_5;
+    test_net.write = mock_net_write_accept;
+    test_net.read = mock_net_read_canned;
+
+    XMEMSET(&publish, 0, sizeof(publish));
+    publish.qos = MQTT_QOS_2;
+    publish.packet_id = 15;
+    publish.topic_name = "test/topic";
+    publish.buffer = payload;
+    publish.total_len = (word32)(sizeof(payload) - 1);
+    publish.buffer_len = publish.total_len;
+
+    rc = MqttClient_Publish_WriteOnly(&test_client, &publish, NULL);
+    ASSERT_EQ(MQTT_CODE_CONTINUE, rc);
+
+    XMEMCPY(g_canned_buf, pubrec, sizeof(pubrec));
+    g_canned_len = (int)sizeof(pubrec);
+    g_canned_pos = 0;
+    connect_mock_xfer = 0;
+    rc = MqttClient_WaitMessage(&test_client, TEST_CMD_TIMEOUT_MS);
+    ASSERT_EQ(MQTT_CODE_CONTINUE, rc);
+    ASSERT_EQ((int)sizeof(success_pubrel), connect_mock_xfer);
+    ASSERT_MEM_EQ(success_pubrel, connect_mock_sent, sizeof(success_pubrel));
+
+    XMEMCPY(g_canned_buf, pubcomp, sizeof(pubcomp));
+    g_canned_len = (int)sizeof(pubcomp);
+    g_canned_pos = 0;
+    rc = MqttClient_WaitMessage(&test_client, TEST_CMD_TIMEOUT_MS);
+    ASSERT_EQ(MQTT_CODE_CONTINUE, rc);
+    ASSERT_EQ((int)sizeof(pubcomp), g_canned_pos);
+
+    for (i = 0; i < 20 && rc == MQTT_CODE_CONTINUE; i++) {
+        rc = MqttClient_Publish_WriteOnly(&test_client, &publish, NULL);
+    }
+    ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
+    ASSERT_NULL(test_client.firstPendResp);
+
+    XMEMCPY(g_canned_buf, pubrec, sizeof(pubrec));
+    g_canned_len = (int)sizeof(pubrec);
+    g_canned_pos = 0;
+    connect_mock_xfer = 0;
+    XMEMSET(connect_mock_sent, 0, sizeof(connect_mock_sent));
+    rc = MqttClient_WaitMessage(&test_client, TEST_CMD_TIMEOUT_MS);
+    ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
+    ASSERT_EQ((int)sizeof(unknown_pubrel), connect_mock_xfer);
+    ASSERT_MEM_EQ(unknown_pubrel, connect_mock_sent, sizeof(unknown_pubrel));
 }
 #endif /* WOLFMQTT_MULTITHREAD && WOLFMQTT_NONBLOCK && WOLFMQTT_MAX_QOS >= 2 */
 
@@ -3289,6 +3839,115 @@ static int test_accept_message_cb(MqttClient* client, MqttMessage* msg,
     return MQTT_CODE_SUCCESS;
 }
 
+#ifdef WOLFMQTT_NONBLOCK
+static int g_partial_vbi_read_step;
+static byte g_partial_vbi_publish[131];
+
+static int mock_net_read_partial_vbi_timeout(void* context, byte* buf,
+    int buf_len, int timeout_ms)
+{
+    (void)context;
+    (void)timeout_ms;
+
+    switch (g_partial_vbi_read_step++) {
+        case 0:
+            if (buf_len != 2) {
+                return MQTT_CODE_ERROR_NETWORK;
+            }
+            XMEMCPY(buf, g_partial_vbi_publish, 2);
+            return 2;
+        case 1:
+            return MQTT_CODE_CONTINUE;
+        case 2:
+            return MQTT_CODE_ERROR_TIMEOUT;
+        case 3:
+            if (buf_len != 1) {
+                return MQTT_CODE_ERROR_NETWORK;
+            }
+            buf[0] = g_partial_vbi_publish[2];
+            return 1;
+        case 4:
+            if (buf_len != 128) {
+                return MQTT_CODE_ERROR_NETWORK;
+            }
+            XMEMCPY(buf, &g_partial_vbi_publish[3], 128);
+            return 128;
+        default:
+            return MQTT_CODE_CONTINUE;
+    }
+}
+
+/* A transport timeout is resumable and must not destroy a partially received
+ * MQTT fixed header. The fixture is a v3.1.1 QoS 0 PUBLISH whose Remaining
+ * Length is the two-byte VBI 0x80 0x01 (128). The mock pauses after 0x80,
+ * times out on the first retry, then supplies the rest of the fixed packet. */
+TEST(wait_message_timeout_preserves_partial_vbi)
+{
+    int rc;
+
+    XMEMSET(g_partial_vbi_publish, 'x', sizeof(g_partial_vbi_publish));
+    g_partial_vbi_publish[0] = 0x30;
+    g_partial_vbi_publish[1] = 0x80;
+    g_partial_vbi_publish[2] = 0x01;
+    g_partial_vbi_publish[3] = 0x00;
+    g_partial_vbi_publish[4] = 0x02;
+    g_partial_vbi_publish[5] = 'a';
+    g_partial_vbi_publish[6] = 'b';
+
+    ASSERT_EQ(MQTT_CODE_SUCCESS, test_init_client());
+#ifdef WOLFMQTT_V5
+    test_client.protocol_level = MQTT_CONNECT_PROTOCOL_LEVEL_4;
+#endif
+    test_client.msg_cb = test_accept_message_cb;
+    test_net.read = mock_net_read_partial_vbi_timeout;
+    g_partial_vbi_read_step = 0;
+    g_msg_cb_calls = 0;
+
+    rc = MqttClient_WaitMessage(&test_client, TEST_CMD_TIMEOUT_MS);
+    ASSERT_EQ(MQTT_CODE_CONTINUE, rc);
+    rc = MqttClient_WaitMessage(&test_client, TEST_CMD_TIMEOUT_MS);
+    ASSERT_EQ(MQTT_CODE_ERROR_TIMEOUT, rc);
+    rc = MqttClient_WaitMessage(&test_client, TEST_CMD_TIMEOUT_MS);
+
+    ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
+    ASSERT_EQ(1, g_msg_cb_calls);
+}
+#endif /* WOLFMQTT_NONBLOCK */
+
+#ifdef WOLFMQTT_V5
+/* MQTT v5 section 3.3.2.3.4 permits an empty Topic Name when a nonzero Topic
+ * Alias property supplies the topic. This fixed wire fixture reaches the
+ * preliminary packet decode used by MqttClient_WaitMessage. */
+TEST(wait_message_v5_empty_topic_with_alias_delivered)
+{
+    int rc;
+    int i;
+    static const byte publish_v5[] = {
+        0x30, 0x07, 0x00, 0x00, 0x03, 0x23, 0x00, 0x01, 'x'
+    };
+
+    rc = test_init_client();
+    ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
+    test_client.protocol_level = MQTT_CONNECT_PROTOCOL_LEVEL_5;
+    test_client.msg_cb = test_accept_message_cb;
+    g_msg_cb_calls = 0;
+
+    test_net.write = mock_net_write_accept;
+    test_net.read = mock_net_read_canned;
+    XMEMCPY(g_canned_buf, publish_v5, sizeof(publish_v5));
+    g_canned_len = (int)sizeof(publish_v5);
+    g_canned_pos = 0;
+
+    rc = MQTT_CODE_CONTINUE;
+    for (i = 0; i < 20 && rc == MQTT_CODE_CONTINUE; i++) {
+        rc = MqttClient_WaitMessage(&test_client, TEST_CMD_TIMEOUT_MS);
+    }
+
+    ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
+    ASSERT_TRUE(g_msg_cb_calls > 0);
+}
+#endif /* WOLFMQTT_V5 */
+
 /* Positive control for #6217: with a real msg_cb registered, an incoming QoS 1
  * PUBLISH must still be delivered to the callback AND acknowledged with a
  * PUBACK. The no-callback error is gated on msg_cb == NULL, so the normal
@@ -3591,6 +4250,42 @@ TEST(wait_message_pubrec_emits_pubrel)
     ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
     ASSERT_EQ(MQTT_PACKET_TYPE_PUBLISH_REL, g_last_ack_written);
 }
+
+#ifdef WOLFMQTT_V5
+/* [MQTT-3.6.2.1] permits 0x92 in PUBREL when the receiver has no matching
+ * outbound QoS 2 flow. This fixed wire fixture is an unsolicited successful
+ * PUBREC; the exact response must report that its Packet Identifier is unknown. */
+TEST(wait_message_v5_unmatched_pubrec_reports_unknown_id)
+{
+    int rc;
+    int i;
+    static const byte pubrec[] = { 0x50, 0x02, 0x12, 0x34 };
+    static const byte expected_pubrel[] = {
+        0x62, 0x03, 0x12, 0x34, MQTT_REASON_PACKET_ID_NOT_FOUND
+    };
+
+    rc = test_init_client();
+    ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
+    test_client.protocol_level = MQTT_CONNECT_PROTOCOL_LEVEL_5;
+    test_net.write = mock_net_write_accept;
+    test_net.read = mock_net_read_canned;
+    XMEMCPY(g_canned_buf, pubrec, sizeof(pubrec));
+    g_canned_len = (int)sizeof(pubrec);
+    g_canned_pos = 0;
+    connect_mock_xfer = 0;
+    XMEMSET(connect_mock_sent, 0, sizeof(connect_mock_sent));
+
+    rc = MQTT_CODE_CONTINUE;
+    for (i = 0; i < 20 && rc == MQTT_CODE_CONTINUE; i++) {
+        rc = MqttClient_WaitMessage(&test_client, TEST_CMD_TIMEOUT_MS);
+    }
+
+    ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
+    ASSERT_EQ((int)sizeof(expected_pubrel), connect_mock_xfer);
+    ASSERT_MEM_EQ(expected_pubrel, connect_mock_sent,
+        sizeof(expected_pubrel));
+}
+#endif /* WOLFMQTT_V5 */
 
 TEST(wait_message_pubrel_emits_pubcomp)
 {
@@ -4245,6 +4940,7 @@ void run_mqtt_client_tests(void)
     RUN_TEST(init_zero_tx_buf_len);
     RUN_TEST(init_null_rx_buf);
     RUN_TEST(init_zero_rx_buf_len);
+    RUN_TEST(init_positive_rx_buf_len_supported);
     RUN_TEST(init_success);
     RUN_TEST(init_negative_tx_buf_len);
     RUN_TEST(init_negative_rx_buf_len);
@@ -4269,7 +4965,8 @@ void run_mqtt_client_tests(void)
     RUN_TEST(auth_without_connect_method_rejected);
     RUN_TEST(auth_with_connect_method_allowed);
     RUN_TEST(connect_refused_connack_preserves_v5_defaults);
-    RUN_TEST(connect_accepted_connack_clamps_illegal_max_qos);
+    RUN_TEST(connect_accepted_connack_rejects_illegal_max_qos);
+    RUN_TEST(connect_accepted_connack_rejects_illegal_retain_available);
     RUN_TEST(connect_accepted_connack_latches_topic_alias_max);
     RUN_TEST(connect_accepted_connack_rejects_zero_receive_max);
     RUN_TEST(connect_accepted_connack_latches_receive_max);
@@ -4284,6 +4981,11 @@ void run_mqtt_client_tests(void)
 
     /* MqttClient_Ping tests */
     RUN_TEST(ping_null_client);
+    RUN_TEST(ping_response_timeout_disconnects_network);
+#if defined(WOLFMQTT_MULTITHREAD) && \
+    (defined(__MACH__) || defined(WOLFMQTT_POSIX_SEMAPHORES))
+    RUN_TEST(ping_timeout_waits_for_concurrent_writer);
+#endif
 
     /* MqttClient_Subscribe tests */
     RUN_TEST(subscribe_null_client);
@@ -4291,6 +4993,8 @@ void run_mqtt_client_tests(void)
     RUN_TEST(subscribe_broker_rejection_returns_subscribe_rejected);
 #ifdef WOLFMQTT_V5
     RUN_TEST(unsubscribe_broker_rejection_returns_unsubscribe_rejected);
+    RUN_TEST(unsubscribe_too_few_reason_codes_is_malformed);
+    RUN_TEST(unsubscribe_too_many_reason_codes_is_malformed);
 #endif
 
     /* MqttClient_Unsubscribe tests */
@@ -4302,6 +5006,7 @@ void run_mqtt_client_tests(void)
     RUN_TEST(publish_null_publish);
     RUN_TEST(publish_stream_cb_final_chunk_no_overrun);
     RUN_TEST(publish_stream_cb_multifill_full_payload);
+    RUN_TEST(publish_stream_cb_overreturn_clamped_to_total);
 #ifdef WOLFMQTT_NONBLOCK
     RUN_TEST(publish_stream_cb_nonblock_resume_no_tail_drop);
 #endif
@@ -4339,6 +5044,7 @@ void run_mqtt_client_tests(void)
 #if defined(WOLFMQTT_MULTITHREAD) && defined(WOLFMQTT_NONBLOCK) && \
     WOLFMQTT_MAX_QOS >= 2
     RUN_TEST(publish_qos2_v5_pubrec_rejection_multithread_reader);
+    RUN_TEST(publish_qos2_v5_pubrec_state_multithread_reader);
 #endif
 #ifdef WOLFMQTT_MULTITHREAD
 #ifdef WOLFMQTT_NONBLOCK
@@ -4366,8 +5072,12 @@ void run_mqtt_client_tests(void)
     RUN_TEST(wait_message_qos2_null_msg_cb_errors_no_ack);
 #ifdef WOLFMQTT_V5
     RUN_TEST(wait_message_v5_props_null_msg_cb_frees_props);
+    RUN_TEST(wait_message_v5_empty_topic_with_alias_delivered);
 #endif
     RUN_TEST(wait_message_qos1_with_msg_cb_delivers_and_acks);
+#ifdef WOLFMQTT_NONBLOCK
+    RUN_TEST(wait_message_timeout_preserves_partial_vbi);
+#endif
     RUN_TEST(wait_message_qos0_publish_no_ack);
     RUN_TEST(wait_message_qos1_publish_acks_puback);
     RUN_TEST(wait_message_qos2_publish_acks_pubrec);
@@ -4378,6 +5088,9 @@ void run_mqtt_client_tests(void)
 #endif
 #endif
     RUN_TEST(wait_message_pubrec_emits_pubrel);
+#ifdef WOLFMQTT_V5
+    RUN_TEST(wait_message_v5_unmatched_pubrec_reports_unknown_id);
+#endif
     RUN_TEST(wait_message_pubrel_emits_pubcomp);
     RUN_TEST(wait_message_puback_emits_no_ack);
     RUN_TEST(wait_message_pubcomp_emits_no_ack);
@@ -4385,6 +5098,9 @@ void run_mqtt_client_tests(void)
     RUN_TEST(wait_message_fatal_packet_type_clears_is_connected);
 #ifdef WOLFMQTT_V5
     RUN_TEST(wait_message_fatal_property_clears_is_connected);
+#ifdef WOLFMQTT_NONBLOCK
+    RUN_TEST(wait_message_fatal_property_pending_ack_scrubs_rx_buf);
+#endif
 #endif
 
 #ifndef WOLFMQTT_NO_TIME

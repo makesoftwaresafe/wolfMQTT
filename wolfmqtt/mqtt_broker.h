@@ -221,6 +221,9 @@
 #ifndef BROKER_MAX_OFFLINE_MSGS_PER_SUB
     #define BROKER_MAX_OFFLINE_MSGS_PER_SUB 32
 #endif
+#if BROKER_MAX_OFFLINE_MSGS_PER_SUB >= 65535
+    #error BROKER_MAX_OFFLINE_MSGS_PER_SUB must leave a free packet identifier
+#endif
 
 /* BROKER_MAX_QUEUED_MSGS_PER_SUB bounds the total depth of a *connected*
  * subscriber's outbound queue (out_q_count) in dynamic-memory mode.
@@ -246,6 +249,9 @@
     #define BROKER_MAX_QUEUED_MSGS_PER_SUB \
         (BROKER_MAX_INFLIGHT_PER_SUB + BROKER_MAX_OFFLINE_MSGS_PER_SUB)
 #endif
+#if BROKER_MAX_QUEUED_MSGS_PER_SUB >= 65535
+    #error BROKER_MAX_QUEUED_MSGS_PER_SUB must leave a free packet identifier
+#endif
 
 /* Schema version stamped on every persisted record. Bump when the
  * encoding of any namespace changes incompatibly; a startup with stored
@@ -254,11 +260,10 @@
 #ifndef WOLFMQTT_BROKER_PERSIST_SCHEMA_VER
     /* Bumped from 1 -> 2 when the header layout split a dedicated
      * wrap_mode byte out of the schema-version field. Bumped 2 -> 3 when
-     * the NS_SESSION record gained an orphan_since timestamp so the v5
-     * Session Expiry timer survives a broker restart. Any existing dev
-     * directory written by an older build mismatches and is wiped via the
-     * schema-mismatch path on first restart. */
-    #define WOLFMQTT_BROKER_PERSIST_SCHEMA_VER 3
+     * the NS_SESSION record gained an orphan_since timestamp. Bumped 3 -> 4
+     * when NS_OUTQ gained an explicit enqueue sequence, then 4 -> 5 when it
+     * gained retransmission state. */
+    #define WOLFMQTT_BROKER_PERSIST_SCHEMA_VER 5
 #endif
 
 /* Header wrap_mode byte values (record body framing on disk). */
@@ -275,7 +280,11 @@
 /* Default storage directory for the POSIX backend. Application can pass
  * a different path at MqttBrokerNet_PersistPosix_Init time. */
 #ifndef BROKER_PERSIST_DIR_DEFAULT
-    #define BROKER_PERSIST_DIR_DEFAULT  "/var/lib/wolfmqtt"
+    #ifdef __MACH__
+        #define BROKER_PERSIST_DIR_DEFAULT  "/private/var/lib/wolfmqtt"
+    #else
+        #define BROKER_PERSIST_DIR_DEFAULT  "/var/lib/wolfmqtt"
+    #endif
 #endif
 
 /* Persistence namespaces. One per logical record type. The backend
@@ -347,12 +356,10 @@ typedef struct MqttBrokerNet {
  * error code. Shadow-write failures are logged while in-memory state remains
  * authoritative. Iterator failures during restore abort MqttBroker_Start.
  *
- * Both a key/value API and a streaming API are provided. The broker will
- * use whichever family the registered hook implements; any individual
- * hook pointer may be NULL when not supported. At minimum kv_put / kv_get
- * / kv_iter must be installed for sessions / subs / retained / outq to
- * round-trip; the streaming API is offered for backends that prefer an
- * append-only log (e.g., raw NOR flash). */
+ * The broker currently uses only the key/value API. At minimum kv_put,
+ * kv_get, and kv_iter must be installed for sessions, subscriptions,
+ * retained messages, and outbound queues to round-trip. kv_del is required
+ * to remove persisted records. */
 
 /* Iterator callback supplied by the broker to kv_iter. Return 0 to
  * continue, non-zero to stop iteration early. */
@@ -375,7 +382,8 @@ typedef struct MqttBrokerPersistHooks {
     int (*kv_iter)(void* ctx, byte ns, MqttBrokerPersist_IterCb cb,
                    void* cb_ctx);
 
-    /* Streaming API. handle is opaque; broker passes through. */
+    /* Reserved for future use. Ignored when a complete KV family is present;
+     * a stream-only hook structure is rejected. */
     int (*stream_open)(void* ctx, byte ns, const byte* key, word16 key_len,
                        int mode, void** handle);
     int (*stream_read)(void* ctx, void* handle, byte* buf, word32 len,
@@ -509,6 +517,7 @@ typedef struct BrokerOutPub {
      * MQTT-4.4.0-1, then clears the flag. */
     byte    retransmit_dup; /* 0 or 1 */
     WOLFMQTT_BROKER_TIME_T enq_time;
+    word64  enqueue_seq;    /* persistent FIFO order within this session */
     word32  expiry_sec;     /* v5 Message Expiry Interval, 0 = no expiry */
     byte    protocol_level; /* echoed back to subscriber on send */
 #ifdef WOLFMQTT_V5
@@ -644,6 +653,11 @@ typedef struct BrokerClient {
     BrokerOutPub* out_q_tail;
     int           out_q_count;
     int           out_q_inflight;
+    /* Encoded length of an out_q packet whose nonblocking/TLS-async write is
+     * still in progress. While nonzero, tx_buf remains owned by that write. */
+    int           out_q_pending_len;
+    /* Encoded length of a direct broker response still being written. */
+    int           direct_pending_len;
     /* v5 Receive Maximum advertised by this client in CONNECT, or 65535
      * (per MQTT v5 sec 3.1.2.11.3) when the client did not include the
      * property. For v3.1.1 clients this is left at 65535 - the cap
@@ -880,7 +894,9 @@ WOLFMQTT_API int MqttBrokerNet_Init(MqttBrokerNet* net);
 /* Install non-NULL persistence hooks after MqttBroker_Init and before the
  * first MqttBroker_Start, or after MqttBroker_Free. Passing NULL may detach
  * the current hooks at any time. The MqttBrokerPersistHooks struct must
- * outlive the broker while installed. */
+ * outlive the broker while installed. Stream-only hooks are unsupported;
+ * deprecated stream members are ignored when all four KV callbacks are
+ * provided. */
 WOLFMQTT_API int MqttBroker_SetPersistHooks(MqttBroker* broker,
     const MqttBrokerPersistHooks* hooks);
 
@@ -934,7 +950,6 @@ WOLFMQTT_LOCAL int BrokerPersist_DelOutPub(MqttBroker* broker,
     const char* client_id, word16 packet_id);
 WOLFMQTT_LOCAL int BrokerPersist_DelOutQueue(MqttBroker* broker,
     const char* client_id);
-
 /* Startup-time restore on a freshly initialized, empty broker. Rebuilds the
  * in-memory tables before the first MqttBroker_Start accepts clients. Wipes
  * and re-stamps META when the persisted schema version does not match. */

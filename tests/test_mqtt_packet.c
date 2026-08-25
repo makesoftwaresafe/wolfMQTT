@@ -307,6 +307,110 @@ TEST(encode_decode_vbi_roundtrip)
     }
 }
 
+typedef struct PacketReadFixture {
+    const byte* data;
+    int data_len;
+    int pos;
+    int calls;
+} PacketReadFixture;
+
+static int packet_read_fixture(void* context, byte* buf, int buf_len,
+    int timeout_ms)
+{
+    PacketReadFixture* fixture = (PacketReadFixture*)context;
+    int read_len = fixture->data_len - fixture->pos;
+
+    (void)timeout_ms;
+    fixture->calls++;
+    if (read_len > buf_len) {
+        read_len = buf_len;
+    }
+    if (read_len <= 0) {
+        return MQTT_CODE_ERROR_NETWORK;
+    }
+    XMEMCPY(buf, fixture->data + fixture->pos, (size_t)read_len);
+    fixture->pos += read_len;
+    return read_len;
+}
+
+static int packet_net_connect(void* context, const char* host, word16 port,
+    int timeout_ms)
+{
+    (void)context;
+    (void)host;
+    (void)port;
+    (void)timeout_ms;
+    return MQTT_CODE_SUCCESS;
+}
+
+static int packet_net_write(void* context, const byte* buf, int buf_len,
+    int timeout_ms)
+{
+    (void)context;
+    (void)buf;
+    (void)timeout_ms;
+    return buf_len;
+}
+
+static int packet_net_disconnect(void* context)
+{
+    (void)context;
+    return MQTT_CODE_SUCCESS;
+}
+
+TEST(packet_read_rejects_buffer_shorter_than_max_header)
+{
+    static const byte extended_header[] = {
+        0x30, 0x80, 0x80, 0x80, 0x00
+    };
+    static const byte short_header[] = { 0xD0, 0x00 };
+    byte guarded[7];
+    byte client_rx[16];
+    byte client_tx[16];
+    MqttClient client;
+    MqttNet net;
+    PacketReadFixture fixture;
+    int rx_len;
+    int rc;
+
+    XMEMSET(&net, 0, sizeof(net));
+    XMEMSET(&fixture, 0, sizeof(fixture));
+    net.context = &fixture;
+    net.connect = packet_net_connect;
+    net.read = packet_read_fixture;
+    net.write = packet_net_write;
+    net.disconnect = packet_net_disconnect;
+    rc = MqttClient_Init(&client, &net, NULL, client_tx,
+        (int)sizeof(client_tx), client_rx, (int)sizeof(client_rx), 0);
+    ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
+
+    for (rx_len = 1; rx_len < MQTT_PACKET_MAX_LEN_BYTES + 1; rx_len++) {
+        XMEMSET(guarded, 0xA5, sizeof(guarded));
+        XMEMSET(&fixture, 0, sizeof(fixture));
+        fixture.data = extended_header;
+        fixture.data_len = (int)sizeof(extended_header);
+
+        rc = MqttPacket_Read(&client, &guarded[1], rx_len, 0);
+        ASSERT_EQ(0xA5, guarded[0]);
+        ASSERT_EQ(0xA5, guarded[rx_len + 1]);
+        ASSERT_EQ(MQTT_CODE_ERROR_OUT_OF_BUFFER, rc);
+        ASSERT_EQ(0, fixture.calls);
+    }
+
+    XMEMSET(guarded, 0xA5, sizeof(guarded));
+    XMEMSET(&fixture, 0, sizeof(fixture));
+    fixture.data = short_header;
+    fixture.data_len = (int)sizeof(short_header);
+
+    rc = MqttPacket_Read(&client, &guarded[1],
+        MQTT_PACKET_MAX_LEN_BYTES + 1, 0);
+    ASSERT_EQ((int)sizeof(short_header), rc);
+    ASSERT_EQ(0xA5, guarded[0]);
+    ASSERT_EQ(0xA5, guarded[sizeof(guarded) - 1]);
+
+    MqttClient_DeInit(&client);
+}
+
 /* ============================================================================
  * UTF-8 well-formedness validation [MQTT-1.5.3-1]
  *
@@ -1732,6 +1836,49 @@ TEST(decode_connack_truncated_partial_var_header)
     ASSERT_EQ(MQTT_CODE_ERROR_OUT_OF_BUFFER, rc);
 }
 
+#ifdef WOLFMQTT_V5
+/* MQTT 5.0 section 3.2.2.3: the Property Length belongs to this CONNACK,
+ * so bytes after its declared Remaining Length cannot satisfy the property
+ * block. The trailing bytes form a valid Maximum QoS property deliberately. */
+TEST(decode_connack_v5_props_cannot_cross_packet_end)
+{
+    byte buf[] = {
+        0x20, 0x03, 0x00, MQTT_REASON_SUCCESS, 0x02,
+        MQTT_PROP_MAX_QOS, MQTT_QOS_1
+    };
+    MqttConnectAck ack;
+    int rc;
+
+    XMEMSET(&ack, 0, sizeof(ack));
+    ack.protocol_level = MQTT_CONNECT_PROTOCOL_LEVEL_5;
+
+    rc = MqttDecode_ConnectAck(buf, (int)sizeof(buf), &ack);
+
+    ASSERT_EQ(MQTT_CODE_ERROR_OUT_OF_BUFFER, rc);
+    ASSERT_NULL(ack.props);
+}
+
+/* MQTT 5.0 section 3.2.2 requires the Remaining Length to contain exactly
+ * the flags, Reason Code, Property Length, and declared Properties. */
+TEST(decode_connack_v5_rejects_bytes_after_property_block)
+{
+    byte buf[] = {
+        0x20, 0x05, 0x00, MQTT_REASON_SUCCESS, 0x00,
+        MQTT_PROP_MAX_QOS, MQTT_QOS_1
+    };
+    MqttConnectAck ack;
+    int rc;
+
+    XMEMSET(&ack, 0, sizeof(ack));
+    ack.protocol_level = MQTT_CONNECT_PROTOCOL_LEVEL_5;
+
+    rc = MqttDecode_ConnectAck(buf, (int)sizeof(buf), &ack);
+
+    ASSERT_EQ(MQTT_CODE_ERROR_MALFORMED_DATA, rc);
+    ASSERT_NULL(ack.props);
+}
+#endif /* WOLFMQTT_V5 */
+
 /* [MQTT-3.2.2-1] / [MQTT-3.2.2-4] CONNACK Flags receive-side validation.
  *
  * The Connect Acknowledge Flags byte has only bit 0 (Session Present)
@@ -1811,6 +1958,63 @@ TEST(decode_connack_refused_without_session_present_accepted)
     int rc = decode_connack_flags(0x00, MQTT_CONNECT_ACK_CODE_REFUSED_PROTO);
     ASSERT_TRUE(rc > 0);
 }
+
+#ifdef WOLFMQTT_BROKER
+/* [MQTT-3.2.2-4] Session Present must be zero when a connection is refused.
+ * The encoder must not produce a CONNACK that the matching decoder rejects. */
+TEST(encode_connack_refused_with_session_present_rejected)
+{
+    byte buf[16];
+    MqttConnectAck ack;
+    int rc;
+
+    XMEMSET(&ack, 0, sizeof(ack));
+    XMEMSET(buf, 0xA5, sizeof(buf));
+    ack.flags = 1;
+    ack.return_code = MQTT_CONNECT_ACK_CODE_REFUSED_PROTO;
+#ifdef WOLFMQTT_V5
+    ack.protocol_level = MQTT_CONNECT_PROTOCOL_LEVEL_4;
+#endif
+    rc = MqttEncode_ConnectAck(buf, (int)sizeof(buf), &ack);
+    ASSERT_EQ(MQTT_CODE_ERROR_BAD_ARG, rc);
+    ASSERT_EQ(0xA5, buf[0]);
+
+#ifdef WOLFMQTT_V5
+    XMEMSET(buf, 0xA5, sizeof(buf));
+    ack.protocol_level = MQTT_CONNECT_PROTOCOL_LEVEL_5;
+    ack.return_code = MQTT_REASON_NOT_AUTHORIZED;
+    rc = MqttEncode_ConnectAck(buf, (int)sizeof(buf), &ack);
+    ASSERT_EQ(MQTT_CODE_ERROR_BAD_ARG, rc);
+    ASSERT_EQ(0xA5, buf[0]);
+#endif
+}
+#endif /* WOLFMQTT_BROKER */
+
+#if defined(WOLFMQTT_BROKER) && defined(WOLFMQTT_V5)
+/* MQTT v3.1.1 section 3.2.2.3 permits only return codes 0x00-0x05, while
+ * MQTT 5.0 section 3.2.2.2 uses the version-specific Reason Code table. */
+TEST(encode_connack_rejects_version_invalid_reason_codes)
+{
+    byte buf[16];
+    MqttConnectAck ack;
+    int rc;
+
+    XMEMSET(&ack, 0, sizeof(ack));
+    XMEMSET(buf, 0xA5, sizeof(buf));
+    ack.protocol_level = MQTT_CONNECT_PROTOCOL_LEVEL_4;
+    ack.return_code = MQTT_REASON_UNSPECIFIED_ERR;
+    rc = MqttEncode_ConnectAck(buf, (int)sizeof(buf), &ack);
+    ASSERT_EQ(MQTT_CODE_ERROR_BAD_ARG, rc);
+    ASSERT_EQ(0xA5, buf[0]);
+
+    XMEMSET(buf, 0xA5, sizeof(buf));
+    ack.protocol_level = MQTT_CONNECT_PROTOCOL_LEVEL_5;
+    ack.return_code = MQTT_REASON_GRANTED_QOS_1;
+    rc = MqttEncode_ConnectAck(buf, (int)sizeof(buf), &ack);
+    ASSERT_EQ(MQTT_CODE_ERROR_BAD_ARG, rc);
+    ASSERT_EQ(0xA5, buf[0]);
+}
+#endif /* WOLFMQTT_BROKER && WOLFMQTT_V5 */
 
 /* ============================================================================
  * MqttEncode_Subscribe
@@ -2780,6 +2984,98 @@ TEST(encode_connect_lwt_topic_oversized_rejected)
     ASSERT_TRUE(rc < 0);
 }
 
+#ifdef WOLFMQTT_V5
+/* [MQTT-3.1.3.2] Session Expiry Interval is a CONNECT property, not a Will
+ * Property, so the encoder must reject it before writing the packet. */
+TEST(encode_connect_v5_invalid_will_property_rejected)
+{
+    byte buf[256];
+    MqttConnect connect;
+    MqttMessage lwt;
+    MqttProp will_prop;
+    int rc;
+
+    XMEMSET(&connect, 0, sizeof(connect));
+    XMEMSET(&lwt, 0, sizeof(lwt));
+    XMEMSET(&will_prop, 0, sizeof(will_prop));
+    XMEMSET(buf, 0xA5, sizeof(buf));
+    connect.protocol_level = MQTT_CONNECT_PROTOCOL_LEVEL_5;
+    connect.client_id = "cid";
+    connect.enable_lwt = 1;
+    connect.lwt_msg = &lwt;
+    lwt.topic_name = "will/topic";
+    will_prop.type = MQTT_PROP_SESSION_EXPIRY_INTERVAL;
+    will_prop.data_int = 30;
+    lwt.props = &will_prop;
+
+    rc = MqttEncode_Connect(buf, (int)sizeof(buf), &connect);
+    ASSERT_EQ(MQTT_CODE_ERROR_PROPERTY, rc);
+    ASSERT_EQ(0xA5, buf[0]);
+}
+
+TEST(encode_connect_v5_cyclic_will_properties_rejected)
+{
+    byte buf[256];
+    MqttConnect connect;
+    MqttMessage lwt;
+    MqttProp will_prop;
+    int rc;
+
+    XMEMSET(&connect, 0, sizeof(connect));
+    XMEMSET(&lwt, 0, sizeof(lwt));
+    XMEMSET(&will_prop, 0, sizeof(will_prop));
+    connect.protocol_level = MQTT_CONNECT_PROTOCOL_LEVEL_5;
+    connect.client_id = "cid";
+    connect.enable_lwt = 1;
+    connect.lwt_msg = &lwt;
+    lwt.topic_name = "will/topic";
+    will_prop.type = MQTT_PROP_USER_PROP;
+    will_prop.data_str.str = (char*)"key";
+    will_prop.data_str.len = 3;
+    will_prop.data_str2.str = (char*)"value";
+    will_prop.data_str2.len = 5;
+    will_prop.next = &will_prop;
+    lwt.props = &will_prop;
+
+    rc = MqttEncode_Connect(buf, (int)sizeof(buf), &connect);
+    ASSERT_EQ(MQTT_CODE_ERROR_PROPERTY, rc);
+}
+
+TEST(encode_connect_v5_excess_will_properties_rejected)
+{
+    enum { prop_count = 40 };
+    byte buf[512];
+    MqttConnect connect;
+    MqttMessage lwt;
+    MqttProp will_props[prop_count];
+    int i;
+    int rc;
+
+    XMEMSET(&connect, 0, sizeof(connect));
+    XMEMSET(&lwt, 0, sizeof(lwt));
+    XMEMSET(will_props, 0, sizeof(will_props));
+    connect.protocol_level = MQTT_CONNECT_PROTOCOL_LEVEL_5;
+    connect.client_id = "cid";
+    connect.enable_lwt = 1;
+    connect.lwt_msg = &lwt;
+    lwt.topic_name = "will/topic";
+    for (i = 0; i < prop_count; i++) {
+        will_props[i].type = MQTT_PROP_USER_PROP;
+        will_props[i].data_str.str = (char*)"k";
+        will_props[i].data_str.len = 1;
+        will_props[i].data_str2.str = (char*)"v";
+        will_props[i].data_str2.len = 1;
+        if (i + 1 < prop_count) {
+            will_props[i].next = &will_props[i + 1];
+        }
+    }
+    lwt.props = will_props;
+
+    rc = MqttEncode_Connect(buf, (int)sizeof(buf), &connect);
+    ASSERT_EQ(MQTT_CODE_ERROR_PROPERTY, rc);
+}
+#endif /* WOLFMQTT_V5 */
+
 /* ============================================================================
  * MqttDecode_Connect (broker-side)
  * ============================================================================ */
@@ -3247,6 +3543,60 @@ TEST(decode_connect_will_topic_contains_u0000_rejected)
     ASSERT_EQ(MQTT_CODE_ERROR_MALFORMED_DATA, rc);
 }
 
+/* [MQTT-3.1.3.3] / [MQTT-4.7.1-1]: the Will Topic is a Topic Name and
+ * cannot contain wildcard characters. This fixture carries "sport/#". */
+TEST(decode_connect_will_topic_wildcard_rejected)
+{
+    byte buf[] = {
+        0x10, 0x1B,                         /* CONNECT, remain_len = 27 */
+        0x00, 0x04, 'M', 'Q', 'T', 'T',
+        0x04,
+        0x06,                               /* clean | will_flag */
+        0x00, 0x3C,
+        0x00, 0x03, 'c', 'i', 'd',
+        0x00, 0x07, 's', 'p', 'o', 'r', 't', '/', '#',
+        0x00, 0x01, 'm'
+    };
+    MqttConnect dec;
+    MqttMessage lwt;
+    int rc;
+
+    XMEMSET(&dec, 0, sizeof(dec));
+    XMEMSET(&lwt, 0, sizeof(lwt));
+    dec.lwt_msg = &lwt;
+    rc = MqttDecode_Connect(buf, (int)sizeof(buf), &dec);
+    ASSERT_EQ(MQTT_CODE_ERROR_MALFORMED_DATA, rc);
+}
+
+#ifdef WOLFMQTT_V5
+/* [MQTT-4.7.3-1]: a Will Topic must contain at least one character.
+ * Topic Alias does not apply to the CONNECT Will Topic. */
+TEST(decode_connect_v5_empty_will_topic_rejected)
+{
+    byte buf[] = {
+        0x10, 0x16,                         /* CONNECT, remain_len = 22 */
+        0x00, 0x04, 'M', 'Q', 'T', 'T',
+        0x05,
+        0x06,                               /* clean | will_flag */
+        0x00, 0x3C,
+        0x00,                               /* CONNECT properties length */
+        0x00, 0x03, 'c', 'i', 'd',
+        0x00,                               /* Will properties length */
+        0x00, 0x00,                         /* empty Will Topic */
+        0x00, 0x01, 'm'
+    };
+    MqttConnect dec;
+    MqttMessage lwt;
+    int rc;
+
+    XMEMSET(&dec, 0, sizeof(dec));
+    XMEMSET(&lwt, 0, sizeof(lwt));
+    dec.lwt_msg = &lwt;
+    rc = MqttDecode_Connect(buf, (int)sizeof(buf), &dec);
+    ASSERT_EQ(MQTT_CODE_ERROR_MALFORMED_DATA, rc);
+}
+#endif
+
 /* [MQTT-3.1.2-22] If the User Name Flag is 0, the Password Flag MUST be 0.
  * The encoder already enforces this; the decoder must too. Wire is
  * flags 0x42 = clean_session | password, with client_id "cid" followed
@@ -3591,6 +3941,32 @@ TEST(decode_subscribe_v5_props_freed_on_bad_filter)
     rc = MqttDecode_Subscribe(rx_buf, (int)sizeof(rx_buf), &sub);
     ASSERT_EQ(MQTT_CODE_ERROR_MALFORMED_DATA, rc);
     ASSERT_NULL(sub.props);
+}
+
+TEST(decode_subscribe_null_topics_allocates_no_props)
+{
+    byte rx_buf[] = {
+        0x82, 0x0E,                        /* SUBSCRIBE, remain_len = 14 */
+        0x00, 0x01,                        /* packet_id */
+        0x07,                              /* props_len VBI = 7 */
+        0x26, 0x00, 0x01, 'k', 0x00, 0x01, 'v', /* User Property k=v */
+        0x00, 0x01, 'a',                   /* topic filter "a" */
+        0x00                               /* options */
+    };
+    MqttSubscribe sub;
+    MqttProp* leaked;
+    int rc;
+
+    XMEMSET(&sub, 0, sizeof(sub));
+    sub.protocol_level = MQTT_CONNECT_PROTOCOL_LEVEL_5;
+    rc = MqttDecode_Subscribe(rx_buf, (int)sizeof(rx_buf), &sub);
+    leaked = sub.props;
+    if (sub.props != NULL) {
+        MqttProps_Free(sub.props);
+        sub.props = NULL;
+    }
+    ASSERT_EQ(MQTT_CODE_ERROR_BAD_ARG, rc);
+    ASSERT_NULL(leaked);
 }
 #endif /* WOLFMQTT_V5 */
 
@@ -4133,6 +4509,31 @@ TEST(decode_unsubscribe_v5_props_freed_on_bad_filter)
     rc = MqttDecode_Unsubscribe(rx_buf, (int)sizeof(rx_buf), &unsub);
     ASSERT_EQ(MQTT_CODE_ERROR_MALFORMED_DATA, rc);
     ASSERT_NULL(unsub.props);
+}
+
+TEST(decode_unsubscribe_null_topics_allocates_no_props)
+{
+    byte rx_buf[] = {
+        0xA2, 0x0D,                        /* UNSUBSCRIBE, remain_len = 13 */
+        0x00, 0x01,                        /* packet_id */
+        0x07,                              /* props_len VBI = 7 */
+        0x26, 0x00, 0x01, 'k', 0x00, 0x01, 'v', /* User Property k=v */
+        0x00, 0x01, 'a'                    /* topic filter "a" */
+    };
+    MqttUnsubscribe unsub;
+    MqttProp* leaked;
+    int rc;
+
+    XMEMSET(&unsub, 0, sizeof(unsub));
+    unsub.protocol_level = MQTT_CONNECT_PROTOCOL_LEVEL_5;
+    rc = MqttDecode_Unsubscribe(rx_buf, (int)sizeof(rx_buf), &unsub);
+    leaked = unsub.props;
+    if (unsub.props != NULL) {
+        MqttProps_Free(unsub.props);
+        unsub.props = NULL;
+    }
+    ASSERT_EQ(MQTT_CODE_ERROR_BAD_ARG, rc);
+    ASSERT_NULL(leaked);
 }
 #endif /* WOLFMQTT_V5 */
 
@@ -4798,6 +5199,45 @@ TEST(decode_unsuback_v5_props_past_remain_len_rejected)
 }
 #endif /* WOLFMQTT_V5 */
 
+#ifdef WOLFMQTT_BROKER
+/* [MQTT-2.3.1-1] An UNSUBACK Packet Identifier must be non-zero. */
+TEST(encode_unsuback_packet_id_zero_rejected)
+{
+    byte buf[16];
+    MqttUnsubscribeAck ack;
+    int rc;
+
+    XMEMSET(&ack, 0, sizeof(ack));
+    XMEMSET(buf, 0xA5, sizeof(buf));
+    rc = MqttEncode_UnsubscribeAck(buf, (int)sizeof(buf), &ack);
+    ASSERT_EQ(MQTT_CODE_ERROR_PACKET_ID, rc);
+    ASSERT_EQ(0xA5, buf[0]);
+}
+#endif /* WOLFMQTT_BROKER */
+
+#if defined(WOLFMQTT_BROKER) && defined(WOLFMQTT_V5)
+/* [MQTT-4.8.0-1] An UNSUBACK Reason Code outside the set in MQTT 5.0
+ * section 3.11.3 must not be serialized. */
+TEST(encode_unsuback_v5_reserved_reason_code_rejected)
+{
+    byte buf[16];
+    byte reason_code = MQTT_REASON_GRANTED_QOS_1;
+    MqttUnsubscribeAck ack;
+    int rc;
+
+    XMEMSET(&ack, 0, sizeof(ack));
+    XMEMSET(buf, 0xA5, sizeof(buf));
+    ack.packet_id = 1;
+    ack.protocol_level = MQTT_CONNECT_PROTOCOL_LEVEL_5;
+    ack.reason_codes = &reason_code;
+    ack.reason_code_count = 1;
+
+    rc = MqttEncode_UnsubscribeAck(buf, (int)sizeof(buf), &ack);
+    ASSERT_EQ(MQTT_CODE_ERROR_BAD_ARG, rc);
+    ASSERT_EQ(0xA5, buf[0]);
+}
+#endif /* WOLFMQTT_BROKER && WOLFMQTT_V5 */
+
 /* ============================================================================
  * MqttDecode_Ping (PINGRESP) and MqttDecode_Disconnect length validation
  *
@@ -4923,6 +5363,94 @@ TEST(decode_disconnect_v5_reason_code_past_buf_rejected)
     XMEMSET(&disc, 0, sizeof(disc));
     rc = MqttDecode_Disconnect(buf, (int)sizeof(buf), &disc);
     ASSERT_EQ(MQTT_CODE_ERROR_OUT_OF_BUFFER, rc);
+}
+
+/* [MQTT-3.14.2-1] Table 3-10 is the complete DISCONNECT Reason Code
+ * allow-list. Each nonzero code is encoded as the sole variable-header byte. */
+TEST(encode_disconnect_v5_reason_code_allowed_set)
+{
+    static const byte allowed[] = {
+        MQTT_REASON_SUCCESS,
+        MQTT_REASON_DISCONNECT_W_WILL_MSG,
+        MQTT_REASON_UNSPECIFIED_ERR,
+        MQTT_REASON_MALFORMED_PACKET,
+        MQTT_REASON_PROTOCOL_ERR,
+        MQTT_REASON_IMPL_SPECIFIC_ERR,
+        MQTT_REASON_NOT_AUTHORIZED,
+        MQTT_REASON_SERVER_BUSY,
+        MQTT_REASON_SERVER_SHUTTING_DOWN,
+        MQTT_REASON_KEEP_ALIVE_TIMEOUT,
+        MQTT_REASON_SESSION_TAKEN_OVER,
+        MQTT_REASON_TOPIC_FILTER_INVALID,
+        MQTT_REASON_TOPIC_NAME_INVALID,
+        MQTT_REASON_RX_MAX_EXCEEDED,
+        MQTT_REASON_TOPIC_ALIAS_INVALID,
+        MQTT_REASON_PACKET_TOO_LARGE,
+        MQTT_REASON_MSG_RATE_TOO_HIGH,
+        MQTT_REASON_QUOTA_EXCEEDED,
+        MQTT_REASON_ADMIN_ACTION,
+        MQTT_REASON_PAYLOAD_FORMAT_INVALID,
+        MQTT_REASON_RETAIN_NOT_SUPPORTED,
+        MQTT_REASON_QOS_NOT_SUPPORTED,
+        MQTT_REASON_USE_ANOTHER_SERVER,
+        MQTT_REASON_SERVER_MOVED,
+        MQTT_REASON_SS_NOT_SUPPORTED,
+        MQTT_REASON_CON_RATE_EXCEED,
+        MQTT_REASON_MAX_CON_TIME,
+        MQTT_REASON_SUB_ID_NOT_SUP,
+        MQTT_REASON_WILDCARD_SUB_NOT_SUP
+    };
+    MqttDisconnect disc;
+    byte buf[16];
+    size_t i;
+
+    for (i = 0; i < sizeof(allowed); i++) {
+        int rc;
+
+        XMEMSET(&disc, 0, sizeof(disc));
+        XMEMSET(buf, 0xA5, sizeof(buf));
+        disc.protocol_level = MQTT_CONNECT_PROTOCOL_LEVEL_5;
+        disc.reason_code = allowed[i];
+        rc = MqttEncode_Disconnect(buf, (int)sizeof(buf), &disc);
+        ASSERT_EQ(MQTT_PACKET_TYPE_SET(MQTT_PACKET_TYPE_DISCONNECT), buf[0]);
+        if (allowed[i] == MQTT_REASON_SUCCESS) {
+            ASSERT_EQ(2, rc);
+            ASSERT_EQ(0, buf[1]);
+        }
+        else {
+            ASSERT_EQ(3, rc);
+            ASSERT_EQ(1, buf[1]);
+            ASSERT_EQ(allowed[i], buf[2]);
+        }
+    }
+}
+
+/* [MQTT-3.14.2-1] Values assigned only to other packet types are reserved
+ * for DISCONNECT and must not be emitted. */
+TEST(encode_disconnect_v5_reason_code_out_of_table_rejected)
+{
+    static const byte invalid[] = {
+        MQTT_REASON_GRANTED_QOS_1,
+        MQTT_REASON_CONT_AUTH,
+        MQTT_REASON_BAD_AUTH_METHOD,
+        MQTT_REASON_PACKET_ID_NOT_FOUND,
+        0xFF
+    };
+    MqttDisconnect disc;
+    byte buf[16];
+    size_t i;
+
+    for (i = 0; i < sizeof(invalid); i++) {
+        int rc;
+
+        XMEMSET(&disc, 0, sizeof(disc));
+        XMEMSET(buf, 0xA5, sizeof(buf));
+        disc.protocol_level = MQTT_CONNECT_PROTOCOL_LEVEL_5;
+        disc.reason_code = invalid[i];
+        rc = MqttEncode_Disconnect(buf, (int)sizeof(buf), &disc);
+        ASSERT_EQ(MQTT_CODE_ERROR_BAD_ARG, rc);
+        ASSERT_EQ(0xA5, buf[0]);
+    }
 }
 #endif /* WOLFMQTT_V5 */
 
@@ -5308,6 +5836,49 @@ TEST(encode_props_user_prop_invalid_utf8_rejected)
     ASSERT_EQ(MQTT_CODE_ERROR_MALFORMED_DATA, rc);
 }
 
+/* MQTT 5.0 section 2.2.2.2 permits repeated User Property and repeated
+ * Subscription Identifier in PUBLISH; other properties are singletons. */
+TEST(encode_props_duplicate_repeatability)
+{
+    MqttProp first;
+    MqttProp second;
+    char key[] = "key";
+    char value[] = "value";
+    int rc;
+
+    XMEMSET(&first, 0, sizeof(first));
+    XMEMSET(&second, 0, sizeof(second));
+    first.type = MQTT_PROP_TOPIC_ALIAS;
+    first.data_short = 1;
+    first.next = &second;
+    second.type = MQTT_PROP_TOPIC_ALIAS;
+    second.data_short = 2;
+    rc = MqttEncode_Props(MQTT_PACKET_TYPE_PUBLISH, &first, NULL);
+    ASSERT_EQ(MQTT_CODE_ERROR_PROPERTY, rc);
+
+    first.type = MQTT_PROP_SUBSCRIPTION_ID;
+    first.data_int = 1;
+    second.type = MQTT_PROP_SUBSCRIPTION_ID;
+    second.data_int = 2;
+    rc = MqttEncode_Props(MQTT_PACKET_TYPE_SUBSCRIBE, &first, NULL);
+    ASSERT_EQ(MQTT_CODE_ERROR_PROPERTY, rc);
+    rc = MqttEncode_Props(MQTT_PACKET_TYPE_PUBLISH, &first, NULL);
+    ASSERT_TRUE(rc > 0);
+
+    first.type = MQTT_PROP_USER_PROP;
+    first.data_str.str = key;
+    first.data_str.len = (word16)XSTRLEN(key);
+    first.data_str2.str = value;
+    first.data_str2.len = (word16)XSTRLEN(value);
+    second.type = MQTT_PROP_USER_PROP;
+    second.data_str.str = key;
+    second.data_str.len = (word16)XSTRLEN(key);
+    second.data_str2.str = value;
+    second.data_str2.len = (word16)XSTRLEN(value);
+    rc = MqttEncode_Props(MQTT_PACKET_TYPE_PUBLISH, &first, NULL);
+    ASSERT_TRUE(rc > 0);
+}
+
 /* ============================================================================
  * MqttEncode/Decode_Auth roundtrip
  *
@@ -5499,32 +6070,26 @@ TEST(decode_subscribe_v5_duplicate_subscription_id_rejected)
 /* [MQTT-3.1.3.2]: a CONNECT-only property in Will Properties is rejected. */
 TEST(decode_connect_v5_will_props_session_expiry_rejected)
 {
-    byte buf[256];
-    MqttConnect enc, dec;
-    MqttMessage enc_lwt, dec_lwt;
-    MqttProp will_prop;
-    int enc_len, rc;
-
-    XMEMSET(&enc, 0, sizeof(enc));
-    XMEMSET(&enc_lwt, 0, sizeof(enc_lwt));
-    XMEMSET(&will_prop, 0, sizeof(will_prop));
-    enc.protocol_level = MQTT_CONNECT_PROTOCOL_LEVEL_5;
-    enc.client_id       = "cid";
-    enc.enable_lwt       = 1;
-    enc.lwt_msg          = &enc_lwt;
-    enc_lwt.topic_name   = "will/topic";
-    enc_lwt.qos          = MQTT_QOS_0;
-    will_prop.type       = MQTT_PROP_SESSION_EXPIRY_INTERVAL;
-    will_prop.data_int   = 30;
-    enc_lwt.props        = &will_prop;
-
-    enc_len = MqttEncode_Connect(buf, (int)sizeof(buf), &enc);
-    ASSERT_TRUE(enc_len > 0);
+    /* Hand-built v5 CONNECT: Will Properties contains Session Expiry Interval
+     * (0x11, four-byte value 30), which is legal only in CONNECT Properties. */
+    byte buf[] = {
+        0x10, 0x24,                         /* CONNECT, Remaining Length 36 */
+        0x00, 0x04, 'M', 'Q', 'T', 'T',    /* Protocol Name */
+        0x05, 0x04, 0x00, 0x00,            /* v5, Will Flag, Keep Alive */
+        0x00,                               /* CONNECT Properties length */
+        0x00, 0x03, 'c', 'i', 'd',         /* Client Identifier */
+        0x05, 0x11, 0x00, 0x00, 0x00, 0x1E, /* invalid Will Property */
+        0x00, 0x0A, 'w', 'i', 'l', 'l', '/', 't', 'o', 'p', 'i', 'c',
+        0x00, 0x00                          /* empty Will Payload */
+    };
+    MqttConnect dec;
+    MqttMessage dec_lwt;
+    int rc;
 
     XMEMSET(&dec, 0, sizeof(dec));
     XMEMSET(&dec_lwt, 0, sizeof(dec_lwt));
     dec.lwt_msg = &dec_lwt;
-    rc = MqttDecode_Connect(buf, enc_len, &dec);
+    rc = MqttDecode_Connect(buf, (int)sizeof(buf), &dec);
     ASSERT_EQ(MQTT_CODE_ERROR_PROPERTY, rc);
 }
 #endif /* WOLFMQTT_BROKER && WOLFMQTT_V5 */
@@ -5754,6 +6319,7 @@ void run_mqtt_packet_tests(void)
     RUN_TEST(decode_vbi_overlong_4byte_zero);
     RUN_TEST(decode_vbi_overlong_2byte_127);
     RUN_TEST(encode_decode_vbi_roundtrip);
+    RUN_TEST(packet_read_rejects_buffer_shorter_than_max_header);
 
     /* UTF-8 well-formedness validation [MQTT-1.5.3-1] */
 #ifdef WOLFMQTT_BROKER
@@ -5847,6 +6413,10 @@ void run_mqtt_packet_tests(void)
     RUN_TEST(decode_connack_truncated_one_byte_buffer);
     RUN_TEST(decode_connack_truncated_no_var_header);
     RUN_TEST(decode_connack_truncated_partial_var_header);
+#ifdef WOLFMQTT_V5
+    RUN_TEST(decode_connack_v5_props_cannot_cross_packet_end);
+    RUN_TEST(decode_connack_v5_rejects_bytes_after_property_block);
+#endif
     RUN_TEST(decode_connack_flags_session_present_accepted);
     RUN_TEST(decode_connack_flags_no_session_accepted);
     RUN_TEST(decode_connack_flags_reserved_bit_1_rejected);
@@ -5855,6 +6425,12 @@ void run_mqtt_packet_tests(void)
     RUN_TEST(decode_connack_flags_all_bits_rejected);
     RUN_TEST(decode_connack_refused_with_session_present_rejected);
     RUN_TEST(decode_connack_refused_without_session_present_accepted);
+#ifdef WOLFMQTT_BROKER
+    RUN_TEST(encode_connack_refused_with_session_present_rejected);
+#endif
+#if defined(WOLFMQTT_BROKER) && defined(WOLFMQTT_V5)
+    RUN_TEST(encode_connack_rejects_version_invalid_reason_codes);
+#endif
 
     /* MqttEncode_Subscribe */
     RUN_TEST(encode_subscribe_packet_id_zero);
@@ -5908,6 +6484,11 @@ void run_mqtt_packet_tests(void)
     RUN_TEST(encode_connect_username_oversized_rejected);
     RUN_TEST(encode_connect_password_oversized_rejected);
     RUN_TEST(encode_connect_lwt_topic_oversized_rejected);
+#ifdef WOLFMQTT_V5
+    RUN_TEST(encode_connect_v5_invalid_will_property_rejected);
+    RUN_TEST(encode_connect_v5_cyclic_will_properties_rejected);
+    RUN_TEST(encode_connect_v5_excess_will_properties_rejected);
+#endif
 
 #ifdef WOLFMQTT_BROKER
     /* MqttDecode_Connect */
@@ -5932,6 +6513,7 @@ void run_mqtt_packet_tests(void)
     RUN_TEST(decode_connect_will_qos3_rejected);
     RUN_TEST(decode_connect_will_topic_invalid_utf8_rejected);
     RUN_TEST(decode_connect_will_topic_contains_u0000_rejected);
+    RUN_TEST(decode_connect_will_topic_wildcard_rejected);
     RUN_TEST(decode_connect_password_flag_without_username_flag_rejected);
     RUN_TEST(decode_connect_trailing_garbage_rejected);
 #ifdef WOLFMQTT_V5
@@ -5941,6 +6523,7 @@ void run_mqtt_packet_tests(void)
     RUN_TEST(decode_connect_v5_max_packet_size_zero_rejected);
     RUN_TEST(decode_connect_v5_auth_data_without_auth_method_rejected);
     RUN_TEST(decode_connect_v5_will_props_session_expiry_rejected);
+    RUN_TEST(decode_connect_v5_empty_will_topic_rejected);
 #endif
 
     /* MqttDecode_Subscribe */
@@ -5965,6 +6548,7 @@ void run_mqtt_packet_tests(void)
 #ifdef WOLFMQTT_V5
     RUN_TEST(decode_subscribe_v5_empty_payload_rejected);
     RUN_TEST(decode_subscribe_v5_props_freed_on_bad_filter);
+    RUN_TEST(decode_subscribe_null_topics_allocates_no_props);
     RUN_TEST(decode_subscribe_v5_duplicate_subscription_id_rejected);
 #endif
 #ifdef WOLFMQTT_V5
@@ -5984,6 +6568,7 @@ void run_mqtt_packet_tests(void)
 #ifdef WOLFMQTT_V5
     RUN_TEST(decode_unsubscribe_v5_empty_payload_rejected);
     RUN_TEST(decode_unsubscribe_v5_props_freed_on_bad_filter);
+    RUN_TEST(decode_unsubscribe_null_topics_allocates_no_props);
 #endif
 #endif
 
@@ -6037,6 +6622,12 @@ void run_mqtt_packet_tests(void)
     RUN_TEST(decode_unsuback_v5_reason_codes);
     RUN_TEST(decode_unsuback_v5_props_past_remain_len_rejected);
 #endif
+#ifdef WOLFMQTT_BROKER
+    RUN_TEST(encode_unsuback_packet_id_zero_rejected);
+#endif
+#if defined(WOLFMQTT_BROKER) && defined(WOLFMQTT_V5)
+    RUN_TEST(encode_unsuback_v5_reserved_reason_code_rejected);
+#endif
 
     /* MqttDecode_Ping (PINGRESP) length validation */
     RUN_TEST(decode_pingresp_valid);
@@ -6052,6 +6643,8 @@ void run_mqtt_packet_tests(void)
     RUN_TEST(decode_disconnect_v5_invalid_fixed_header_flags_rejected);
     RUN_TEST(decode_disconnect_v5_with_reason_code_accepted);
     RUN_TEST(decode_disconnect_v5_reason_code_past_buf_rejected);
+    RUN_TEST(encode_disconnect_v5_reason_code_allowed_set);
+    RUN_TEST(encode_disconnect_v5_reason_code_out_of_table_rejected);
 #endif
 
     /* Fixed-header reserved-flag validation [MQTT-2.2.2-2] */
@@ -6083,6 +6676,7 @@ void run_mqtt_packet_tests(void)
     /* MqttEncode/Decode_Auth */
     RUN_TEST(encode_props_string_invalid_utf8_rejected);
     RUN_TEST(encode_props_user_prop_invalid_utf8_rejected);
+    RUN_TEST(encode_props_duplicate_repeatability);
     RUN_TEST(auth_v5_cont_auth_roundtrip);
     RUN_TEST(auth_v5_reauth_roundtrip);
     RUN_TEST(auth_v5_reauth_decodes_without_error);

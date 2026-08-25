@@ -56,9 +56,14 @@
 /* Context held by the backend. Lives inside the hooks->ctx pointer. */
 typedef struct WmqbPosixCtx {
     char dir[512];
+    int  root_fd;
     /* Per-instance flag so Free knows we own this allocation. */
     int  owned;
 } WmqbPosixCtx;
+
+#ifndef O_CLOEXEC
+    #define O_CLOEXEC 0
+#endif
 
 /* Forward decl of all hook callbacks. */
 static int wmqb_posix_put(void* ctx, byte ns, const byte* key, word16 key_len,
@@ -132,70 +137,176 @@ static int wmqb_hex_decode(const char* in, byte* out, word16 out_cap)
     return n / 2;
 }
 
-/* Build "<root>/<ns>" path. Returns 0 on success, negative on overflow. */
-static int wmqb_ns_dir(const WmqbPosixCtx* c, byte ns, char* out,
-    size_t out_cap)
+static int wmqb_validate_dir(int fd)
 {
-    int n = snprintf(out, out_cap, "%s/%u", c->dir, (unsigned)ns);
-    if (n <= 0 || (size_t)n >= out_cap) {
-        return MQTT_CODE_ERROR_OUT_OF_BUFFER;
+    struct stat st;
+
+    if (fstat(fd, &st) < 0 || !S_ISDIR(st.st_mode) ||
+            st.st_uid != geteuid() ||
+            (st.st_mode & (S_IWGRP | S_IWOTH)) != 0) {
+        return MQTT_CODE_ERROR_SYSTEM;
     }
     return 0;
 }
 
-/* Build "<root>/<ns>/<hex>.bin" path. */
-static int wmqb_rec_path(const WmqbPosixCtx* c, byte ns, const byte* key,
-    word16 key_len, char* out, size_t out_cap)
+static int wmqb_normalize_root(const char* path, char* out, size_t out_sz)
+{
+    const char* prefix = "";
+    size_t path_len;
+    size_t prefix_len;
+
+    if (path == NULL || out == NULL) {
+        return MQTT_CODE_ERROR_BAD_ARG;
+    }
+#ifdef __MACH__
+    if (XSTRCMP(path, "/tmp") == 0 || XSTRNCMP(path, "/tmp/", 5) == 0 ||
+            XSTRCMP(path, "/var") == 0 ||
+            XSTRNCMP(path, "/var/", 5) == 0) {
+        prefix = "/private";
+    }
+#endif
+    path_len = XSTRLEN(path);
+    prefix_len = XSTRLEN(prefix);
+    if (path_len == 0 || prefix_len + path_len >= out_sz) {
+        return MQTT_CODE_ERROR_OUT_OF_BUFFER;
+    }
+    XMEMCPY(out, prefix, prefix_len);
+    XMEMCPY(out + prefix_len, path, path_len + 1);
+    return MQTT_CODE_SUCCESS;
+}
+
+/* Resolve every configured root component relative to a trusted descriptor.
+ * Symlinks and ".." are rejected, and only the final component is created.
+ * The returned descriptor pins the validated tree even if an ancestor is
+ * later renamed. */
+static int wmqb_open_root(const char* path, int* root_fd)
+{
+    char work[512];
+    char* component;
+    char* next;
+    int current_fd;
+    int next_fd;
+    int is_last;
+    size_t path_len;
+
+    if (path == NULL || root_fd == NULL) {
+        return MQTT_CODE_ERROR_BAD_ARG;
+    }
+    path_len = XSTRLEN(path);
+    if (path_len == 0 || path_len >= sizeof(work)) {
+        return MQTT_CODE_ERROR_OUT_OF_BUFFER;
+    }
+    XMEMCPY(work, path, path_len + 1);
+    current_fd = open(path[0] == '/' ? "/" : ".",
+        O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (current_fd < 0) {
+        return MQTT_CODE_ERROR_SYSTEM;
+    }
+
+    component = work;
+    while (*component == '/') {
+        component++;
+    }
+    while (*component != '\0') {
+        next = component;
+        while (*next != '\0' && *next != '/') {
+            next++;
+        }
+        if (*next == '/') {
+            *next = '\0';
+            next++;
+            while (*next == '/') {
+                next++;
+            }
+        }
+        is_last = (*next == '\0');
+        if (XSTRCMP(component, ".") == 0) {
+            component = next;
+            continue;
+        }
+        if (XSTRCMP(component, "..") == 0) {
+            (void)close(current_fd);
+            return MQTT_CODE_ERROR_BAD_ARG;
+        }
+        next_fd = openat(current_fd, component,
+            O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+        if (next_fd < 0 && errno == ENOENT && is_last) {
+            if (mkdirat(current_fd, component, 0700) < 0 && errno != EEXIST) {
+                (void)close(current_fd);
+                return MQTT_CODE_ERROR_SYSTEM;
+            }
+            next_fd = openat(current_fd, component,
+                O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+        }
+        if (next_fd < 0) {
+            (void)close(current_fd);
+            return MQTT_CODE_ERROR_SYSTEM;
+        }
+        (void)close(current_fd);
+        current_fd = next_fd;
+        component = next;
+    }
+    if (wmqb_validate_dir(current_fd) != 0) {
+        (void)close(current_fd);
+        return MQTT_CODE_ERROR_SYSTEM;
+    }
+    *root_fd = current_fd;
+    return 0;
+}
+
+static int wmqb_open_ns(const WmqbPosixCtx* c, byte ns, int create,
+    int* ns_fd)
+{
+    char ns_name[4];
+    int fd;
+    int n;
+
+    if (c == NULL || c->root_fd < 0 || ns_fd == NULL) {
+        return MQTT_CODE_ERROR_BAD_ARG;
+    }
+    n = snprintf(ns_name, sizeof(ns_name), "%u", (unsigned)ns);
+    if (n <= 0 || (size_t)n >= sizeof(ns_name)) {
+        return MQTT_CODE_ERROR_OUT_OF_BUFFER;
+    }
+    fd = openat(c->root_fd, ns_name,
+        O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (fd < 0 && errno == ENOENT && create) {
+        if (mkdirat(c->root_fd, ns_name, 0700) < 0 && errno != EEXIST) {
+            return MQTT_CODE_ERROR_SYSTEM;
+        }
+        fd = openat(c->root_fd, ns_name,
+            O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    }
+    if (fd < 0) {
+        return (errno == ENOENT) ? MQTT_CODE_ERROR_NOT_FOUND :
+            MQTT_CODE_ERROR_SYSTEM;
+    }
+    if (wmqb_validate_dir(fd) != 0) {
+        (void)close(fd);
+        return MQTT_CODE_ERROR_SYSTEM;
+    }
+    *ns_fd = fd;
+    return 0;
+}
+
+static int wmqb_rec_name(const byte* key, word16 key_len, char* out,
+    size_t out_cap)
 {
     char hex[2 * 256 + 1];
     int n;
+
+    if (key == NULL || out == NULL) {
+        return MQTT_CODE_ERROR_BAD_ARG;
+    }
     if (key_len > 256) {
         return MQTT_CODE_ERROR_OUT_OF_BUFFER;
     }
     wmqb_hex_encode(hex, key, key_len);
-    n = snprintf(out, out_cap, "%s/%u/%s.bin", c->dir, (unsigned)ns, hex);
+    n = snprintf(out, out_cap, "%s.bin", hex);
     if (n <= 0 || (size_t)n >= out_cap) {
         return MQTT_CODE_ERROR_OUT_OF_BUFFER;
     }
     return 0;
-}
-
-/* mkdir -p semantics for a single trailing component. Tolerates EEXIST. */
-static int wmqb_mkdir(const char* path)
-{
-    if (mkdir(path, 0700) == 0) {
-        return 0;
-    }
-    if (errno == EEXIST) {
-        return 0;
-    }
-    return MQTT_CODE_ERROR_SYSTEM;
-}
-
-/* Ensure <root>/<ns> exists. Idempotent. */
-static int wmqb_ensure_ns_dir(const WmqbPosixCtx* c, byte ns)
-{
-    char path[576];
-    int rc;
-    rc = wmqb_mkdir(c->dir);
-    if (rc != 0) {
-        return rc;
-    }
-    rc = wmqb_ns_dir(c, ns, path, sizeof(path));
-    if (rc != 0) {
-        return rc;
-    }
-    return wmqb_mkdir(path);
-}
-
-/* fsync a directory by open() + fsync() + close(). Best-effort. */
-static void wmqb_fsync_dir(const char* path)
-{
-    int fd = open(path, O_RDONLY);
-    if (fd >= 0) {
-        (void)fsync(fd);
-        (void)close(fd);
-    }
 }
 
 /* kv_put: write to <root>/<ns>/<hex>.bin.tmp, fsync, rename, fsync dir. */
@@ -203,39 +314,64 @@ static int wmqb_posix_put(void* ctx, byte ns, const byte* key,
     word16 key_len, const byte* blob, word32 blob_len)
 {
     WmqbPosixCtx* c = (WmqbPosixCtx*)ctx;
-    char final_path[640];
-    char tmp_path[660];
-    char ns_path[576];
-    int  fd;
-    int  rc;
+    char final_name[2 * 256 + 5];
+    char tmp_name[2 * 256 + 9];
+    struct stat st;
+    int fd;
+    int ns_fd = -1;
+    int rc;
+    int saved_errno;
     ssize_t w;
     word32 written = 0;
 
     if (c == NULL || key == NULL || blob == NULL) {
         return MQTT_CODE_ERROR_BAD_ARG;
     }
-    rc = wmqb_ensure_ns_dir(c, ns);
+    rc = wmqb_open_ns(c, ns, 1, &ns_fd);
     if (rc != 0) {
         return rc;
     }
-    rc = wmqb_rec_path(c, ns, key, key_len, final_path, sizeof(final_path));
+    rc = wmqb_rec_name(key, key_len, final_name, sizeof(final_name));
     if (rc != 0) {
+        (void)close(ns_fd);
         return rc;
     }
     {
-        /* snprintf returns negative on encoding error, or a non-negative
-         * value that may be >= size on truncation. Treat both as
-         * failure - a truncated tmp_path would rename(2) to a
-         * different file than we intended. Pattern matches
-         * wmqb_rec_path. */
-        int n = snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", final_path);
-        if (n < 0 || (size_t)n >= sizeof(tmp_path)) {
+        int n = snprintf(tmp_name, sizeof(tmp_name), "%s.tmp", final_name);
+        if (n < 0 || (size_t)n >= sizeof(tmp_name)) {
+            (void)close(ns_fd);
             return MQTT_CODE_ERROR_OUT_OF_BUFFER;
         }
     }
 
-    fd = open(tmp_path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    fd = openat(ns_fd, tmp_name,
+        O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
+    if (fd < 0 && errno == EEXIST) {
+        struct stat old_st;
+
+        /* A crash can leave the broker's regular temp file behind. Reclaim
+         * only an owned, single-link, non-writable file; never remove a
+         * symlink or other attacker-supplied object. The namespace itself is
+         * validated as 0700-equivalent, so another uid cannot race this
+         * check and unlink. */
+        if (fstatat(ns_fd, tmp_name, &old_st, AT_SYMLINK_NOFOLLOW) == 0 &&
+                S_ISREG(old_st.st_mode) && old_st.st_uid == geteuid() &&
+                old_st.st_nlink == 1 &&
+                (old_st.st_mode & (S_IWGRP | S_IWOTH)) == 0 &&
+                unlinkat(ns_fd, tmp_name, 0) == 0) {
+            fd = openat(ns_fd, tmp_name,
+                O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
+        }
+    }
     if (fd < 0) {
+        (void)close(ns_fd);
+        return MQTT_CODE_ERROR_SYSTEM;
+    }
+    if (fstat(fd, &st) < 0 || !S_ISREG(st.st_mode) ||
+            st.st_uid != geteuid() || st.st_nlink != 1) {
+        (void)close(fd);
+        (void)unlinkat(ns_fd, tmp_name, 0);
+        (void)close(ns_fd);
         return MQTT_CODE_ERROR_SYSTEM;
     }
     {
@@ -250,7 +386,14 @@ static int wmqb_posix_put(void* ctx, byte ns, const byte* key,
                     continue;
                 }
                 (void)close(fd);
-                (void)unlink(tmp_path);
+                (void)unlinkat(ns_fd, tmp_name, 0);
+                (void)close(ns_fd);
+                return MQTT_CODE_ERROR_SYSTEM;
+            }
+            if (w == 0) {
+                (void)close(fd);
+                (void)unlinkat(ns_fd, tmp_name, 0);
+                (void)close(ns_fd);
                 return MQTT_CODE_ERROR_SYSTEM;
             }
             written += (word32)w;
@@ -258,18 +401,25 @@ static int wmqb_posix_put(void* ctx, byte ns, const byte* key,
     }
     if (fsync(fd) < 0) {
         (void)close(fd);
-        (void)unlink(tmp_path);
+        (void)unlinkat(ns_fd, tmp_name, 0);
+        (void)close(ns_fd);
         return MQTT_CODE_ERROR_SYSTEM;
     }
-    (void)close(fd);
-    if (rename(tmp_path, final_path) < 0) {
-        (void)unlink(tmp_path);
+    if (close(fd) < 0) {
+        (void)unlinkat(ns_fd, tmp_name, 0);
+        (void)close(ns_fd);
+        return MQTT_CODE_ERROR_SYSTEM;
+    }
+    if (renameat(ns_fd, tmp_name, ns_fd, final_name) < 0) {
+        saved_errno = errno;
+        (void)unlinkat(ns_fd, tmp_name, 0);
+        (void)close(ns_fd);
+        errno = saved_errno;
         return MQTT_CODE_ERROR_SYSTEM;
     }
     /* fsync the namespace dir so rename is durable. */
-    if (wmqb_ns_dir(c, ns, ns_path, sizeof(ns_path)) == 0) {
-        wmqb_fsync_dir(ns_path);
-    }
+    (void)fsync(ns_fd);
+    (void)close(ns_fd);
     return 0;
 }
 
@@ -277,9 +427,11 @@ static int wmqb_posix_get(void* ctx, byte ns, const byte* key,
     word16 key_len, byte* out, word32* inout_len)
 {
     WmqbPosixCtx* c = (WmqbPosixCtx*)ctx;
-    char path[640];
-    int  fd;
-    int  rc;
+    char name[2 * 256 + 5];
+    struct stat st;
+    int fd;
+    int ns_fd;
+    int rc;
     ssize_t r;
     word32 cap;
     word32 read_total = 0;
@@ -288,18 +440,35 @@ static int wmqb_posix_get(void* ctx, byte ns, const byte* key,
         return MQTT_CODE_ERROR_BAD_ARG;
     }
     cap = *inout_len;
-    rc = wmqb_rec_path(c, ns, key, key_len, path, sizeof(path));
+    rc = wmqb_rec_name(key, key_len, name, sizeof(name));
     if (rc != 0) {
         return rc;
     }
-    fd = open(path, O_RDONLY);
+    rc = wmqb_open_ns(c, ns, 0, &ns_fd);
+    if (rc != 0) {
+        if (rc == MQTT_CODE_ERROR_NOT_FOUND) {
+            *inout_len = 0;
+        }
+        return rc;
+    }
+    fd = openat(ns_fd, name, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
     if (fd < 0) {
-        if (errno == ENOENT) {
+        int open_errno = errno;
+
+        (void)close(ns_fd);
+        if (open_errno == ENOENT) {
             *inout_len = 0;
             return MQTT_CODE_ERROR_NOT_FOUND;
         }
         return MQTT_CODE_ERROR_SYSTEM;
     }
+    if (fstat(fd, &st) < 0 || !S_ISREG(st.st_mode) ||
+            st.st_uid != geteuid()) {
+        (void)close(fd);
+        (void)close(ns_fd);
+        return MQTT_CODE_ERROR_SYSTEM;
+    }
+    (void)close(ns_fd);
     {
         int eintr_count = 0;
         while (read_total < cap) {
@@ -326,26 +495,34 @@ static int wmqb_posix_del(void* ctx, byte ns, const byte* key,
     word16 key_len)
 {
     WmqbPosixCtx* c = (WmqbPosixCtx*)ctx;
-    char path[640];
-    char ns_path[576];
-    int  rc;
+    char name[2 * 256 + 5];
+    int ns_fd;
+    int rc;
 
     if (c == NULL || key == NULL) {
         return MQTT_CODE_ERROR_BAD_ARG;
     }
-    rc = wmqb_rec_path(c, ns, key, key_len, path, sizeof(path));
+    rc = wmqb_rec_name(key, key_len, name, sizeof(name));
     if (rc != 0) {
         return rc;
     }
-    if (unlink(path) < 0) {
+    rc = wmqb_open_ns(c, ns, 0, &ns_fd);
+    if (rc == MQTT_CODE_ERROR_NOT_FOUND) {
+        return 0;
+    }
+    if (rc != 0) {
+        return rc;
+    }
+    if (unlinkat(ns_fd, name, 0) < 0) {
         if (errno == ENOENT) {
+            (void)close(ns_fd);
             return 0;
         }
+        (void)close(ns_fd);
         return MQTT_CODE_ERROR_SYSTEM;
     }
-    if (wmqb_ns_dir(c, ns, ns_path, sizeof(ns_path)) == 0) {
-        wmqb_fsync_dir(ns_path);
-    }
+    (void)fsync(ns_fd);
+    (void)close(ns_fd);
     return 0;
 }
 
@@ -353,27 +530,27 @@ static int wmqb_posix_iter(void* ctx, byte ns, MqttBrokerPersist_IterCb cb,
     void* cb_ctx)
 {
     WmqbPosixCtx* c = (WmqbPosixCtx*)ctx;
-    char ns_path[576];
     DIR* d;
     struct dirent* ent;
+    int ns_fd;
     int rc;
 
     if (c == NULL || cb == NULL) {
         return MQTT_CODE_ERROR_BAD_ARG;
     }
-    rc = wmqb_ns_dir(c, ns, ns_path, sizeof(ns_path));
+    rc = wmqb_open_ns(c, ns, 0, &ns_fd);
+    if (rc == MQTT_CODE_ERROR_NOT_FOUND) {
+        return 0;
+    }
     if (rc != 0) {
         return rc;
     }
-    d = opendir(ns_path);
+    d = fdopendir(ns_fd);
     if (d == NULL) {
-        if (errno == ENOENT) {
-            return 0;
-        }
+        (void)close(ns_fd);
         return MQTT_CODE_ERROR_SYSTEM;
     }
     while ((ent = readdir(d)) != NULL) {
-        char rec_path[640];
         char key_hex[2 * 256 + 1];
         byte key_buf[256];
         byte* blob;
@@ -407,30 +584,24 @@ static int wmqb_posix_iter(void* ctx, byte ns, MqttBrokerPersist_IterCb cb,
         if (kn < 0) {
             continue;
         }
-        {
-            int n = snprintf(rec_path, sizeof(rec_path), "%s/%s", ns_path,
-                    ent->d_name);
-            if (n < 0 || (size_t)n >= sizeof(rec_path)) {
-                continue;
-            }
-        }
-        if (stat(rec_path, &st) < 0) {
+        fd = openat(dirfd(d), ent->d_name,
+            O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC);
+        if (fd < 0) {
             continue;
         }
-        if (st.st_size <= 0 || (word64)st.st_size > 16 * 1024 * 1024) {
-            /* Sanity cap: refuse to load records larger than 16 MiB. */
+        if (fstat(fd, &st) < 0 || !S_ISREG(st.st_mode) ||
+                st.st_uid != geteuid() || st.st_size <= 0 ||
+                (word64)st.st_size > 16 * 1024 * 1024) {
+            /* Refuse non-regular, foreign-owned, or oversized records. */
+            (void)close(fd);
             continue;
         }
         blob_cap = (word32)st.st_size;
         blob = (byte*)WOLFMQTT_MALLOC(blob_cap);
         if (blob == NULL) {
+            (void)close(fd);
             (void)closedir(d);
             return MQTT_CODE_ERROR_MEMORY;
-        }
-        fd = open(rec_path, O_RDONLY);
-        if (fd < 0) {
-            WOLFMQTT_FREE(blob);
-            continue;
         }
         read_total = 0;
         {
@@ -476,11 +647,10 @@ static int wmqb_posix_sync(void* ctx)
     /* The per-op fsync in put/del already covered the data + the
      * namespace dir. A top-level fsync of the root dir here ensures
      * any namespace-dir creates are durable too. */
-    if (c == NULL) {
+    if (c == NULL || c->root_fd < 0) {
         return MQTT_CODE_ERROR_BAD_ARG;
     }
-    wmqb_fsync_dir(c->dir);
-    return 0;
+    return (fsync(c->root_fd) == 0) ? 0 : MQTT_CODE_ERROR_SYSTEM;
 }
 
 int MqttBrokerNet_PersistPosix_Init(MqttBrokerPersistHooks* hooks,
@@ -488,23 +658,29 @@ int MqttBrokerNet_PersistPosix_Init(MqttBrokerPersistHooks* hooks,
 {
     WmqbPosixCtx* c;
     const char* use_dir = (dir != NULL) ? dir : BROKER_PERSIST_DIR_DEFAULT;
-    size_t dlen;
+    int rc;
 
     if (hooks == NULL) {
         return MQTT_CODE_ERROR_BAD_ARG;
-    }
-    dlen = strlen(use_dir);
-    if (dlen == 0 || dlen >= sizeof(((WmqbPosixCtx*)0)->dir)) {
-        return MQTT_CODE_ERROR_OUT_OF_BUFFER;
     }
     c = (WmqbPosixCtx*)WOLFMQTT_MALLOC(sizeof(*c));
     if (c == NULL) {
         return MQTT_CODE_ERROR_MEMORY;
     }
     XMEMSET(c, 0, sizeof(*c));
-    XMEMCPY(c->dir, use_dir, dlen);
-    c->dir[dlen] = '\0';
+    c->root_fd = -1;
+    rc = wmqb_normalize_root(use_dir, c->dir, sizeof(c->dir));
+    if (rc != MQTT_CODE_SUCCESS) {
+        WOLFMQTT_FREE(c);
+        return rc;
+    }
     c->owned = 1;
+
+    rc = wmqb_open_root(c->dir, &c->root_fd);
+    if (rc != MQTT_CODE_SUCCESS) {
+        WOLFMQTT_FREE(c);
+        return rc;
+    }
 
     XMEMSET(hooks, 0, sizeof(*hooks));
     hooks->kv_put     = wmqb_posix_put;
@@ -514,18 +690,6 @@ int MqttBrokerNet_PersistPosix_Init(MqttBrokerPersistHooks* hooks,
     hooks->sync       = wmqb_posix_sync;
     hooks->ctx        = c;
 
-    /* Create root dir up front so first put doesn't race. Tolerates
-     * EEXIST inside wmqb_mkdir. Non-fatal at init time (the first put
-     * will retry and surface any persistent error), but log a warning
-     * so an operator hitting EACCES on the default /var/lib/wolfmqtt
-     * path (broker run as a non-privileged user without -D) sees the
-     * failure here instead of being puzzled when nothing persists. */
-    if (wmqb_mkdir(c->dir) != 0) {
-        fprintf(stderr,
-            "wolfmqtt: persist root mkdir failed dir=\"%s\" errno=%d (%s) "
-            "- persistence will fail unless the path is writable\n",
-            c->dir, errno, strerror(errno));
-    }
     return 0;
 }
 
@@ -537,6 +701,10 @@ void MqttBrokerNet_PersistPosix_Free(MqttBrokerPersistHooks* hooks)
     }
     c = (WmqbPosixCtx*)hooks->ctx;
     if (c != NULL && c->owned) {
+        if (c->root_fd >= 0) {
+            (void)close(c->root_fd);
+            c->root_fd = -1;
+        }
         WOLFMQTT_FREE(c);
     }
     XMEMSET(hooks, 0, sizeof(*hooks));

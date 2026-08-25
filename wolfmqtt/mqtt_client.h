@@ -141,8 +141,9 @@ typedef int (*MqttMsgCb)(struct _MqttClient *client, MqttMessage *message,
 /*! \brief      Mqtt Publish Callback.
  *  If the publish payload is larger than the maximum TX buffer
     then this callback is called multiple times. This callback is executed from
-    within a call to MqttPublish. It is expected to provide a buffer and it's
-    size and return >=0 for success.
+    within a call to MqttPublish. It is expected to provide a buffer and its
+    size and return the number of valid bytes written. The library limits the
+    final callback result to the remaining MqttPublish.total_len.
     Each callback populates the payload in MqttPublish.buffer.
     The MqttPublish.buffer_len is the size of the buffer payload.
     The MqttPublish.total_len is the length of the complete payload message.
@@ -244,6 +245,9 @@ typedef struct _MqttClient {
     int          rx_buf_len;
 
     MqttNet     *net;   /* Pointer to network callbacks and context */
+#ifdef ENABLE_MQTT_CURL
+    byte         curl_initialized; /* Owns one curl global init reference. */
+#endif
 #ifdef ENABLE_MQTT_TLS
     MqttTls      tls;   /* WolfSSL context for TLS */
 #endif
@@ -257,6 +261,10 @@ typedef struct _MqttClient {
     MqttObject   msg;   /* generic incoming message used by MqttClient_WaitType */
 #ifdef WOLFMQTT_SN
     SN_Object    msgSN;
+    SN_PingReq   pingSN; /* persistent state for a NULL SN ping request */
+    byte         pingSN_busy; /* one caller at a time owns pingSN */
+    SN_MsgType  sn_wait_packet_type;
+    word16      sn_wait_packet_id;
     SN_ClientRegisterCb reg_cb;
     void               *reg_ctx;
 #endif
@@ -268,6 +276,7 @@ typedef struct _MqttClient {
     byte   retain_avail;  /* Server property */
     byte   enable_eauth;  /* Enhanced authentication */
     byte   protocol_level;
+    byte   props_initialized; /* Internal property-stack ownership flag. */
 #endif
 
 #ifdef WOLFMQTT_DISCONNECT_CB
@@ -279,6 +288,11 @@ typedef struct _MqttClient {
     void          *property_ctx;
 #endif
 #ifdef WOLFMQTT_MULTITHREAD
+    byte   init_flags; /* Internal resource-initialization flags. */
+    #ifdef WOLFMQTT_THREAD_ID_T
+    byte   write_owner_valid; /* lockSend owner is known. */
+    WOLFMQTT_THREAD_ID_T write_owner;
+    #endif
     wm_Sem lockSend;
     wm_Sem lockRecv;
     wm_Sem lockClient;
@@ -338,7 +352,8 @@ typedef struct _MqttClient {
  *  \param      tx_buf      Pointer to transmit buffer used during encoding
  *  \param      tx_buf_len  Maximum length of the transmit buffer
  *  \param      rx_buf      Pointer to receive buffer used during decoding
- *  \param      rx_buf_len  Maximum length of the receive buffer
+ *  \param      rx_buf_len  Positive maximum length of the receive buffer;
+                            protocol packet readers enforce their minimum size
  *  \param      cmd_timeout_ms
                             Maximum command wait timeout in milliseconds
  *  \return     MQTT_CODE_SUCCESS or MQTT_CODE_ERROR_BAD_ARG
@@ -730,6 +745,8 @@ WOLFMQTT_API const char* MqttClient_ReturnCodeToString(
 #endif /* WOLFMQTT_NO_ERROR_STRINGS */
 
 /* Internal functions */
+WOLFMQTT_LOCAL int MqttWriteStart(MqttClient* client, MqttMsgStat* stat);
+WOLFMQTT_LOCAL void MqttWriteStop(MqttClient* client, MqttMsgStat* stat);
 WOLFMQTT_LOCAL int MqttReadStart(MqttClient* client, MqttMsgStat* stat);
 WOLFMQTT_LOCAL void MqttReadStop(MqttClient* client, MqttMsgStat* stat);
 #ifdef WOLFMQTT_MULTITHREAD
