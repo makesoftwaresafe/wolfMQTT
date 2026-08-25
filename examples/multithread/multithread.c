@@ -44,6 +44,14 @@
     #define NUM_PUB_PER_TASK 2
 #endif
 
+/* How many cmd_timeout_ms intervals a write-only publish may spend waiting for
+   the reader thread to complete its acknowledgement before the timeout is
+   treated as terminal. Bounds the poll loop in publish_task against a broker
+   that never acknowledges. */
+#ifndef PUBLISH_ACK_MAX_TIMEOUTS
+    #define PUBLISH_ACK_MAX_TIMEOUTS 3
+#endif
+
 /* Maximum size for network read/write callbacks. There is also a v5 define that
    describes the max MQTT control packet size, DEFAULT_MAX_PKT_SZ. */
 #ifndef MAX_BUFFER_SIZE
@@ -655,6 +663,7 @@ static void *publish_task(void *param)
     MQTTCtx *mqttCtx = (MQTTCtx*)param;
     MqttPublish publish[NUM_PUB_PER_TASK];
     word32 startSec[NUM_PUB_PER_TASK];
+    int acktimeouts[NUM_PUB_PER_TASK];
 
     /* Build publish */
     for (i=0; i<NUM_PUB_PER_TASK; i++) {
@@ -670,21 +679,43 @@ static void *publish_task(void *param)
 
         rc[i] = MQTT_CODE_CONTINUE;
         startSec[i] = 0;
+        acktimeouts[i] = 0;
     }
 
-    /* Send until != continue */
+    /* Send until complete. A write-only publish returns MQTT_CODE_CONTINUE
+     * while its acknowledgement is still outstanding; the reader thread
+     * completes that ack, so keep polling until it reports success rather than
+     * abandoning an in-flight publish. Cancelling one whose PUBLISH already
+     * reached the wire cannot reclaim its Receive Maximum unit until reconnect,
+     * since the server keeps counting it [MQTT-4.9]. */
     for (i=0; i<NUM_PUB_PER_TASK; i++) {
         while (rc[i] == MQTT_CODE_CONTINUE) {
             rc[i] = MqttClient_Publish_WriteOnly(&mqttCtx->client, &publish[i],
                 NULL);
             rc[i] = check_response(mqttCtx, rc[i], &startSec[i],
                 MQTT_PACKET_TYPE_PUBLISH, mqttCtx->cmd_timeout_ms);
+        #ifndef WOLFMQTT_TEST_CANCEL
+            /* A benign poll timeout is not a failure for an in-flight write-only
+             * publish; keep waiting for the reader thread to finish its ack.
+             * Bounded, though: mqtt_check_timeout restarts its interval every
+             * time it reports a timeout, so converting every one back to
+             * MQTT_CODE_CONTINUE would poll forever against a broker that never
+             * acknowledges, and this thread would never join. After
+             * PUBLISH_ACK_MAX_TIMEOUTS intervals the timeout stays terminal. */
+            if (rc[i] == MQTT_CODE_ERROR_TIMEOUT &&
+                    ++acktimeouts[i] < PUBLISH_ACK_MAX_TIMEOUTS) {
+                rc[i] = MQTT_CODE_CONTINUE;
+            }
+        #endif
         }
     }
 
     /* Report result */
     for (i=0; i<NUM_PUB_PER_TASK; i++) {
-        if (rc[i] != MQTT_CODE_SUCCESS) {
+        /* Only cancel on a genuine terminal error, never a publish still in
+         * flight (MQTT_CODE_CONTINUE): cancelling one whose PUBLISH is already
+         * on the wire forfeits its reserved Receive Maximum unit [MQTT-4.9]. */
+        if (rc[i] != MQTT_CODE_SUCCESS && rc[i] != MQTT_CODE_CONTINUE) {
             MqttClient_CancelMessage(&mqttCtx->client, (MqttObject*)&publish[i]);
         }
 

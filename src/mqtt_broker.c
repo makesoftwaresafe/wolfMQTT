@@ -1044,6 +1044,7 @@ static BrokerClient* BrokerClient_AddWs(MqttBroker* broker, struct lws *wsi)
 #ifndef WOLFMQTT_STATIC_MEMORY
         bc->next = broker->clients;
         broker->clients = bc;
+        broker->clients_gen++;
 #endif
         WBLOG_INFO(broker, "broker: ws client added (wsi=%p)", (void*)wsi);
     }
@@ -2453,6 +2454,7 @@ static BrokerClient* BrokerClient_Add(MqttBroker* broker,
         /* Prepend to linked list */
         bc->next = broker->clients;
         broker->clients = bc;
+        broker->clients_gen++;
 #endif
     }
     else if (bc != NULL) {
@@ -2495,6 +2497,7 @@ static void BrokerClient_Remove(MqttBroker* broker, BrokerClient* bc)
      * (e.g. WebSocket LWS_CALLBACK_CLOSED during a takeover fan-out) can have
      * already removed and freed bc; freeing again here would double-free. */
     if (found) {
+        broker->clients_gen++;
         BrokerClient_Free(bc);
     }
 #else
@@ -3417,6 +3420,7 @@ WOLFMQTT_LOCAL void BrokerOrphan_DropFull(MqttBroker* broker,
                     WOLFMQTT_FREE(sp->client_id);
                 }
                 WOLFMQTT_FREE(sp);
+                broker->subs_gen++;
             }
             else {
                 prev = sp;
@@ -3902,6 +3906,7 @@ static void BrokerSubs_RemoveClient(MqttBroker* broker, BrokerClient* bc)
                 WOLFMQTT_FREE(cur->client_id);
             }
             WOLFMQTT_FREE(cur);
+            broker->subs_gen++;
         }
         else {
             prev = cur;
@@ -3947,6 +3952,103 @@ static void BrokerSubs_EndClientSession(MqttBroker* broker, BrokerClient* bc)
 #endif
     }
 }
+
+#ifndef WOLFMQTT_STATIC_MEMORY
+/* Confirm a snapshotted fan-out destination is still a live client. Writing to
+ * one subscriber can drive an lws_service spin whose LWS_CALLBACK_CLOSED fires
+ * for a *different* subscriber; only the client whose own write is spinning has
+ * ws->processing set and gets deferred removal, so that peer's BrokerClient is
+ * unlinked and freed immediately. A destination collected before the write must
+ * therefore be re-checked against broker->clients before it is used. Gated on
+ * clients_gen so the common (nothing removed) case stays O(1). */
+static int BrokerClients_StillLinked(const MqttBroker* broker,
+    const BrokerClient* bc)
+{
+    const BrokerClient* cur = broker->clients;
+    while (cur != NULL) {
+        if (cur == bc) {
+            return 1;
+        }
+        cur = cur->next;
+    }
+    return 0;
+}
+
+/* One resolved fan-out destination. Collected in a pass that performs no
+ * writes, so the walk of broker->subs cannot be disturbed part way through and
+ * the BrokerSub nodes are never dereferenced again once delivery starts. */
+typedef struct BrokerFanoutTarget {
+    BrokerClient* client;
+    MqttQoS       qos;      /* already narrowed against the subscription */
+} BrokerFanoutTarget;
+
+/* Destinations a fan-out can hold without allocating. Sized for the common
+ * handful of subscribers on a topic; beyond it the list moves to the heap. */
+#ifndef BROKER_FANOUT_STACK_TARGETS
+    #define BROKER_FANOUT_STACK_TARGETS 16
+#endif
+
+/* Growable destination list backed by a caller-supplied stack array. `heap` is
+ * non-NULL once it has outgrown that array, and `truncated` records that an
+ * allocation failed so the caller can report the dropped deliveries rather than
+ * silently fanning out to a subset. */
+typedef struct BrokerFanoutList {
+    BrokerFanoutTarget* items;
+    BrokerFanoutTarget* heap;
+    int count;
+    int cap;
+    int truncated;
+} BrokerFanoutList;
+
+static void BrokerFanout_Init(BrokerFanoutList* fl, BrokerFanoutTarget* stack,
+    int cap)
+{
+    fl->items = stack;
+    fl->heap = NULL;
+    fl->count = 0;
+    fl->cap = cap;
+    fl->truncated = 0;
+}
+
+static void BrokerFanout_Add(BrokerFanoutList* fl, BrokerClient* client,
+    MqttQoS qos)
+{
+    if (fl->truncated) {
+        return;
+    }
+    if (fl->count == fl->cap) {
+        int new_cap = fl->cap * 2;
+        BrokerFanoutTarget* grown = (BrokerFanoutTarget*)WOLFMQTT_MALLOC(
+            (size_t)new_cap * sizeof(BrokerFanoutTarget));
+        if (grown == NULL) {
+            fl->truncated = 1;
+            return;
+        }
+        XMEMCPY(grown, fl->items,
+            (size_t)fl->count * sizeof(BrokerFanoutTarget));
+        if (fl->heap != NULL) {
+            WOLFMQTT_FREE(fl->heap);
+        }
+        fl->heap = grown;
+        fl->items = grown;
+        fl->cap = new_cap;
+    }
+    fl->items[fl->count].client = client;
+    fl->items[fl->count].qos = qos;
+    fl->count++;
+}
+
+static void BrokerFanout_Free(BrokerFanoutList* fl)
+{
+    if (fl->heap != NULL) {
+        WOLFMQTT_FREE(fl->heap);
+        fl->heap = NULL;
+    }
+    fl->items = NULL;
+    fl->count = 0;
+    fl->cap = 0;
+}
+#endif
 
 static int BrokerSubs_Add(MqttBroker* broker, BrokerClient* bc,
     const char* filter, word16 filter_len, MqttQoS qos)
@@ -4031,6 +4133,11 @@ static int BrokerSubs_Add(MqttBroker* broker, BrokerClient* bc,
         sub->filter[filter_len] = '\0';
         sub->next = broker->subs;
         broker->subs = sub;
+        /* Bump on add too so subs_gen reflects every structural change to the
+         * list, not only removals. Also narrows the ABA window where a free and
+         * a same-address add in one fan-out iteration could otherwise pass the
+         * successor-still-linked check. */
+        broker->subs_gen++;
     }
     else if (sub != NULL) {
         WOLFMQTT_FREE(sub);
@@ -4116,6 +4223,7 @@ static void BrokerSubs_Remove(MqttBroker* broker, BrokerClient* bc,
                 WOLFMQTT_FREE(cur->client_id);
             }
             WOLFMQTT_FREE(cur);
+            broker->subs_gen++;
             if (bc->sub_count > 0) {
                 bc->sub_count--;
             }
@@ -4241,6 +4349,7 @@ static void BrokerSubs_RemoveByClientId(MqttBroker* broker,
                 WOLFMQTT_FREE(cur->client_id);
             }
             WOLFMQTT_FREE(cur);
+            broker->subs_gen++;
         }
         else {
             prev = cur;
@@ -5371,7 +5480,10 @@ static void BrokerClient_PublishWillImmediate(MqttBroker* broker,
     int i;
 #else
     BrokerSub* sub;
-    BrokerSub* next_sub = NULL;
+    BrokerFanoutTarget stack_targets[BROKER_FANOUT_STACK_TARGETS];
+    BrokerFanoutList targets;
+    word32 clients_gen_snapshot;
+    int t;
 #endif
 
     if (broker == NULL || topic == NULL) {
@@ -5398,23 +5510,11 @@ static void BrokerClient_PublishWillImmediate(MqttBroker* broker,
     for (i = 0; i < BROKER_MAX_SUBS; i++) {
         BrokerSub* sub = &broker->subs[i];
         if (!sub->in_use) continue;
-#else
-    sub = broker->subs;
-    while (sub) {
-        /* Snapshot the successor before any MqttPacket_Write: a WS fan-out
-         * write can drive an lws_service spin whose re-entrant CLOSED frees
-         * this client's BrokerSub nodes, so reading sub->next afterwards
-         * would dereference a freed node. */
-        next_sub = sub->next;
-#endif
         if (sub->client != NULL && sub->client->protocol_level != 0 &&
-#ifdef WOLFMQTT_STATIC_MEMORY
             sub->client->connected &&
-#endif
             BROKER_STR_VALID(sub->filter) &&
             BrokerTopicMatch(sub->filter, topic)) {
             MqttQoS eff_qos = (qos < sub->qos) ? qos : sub->qos;
-#ifdef WOLFMQTT_STATIC_MEMORY
             if (eff_qos >= MQTT_QOS_1) {
                 BrokerStaticOrphanSession* orphan =
                     BrokerStaticOrphan_Find(broker,
@@ -5452,66 +5552,10 @@ static void BrokerClient_PublishWillImmediate(MqttBroker* broker,
                     continue;
                 }
             }
-#else
-            if (eff_qos >= MQTT_QOS_1) {
-                /* Route QoS 1/2 through out_q so it survives reconnect. A full
-                 * queue must not silently drop an accepted Will: disconnect the
-                 * slow subscriber with Quota Exceeded, matching the live PUBLISH
-                 * fan-out policy. Gate on connected (not sock) so a WebSocket
-                 * client - which uses ws_ctx with sock == INVALID - is still
-                 * torn down, and a client with several matching subscriptions is
-                 * not disconnected twice. Clearing connected lets the reaper
-                 * close the transport (BrokerClient_Remove -> ws disconnect). */
-                if (sub->client->out_q_count >=
-                        BROKER_MAX_QUEUED_MSGS_PER_SUB) {
-                    BrokerClient* c = sub->client;
-                    if (c->connected) {
-                        WBLOG_ERR(broker,
-                            "broker: will out_q full (%d) -> disconnect sock=%d",
-                            c->out_q_count, (int)c->sock);
-                    #ifdef WOLFMQTT_V5
-                        (void)BrokerSend_Disconnect(c,
-                            MQTT_REASON_QUOTA_EXCEEDED);
-                    #endif
-                        if (c->sock != BROKER_SOCKET_INVALID) {
-                            broker->net.close(broker->net.ctx, c->sock);
-                            c->sock = BROKER_SOCKET_INVALID;
-                        }
-                        c->connected = 0;
-                    }
-                }
-                else {
-                    BrokerOutPub* e = BrokerOutPub_Alloc(topic,
-                        (payload_len > 0) ? payload : NULL, payload_len
-                    #ifdef WOLFMQTT_V5
-                        , NULL
-                    #endif
-                        );
-                    if (e == NULL) {
-                        WBLOG_ERR(broker,
-                            "broker: will alloc failed sock=%d",
-                            (int)sub->client->sock);
-                    }
-                    else {
-                        e->qos = eff_qos;
-                        e->packet_id = BrokerNextPacketId(broker);
-                        e->retain = 0;
-                        e->state = BROKER_OUTQ_QUEUED;
-                    #ifdef WOLFMQTT_V5
-                        e->protocol_level = sub->client->protocol_level;
-                    #endif
-                        BrokerClient_EnqueueOutPub(sub->client, e);
-                        BrokerClient_DrainOutQueue(sub->client);
-                    }
-                }
-            }
-            /* QoS 0 is best effort; skip while tx_buf holds an in-flight
-             * CONNACK. */
-            else if (sub->client->connack_pending_len == 0)
-#endif
             {
                 MqttPublish out_pub;
                 int enc_rc, wr_rc;
+                BrokerClient* wc = sub->client;
                 XMEMSET(&out_pub, 0, sizeof(out_pub));
                 out_pub.topic_name = (char*)topic;
                 out_pub.qos = eff_qos;
@@ -5523,21 +5567,20 @@ static void BrokerClient_PublishWillImmediate(MqttBroker* broker,
                     out_pub.packet_id = BrokerNextPacketId(broker);
                 }
 #ifdef WOLFMQTT_V5
-                out_pub.protocol_level = sub->client->protocol_level;
+                out_pub.protocol_level = wc->protocol_level;
 #endif
-                enc_rc = MqttEncode_Publish(sub->client->tx_buf,
-                    BROKER_CLIENT_TX_SZ(sub->client), &out_pub, 0);
+                enc_rc = MqttEncode_Publish(wc->tx_buf,
+                    BROKER_CLIENT_TX_SZ(wc), &out_pub, 0);
                 if (enc_rc > 0) {
-                    wr_rc = MqttPacket_Write(&sub->client->client,
-                            sub->client->tx_buf, enc_rc);
+                    wr_rc = MqttPacket_Write(&wc->client,
+                            wc->tx_buf, enc_rc);
                     /* Scrub tx_buf unless still in-progress (CONTINUE). */
                     if (wr_rc != MQTT_CODE_CONTINUE) {
-                        BROKER_FORCE_ZERO(sub->client->tx_buf, enc_rc);
+                        BROKER_FORCE_ZERO(wc->tx_buf, enc_rc);
                     }
                 }
             }
         }
-#ifdef WOLFMQTT_STATIC_MEMORY
         else if ((sub->client == NULL || !sub->client->connected) &&
                 BROKER_STR_VALID(sub->client_id) &&
                 BROKER_STR_VALID(sub->filter) &&
@@ -5562,11 +5605,123 @@ static void BrokerClient_PublishWillImmediate(MqttBroker* broker,
                 }
             }
         }
-#endif
-#ifndef WOLFMQTT_STATIC_MEMORY
-        sub = next_sub;
-#endif
     }
+#else
+    /* Two phases. The collect pass performs no writes, so broker->subs cannot
+     * be mutated part way through it; delivery then works only from the
+     * collected BrokerClient pointers and never dereferences a BrokerSub again.
+     * Walking and writing in one pass is not safe: a write can drive an
+     * lws_service spin whose re-entrant LWS_CALLBACK_CLOSED frees the closing
+     * subscriber's BrokerSub nodes, including the node this loop would advance
+     * to next, and abandoning the walk there would silently drop every
+     * still-connected subscriber after it. */
+    BrokerFanout_Init(&targets, stack_targets, BROKER_FANOUT_STACK_TARGETS);
+    for (sub = broker->subs; sub != NULL; sub = sub->next) {
+        if (sub->client != NULL && sub->client->protocol_level != 0 &&
+            BROKER_STR_VALID(sub->filter) &&
+            BrokerTopicMatch(sub->filter, topic)) {
+            BrokerFanout_Add(&targets, sub->client,
+                (qos < sub->qos) ? qos : sub->qos);
+        }
+    }
+    if (targets.truncated) {
+        WBLOG_ERR(broker,
+            "broker: will fan-out list alloc failed after %d destination(s), "
+            "remaining subscribers not served topic=%s",
+            targets.count, BrokerLog_Sanitize(topic));
+    }
+
+    clients_gen_snapshot = broker->clients_gen;
+    for (t = 0; t < targets.count; t++) {
+        BrokerClient* wc = targets.items[t].client;
+        MqttQoS eff_qos = targets.items[t].qos;
+
+        /* An earlier delivery in this fan-out can have closed this peer, and a
+         * peer that is not the one being written to is freed outright rather
+         * than deferred. Only rescan when the client list actually changed. */
+        if (broker->clients_gen != clients_gen_snapshot &&
+                !BrokerClients_StillLinked(broker, wc)) {
+            continue;
+        }
+
+        if (eff_qos >= MQTT_QOS_1) {
+            /* Route QoS 1/2 through out_q so it survives reconnect. A full
+             * queue must not silently drop an accepted Will: disconnect the
+             * slow subscriber with Quota Exceeded, matching the live PUBLISH
+             * fan-out policy. Gate on connected (not sock) so a WebSocket
+             * client - which uses ws_ctx with sock == INVALID - is still
+             * torn down, and a client with several matching subscriptions is
+             * not disconnected twice. Clearing connected lets the reaper
+             * close the transport (BrokerClient_Remove -> ws disconnect). */
+            if (wc->out_q_count >= BROKER_MAX_QUEUED_MSGS_PER_SUB) {
+                if (wc->connected) {
+                    WBLOG_ERR(broker,
+                        "broker: will out_q full (%d) -> disconnect sock=%d",
+                        wc->out_q_count, (int)wc->sock);
+                #ifdef WOLFMQTT_V5
+                    (void)BrokerSend_Disconnect(wc,
+                        MQTT_REASON_QUOTA_EXCEEDED);
+                #endif
+                    if (wc->sock != BROKER_SOCKET_INVALID) {
+                        broker->net.close(broker->net.ctx, wc->sock);
+                        wc->sock = BROKER_SOCKET_INVALID;
+                    }
+                    wc->connected = 0;
+                }
+            }
+            else {
+                BrokerOutPub* e = BrokerOutPub_Alloc(topic,
+                    (payload_len > 0) ? payload : NULL, payload_len
+                #ifdef WOLFMQTT_V5
+                    , NULL
+                #endif
+                    );
+                if (e == NULL) {
+                    WBLOG_ERR(broker,
+                        "broker: will alloc failed sock=%d", (int)wc->sock);
+                }
+                else {
+                    e->qos = eff_qos;
+                    e->packet_id = BrokerNextPacketId(broker);
+                    e->retain = 0;
+                    e->state = BROKER_OUTQ_QUEUED;
+                #ifdef WOLFMQTT_V5
+                    e->protocol_level = wc->protocol_level;
+                #endif
+                    BrokerClient_EnqueueOutPub(wc, e);
+                    BrokerClient_DrainOutQueue(wc);
+                }
+            }
+        }
+        /* QoS 0 is best effort; skip while tx_buf holds an in-flight
+         * CONNACK. */
+        else if (wc->connack_pending_len == 0) {
+            MqttPublish out_pub;
+            int enc_rc, wr_rc;
+
+            XMEMSET(&out_pub, 0, sizeof(out_pub));
+            out_pub.topic_name = (char*)topic;
+            out_pub.qos = eff_qos;
+            out_pub.retain = 0;
+            out_pub.duplicate = 0;
+            out_pub.buffer = (payload_len > 0) ? (byte*)payload : NULL;
+            out_pub.total_len = payload_len;
+        #ifdef WOLFMQTT_V5
+            out_pub.protocol_level = wc->protocol_level;
+        #endif
+            enc_rc = MqttEncode_Publish(wc->tx_buf,
+                BROKER_CLIENT_TX_SZ(wc), &out_pub, 0);
+            if (enc_rc > 0) {
+                wr_rc = MqttPacket_Write(&wc->client, wc->tx_buf, enc_rc);
+                /* Scrub tx_buf unless still in-progress (CONTINUE). */
+                if (wr_rc != MQTT_CODE_CONTINUE) {
+                    BROKER_FORCE_ZERO(wc->tx_buf, enc_rc);
+                }
+            }
+        }
+    }
+    BrokerFanout_Free(&targets);
+#endif
 }
 #endif /* WOLFMQTT_BROKER_WILL */
 
@@ -6208,6 +6363,32 @@ static int BrokerHandle_Connect(BrokerClient* bc, int rx_len,
             ack.return_code = MQTT_CONNECT_ACK_CODE_REFUSED_UNAVAIL;
             goto send_connack;
         }
+#ifdef WOLFMQTT_V5
+        /* [MQTT-3.2.2-11] A v5 Server that caps Maximum QoS below the requested
+         * Will QoS must refuse the connection, not silently downgrade the Will
+         * delivery QoS. v3.1.1 has no Maximum QoS advertisement, so it is still
+         * downgraded when the Will is stored below. */
+        if (mc.protocol_level >= MQTT_CONNECT_PROTOCOL_LEVEL_5 &&
+                mc.lwt_msg->qos > WOLFMQTT_MAX_QOS) {
+            WBLOG_ERR(broker,
+                "broker: LWT QoS %d exceeds max %d sock=%d",
+                (int)mc.lwt_msg->qos, WOLFMQTT_MAX_QOS, (int)bc->sock);
+            ack.return_code = MQTT_REASON_QOS_NOT_SUPPORTED;
+            goto send_connack;
+        }
+#ifndef WOLFMQTT_BROKER_RETAINED
+        /* A v5 Server that does not support retained messages must refuse a
+         * CONNECT whose Will Retain is set, not accept it while advertising
+         * Retain Available = 0 in the same CONNACK. */
+        if (mc.protocol_level >= MQTT_CONNECT_PROTOCOL_LEVEL_5 &&
+                mc.lwt_msg->retain != 0) {
+            WBLOG_ERR(broker,
+                "broker: LWT retain unsupported sock=%d", (int)bc->sock);
+            ack.return_code = MQTT_REASON_RETAIN_NOT_SUPPORTED;
+            goto send_connack;
+        }
+#endif
+#endif
     }
 #endif
 
@@ -6420,10 +6601,9 @@ static int BrokerHandle_Connect(BrokerClient* bc, int rx_len,
 #endif
             bc->will_payload_len = wp_len;
         }
-        /* Clamp will QoS to this build's Maximum QoS. A v5 client that
-         * sent Will QoS > advertised Max QoS would already be in
-         * Protocol Error territory, but for v3.1.1 (no advertisement)
-         * we silently downgrade rather than rejecting CONNECT. */
+        /* Clamp will QoS to this build's Maximum QoS. A v5 Will over the cap
+         * was already refused above, so this only downgrades v3.1.1, which has
+         * no Maximum QoS advertisement to reject against. */
         bc->will_qos = (mc.lwt_msg->qos > WOLFMQTT_MAX_QOS) ?
             (MqttQoS)WOLFMQTT_MAX_QOS : mc.lwt_msg->qos;
         bc->will_retain = mc.lwt_msg->retain;
@@ -7123,29 +7303,23 @@ static int BrokerHandle_Publish(BrokerClient* bc, int rx_len,
     #endif
         topic != NULL && (payload != NULL || pub.total_len == 0)) {
 #ifndef WOLFMQTT_STATIC_MEMORY
-        BrokerSub* sub = broker->subs;
-        BrokerSub* next_sub = NULL;
+        BrokerSub* sub;
+        BrokerFanoutTarget stack_targets[BROKER_FANOUT_STACK_TARGETS];
+        BrokerFanoutList targets;
+        word32 clients_gen_snapshot;
+        int t;
 #endif
         /* Fan out to matching subscribers */
 #ifdef WOLFMQTT_STATIC_MEMORY
         for (i = 0; i < BROKER_MAX_SUBS; i++) {
             sub = &broker->subs[i];
             if (!sub->in_use) continue;
-#else
-        while (sub) {
-            /* Snapshot the successor before any MqttPacket_Write: a fan-out
-             * write can drive an lws_service spin that frees this client's
-             * BrokerSub nodes re-entrantly (LWS_CALLBACK_CLOSED), so reading
-             * sub->next afterwards would dereference a freed node. */
-            next_sub = sub->next;
-#endif
             if (sub->client != NULL &&
                 sub->client->protocol_level != 0 &&
                 sub->client->connected &&
                 BROKER_STR_VALID(sub->filter) &&
                 BrokerTopicMatch(sub->filter, topic)) {
                 eff_qos = (pub.qos < sub->qos) ? pub.qos : sub->qos;
-#ifdef WOLFMQTT_STATIC_MEMORY
                 queued_session = BrokerStaticOrphan_Find(broker,
                     sub->client->client_id);
                 if (eff_qos > MQTT_QOS_0 && queued_session != NULL) {
@@ -7221,91 +7395,7 @@ static int BrokerHandle_Publish(BrokerClient* bc, int rx_len,
                         "sock=%d -> sock=%d rc=%d",
                         (int)bc->sock, (int)sub->client->sock, sub_rc);
                 }
-#else
-                /* Dynamic mode: enqueue a heap-owned copy on the
-                 * subscriber's out_q, then drain. The queue gives us
-                 * the inflight cap (#7 ordered delivery) and is the
-                 * substrate for the offline queue in PR2. Invariant:
-                 * MqttDecode_Publish above has populated pub.buffer
-                 * with at least pub.total_len contiguous bytes (full
-                 * PUBLISH is fully received and decoded before we
-                 * reach the fan-out); BrokerOutPub_Alloc deep-copies
-                 * pub.total_len from that buffer. */
-                if (sub->client->out_q_count >=
-                        BROKER_MAX_QUEUED_MSGS_PER_SUB) {
-                    /* DoS guard: bound the connected subscriber's outbound
-                     * queue depth. The inflight cap above only limits bytes on
-                     * the wire; a subscriber that stops acking lets QUEUED
-                     * entries accumulate one heap-copied PUBLISH at a time
-                     * until the broker exhausts memory. Disconnect the slow /
-                     * abusive subscriber rather than growing out_q or silently
-                     * dropping accepted QoS 1/2 messages. A persistent session
-                     * is reclaimable on reconnect via the (capped) offline
-                     * queue. Mirrors the static partial-write teardown: tear
-                     * the socket down and clear connected so the match guard
-                     * above skips this client's remaining subscriptions; the
-                     * main loop reaps it on the next read error. */
-                    /* Cache the client before BrokerSend_Disconnect below: that
-                     * write can drive an lws_service spin whose
-                     * LWS_CALLBACK_CLOSED frees this subscriber's BrokerSub
-                     * nodes re-entrantly (the same hazard the next_sub snapshot
-                     * guards against), leaving `sub` dangling. The BrokerClient
-                     * itself survives the write - its free is deferred while the
-                     * WS context is marked processing - so the post-write socket
-                     * teardown must reach it through this cached pointer, never
-                     * through the freed sub node. */
-                    BrokerClient* c = sub->client;
-                    WBLOG_ERR(broker,
-                        "broker: out_q full (%d) -> disconnect sock=%d "
-                        "(from sock=%d)", c->out_q_count,
-                        (int)c->sock, (int)bc->sock);
-                #ifdef WOLFMQTT_V5
-                    (void)BrokerSend_Disconnect(c,
-                        MQTT_REASON_QUOTA_EXCEEDED);
-                #endif
-                    if (c->sock != BROKER_SOCKET_INVALID) {
-                        broker->net.close(broker->net.ctx,
-                            c->sock);
-                        c->sock = BROKER_SOCKET_INVALID;
-                    }
-                    c->connected = 0;
-                }
-                else {
-                    BrokerOutPub* e = BrokerOutPub_Alloc(topic, payload,
-                                          pub.total_len
-                    #ifdef WOLFMQTT_V5
-                                          , pub.props
-                    #endif
-                                          );
-                    if (e == NULL) {
-                        WBLOG_ERR(broker,
-                            "broker: PUBLISH fwd alloc failed sock=%d "
-                            "-> sock=%d", (int)bc->sock,
-                            (int)sub->client->sock);
-                    }
-                    else {
-                        e->qos = eff_qos;
-                        if (eff_qos >= MQTT_QOS_1) {
-                            e->packet_id = BrokerNextPacketId(broker);
-                        }
-                        e->retain = 0;
-                        e->state = BROKER_OUTQ_QUEUED;
-                    #ifdef WOLFMQTT_V5
-                        e->protocol_level = sub->client->protocol_level;
-                    #endif
-                        BrokerClient_EnqueueOutPub(sub->client, e);
-                        WBLOG_DBG(broker,
-                            "broker: PUBLISH enq sock=%d -> sock=%d "
-                            "topic=%s qos=%d len=%u",
-                            (int)bc->sock, (int)sub->client->sock,
-                            BrokerLog_Sanitize(topic), eff_qos,
-                            (unsigned)pub.total_len);
-                        BrokerClient_DrainOutQueue(sub->client);
-                    }
-                }
-#endif
             }
-#ifdef WOLFMQTT_STATIC_MEMORY
             else if ((sub->client == NULL || !sub->client->connected) &&
                      BROKER_STR_VALID(sub->client_id) &&
                      BROKER_STR_VALID(sub->filter) &&
@@ -7342,19 +7432,35 @@ static int BrokerHandle_Publish(BrokerClient* bc, int rx_len,
                     }
                 }
             }
+        }
 #else
-            /* Note on iteration model: static-mode walks the BrokerSub
-             * array via for (i=0; i<BROKER_MAX_SUBS; i++) and gets its
-             * advance from i++. Dynamic-mode walks the linked list and
-             * needs an explicit sub = sub->next below. The orphan
-             * branch (sub->client == NULL) only exists in dynamic mode -
-             * static-mode orphan handling lives in the restore path. */
+        /* Two phases. The collect pass performs no writes - the orphan queueing
+         * below never touches the wire - so broker->subs cannot be mutated part
+         * way through it, and delivery then works only from the collected
+         * BrokerClient pointers. Walking and writing in one pass is not safe: a
+         * write can drive an lws_service spin whose re-entrant
+         * LWS_CALLBACK_CLOSED frees the closing subscriber's BrokerSub nodes,
+         * including the node this loop would advance to next, and abandoning
+         * the walk there would silently drop every still-connected subscriber
+         * after it. */
+        BrokerFanout_Init(&targets, stack_targets,
+            BROKER_FANOUT_STACK_TARGETS);
+        for (sub = broker->subs; sub != NULL; sub = sub->next) {
+            if (sub->client != NULL &&
+                sub->client->protocol_level != 0 &&
+                sub->client->connected &&
+                BROKER_STR_VALID(sub->filter) &&
+                BrokerTopicMatch(sub->filter, topic)) {
+                BrokerFanout_Add(&targets, sub->client,
+                    (pub.qos < sub->qos) ? pub.qos : sub->qos);
+            }
+            /* Orphaned persistent session: subscriber is currently
+             * disconnected. Queue QoS 1/2 messages on the orphan slot for
+             * delivery on reconnect. Pure bookkeeping, so it stays in this
+             * pass. */
             else if (sub->client == NULL && sub->client_id != NULL &&
                      BROKER_STR_VALID(sub->filter) &&
                      BrokerTopicMatch(sub->filter, topic)) {
-                /* Orphaned persistent session: subscriber is currently
-                 * disconnected. Queue QoS 1/2 messages on the orphan
-                 * slot for delivery on reconnect. */
                 eff_qos = (pub.qos < sub->qos) ? pub.qos : sub->qos;
                 if (eff_qos > MQTT_QOS_0) {
                     BrokerOrphanSession* o =
@@ -7369,9 +7475,105 @@ static int BrokerHandle_Publish(BrokerClient* bc, int rx_len,
                     }
                 }
             }
-            sub = next_sub;
-#endif
         }
+        if (targets.truncated) {
+            WBLOG_ERR(broker,
+                "broker: fan-out list alloc failed after %d destination(s), "
+                "remaining subscribers not served sock=%d topic=%s",
+                targets.count, (int)bc->sock, BrokerLog_Sanitize(topic));
+        }
+
+        clients_gen_snapshot = broker->clients_gen;
+        for (t = 0; t < targets.count; t++) {
+            BrokerClient* wc = targets.items[t].client;
+
+            eff_qos = targets.items[t].qos;
+
+            /* An earlier delivery in this fan-out can have closed this peer,
+             * and a peer that is not the one being written to is freed
+             * outright rather than deferred. Only rescan when the client list
+             * actually changed. */
+            if (broker->clients_gen != clients_gen_snapshot &&
+                    !BrokerClients_StillLinked(broker, wc)) {
+                continue;
+            }
+            /* A quota disconnect earlier in this fan-out clears connected;
+             * skip its remaining subscriptions, as the single-pass match
+             * guard used to. */
+            if (!wc->connected) {
+                continue;
+            }
+
+            /* Dynamic mode: enqueue a heap-owned copy on the
+             * subscriber's out_q, then drain. The queue gives us
+             * the inflight cap (#7 ordered delivery) and is the
+             * substrate for the offline queue in PR2. Invariant:
+             * MqttDecode_Publish above has populated pub.buffer
+             * with at least pub.total_len contiguous bytes (full
+             * PUBLISH is fully received and decoded before we
+             * reach the fan-out); BrokerOutPub_Alloc deep-copies
+             * pub.total_len from that buffer. */
+            if (wc->out_q_count >= BROKER_MAX_QUEUED_MSGS_PER_SUB) {
+                /* DoS guard: bound the connected subscriber's outbound
+                 * queue depth. The inflight cap above only limits bytes on
+                 * the wire; a subscriber that stops acking lets QUEUED
+                 * entries accumulate one heap-copied PUBLISH at a time
+                 * until the broker exhausts memory. Disconnect the slow /
+                 * abusive subscriber rather than growing out_q or silently
+                 * dropping accepted QoS 1/2 messages. A persistent session
+                 * is reclaimable on reconnect via the (capped) offline
+                 * queue. Mirrors the static partial-write teardown: tear
+                 * the socket down and clear connected so the guard above
+                 * skips this client's remaining subscriptions; the main
+                 * loop reaps it on the next read error. */
+                WBLOG_ERR(broker,
+                    "broker: out_q full (%d) -> disconnect sock=%d "
+                    "(from sock=%d)", wc->out_q_count,
+                    (int)wc->sock, (int)bc->sock);
+            #ifdef WOLFMQTT_V5
+                (void)BrokerSend_Disconnect(wc, MQTT_REASON_QUOTA_EXCEEDED);
+            #endif
+                if (wc->sock != BROKER_SOCKET_INVALID) {
+                    broker->net.close(broker->net.ctx, wc->sock);
+                    wc->sock = BROKER_SOCKET_INVALID;
+                }
+                wc->connected = 0;
+            }
+            else {
+                BrokerOutPub* e = BrokerOutPub_Alloc(topic, payload,
+                                      pub.total_len
+                #ifdef WOLFMQTT_V5
+                                      , pub.props
+                #endif
+                                      );
+                if (e == NULL) {
+                    WBLOG_ERR(broker,
+                        "broker: PUBLISH fwd alloc failed sock=%d "
+                        "-> sock=%d", (int)bc->sock, (int)wc->sock);
+                }
+                else {
+                    e->qos = eff_qos;
+                    if (eff_qos >= MQTT_QOS_1) {
+                        e->packet_id = BrokerNextPacketId(broker);
+                    }
+                    e->retain = 0;
+                    e->state = BROKER_OUTQ_QUEUED;
+                #ifdef WOLFMQTT_V5
+                    e->protocol_level = wc->protocol_level;
+                #endif
+                    BrokerClient_EnqueueOutPub(wc, e);
+                    WBLOG_DBG(broker,
+                        "broker: PUBLISH enq sock=%d -> sock=%d "
+                        "topic=%s qos=%d len=%u",
+                        (int)bc->sock, (int)wc->sock,
+                        BrokerLog_Sanitize(topic), eff_qos,
+                        (unsigned)pub.total_len);
+                    BrokerClient_DrainOutQueue(wc);
+                }
+            }
+        }
+        BrokerFanout_Free(&targets);
+#endif
     }
 
     if (pub.qos == MQTT_QOS_1 || pub.qos == MQTT_QOS_2) {
@@ -8507,6 +8709,7 @@ static void BrokerSubs_FreeAll(MqttBroker* broker)
             WOLFMQTT_FREE(broker->subs->client_id);
         }
         WOLFMQTT_FREE(broker->subs);
+        broker->subs_gen++;
         broker->subs = next;
     }
 #endif

@@ -769,6 +769,13 @@ typedef struct MqttBroker {
 #else
     BrokerClient* clients;
     BrokerSub*    subs;
+    /* Bumped on every structural change to `subs`. */
+    word32        subs_gen;
+    /* Bumped whenever a BrokerClient is linked into or unlinked from
+     * `clients`. A fan-out snapshots it before the writes and only re-validates
+     * its collected destinations when it changed, so the common (nothing
+     * removed) case avoids an O(n) rescan per destination. */
+    word32        clients_gen;
 #ifdef WOLFMQTT_BROKER_RETAINED
     BrokerRetainedMsg* retained;
     int                retained_count;

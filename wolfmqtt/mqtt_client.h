@@ -218,6 +218,21 @@ typedef struct _MqttSk {
     typedef int (*SN_ClientRegisterCb)(word16 topicId, const char* topicName, void *reg_ctx);
 #endif
 
+#if WOLFMQTT_MAX_QOS >= 2
+    /* Max distinct inbound QoS 2 packet ids tracked awaiting PUBREL, used to
+     * suppress re-delivery of a retransmitted PUBLISH [MQTT-4.3.3-10].
+     * Override in user_settings.h to trade memory for a larger dedup window. */
+    #ifndef MQTT_MAX_RECV_QOS2
+        #define MQTT_MAX_RECV_QOS2 16
+    #endif
+    /* Also advertised as the v5 CONNECT Receive Maximum (see
+     * MqttClient_Connect), so it must be a legal value for that property:
+     * 0 is a Protocol Error [MQTT-3.1.2.11.3] and the field is 16-bit. */
+    #if (MQTT_MAX_RECV_QOS2 < 1) || (MQTT_MAX_RECV_QOS2 > 65535)
+        #error "MQTT_MAX_RECV_QOS2 must be between 1 and 65535"
+    #endif
+#endif
+
 /* Client structure */
 typedef struct _MqttClient {
     word32       flags; /* MqttClientFlags */
@@ -293,6 +308,18 @@ typedef struct _MqttClient {
     word16 server_recv_max_negotiated;
     /* Max Topic Alias value; absent CONNACK means 0 [3.1.2.11.8]. */
     word16 topic_alias_max;
+    /* Set when the current connection's CONNECT carried an Authentication
+     * Method; gates MqttClient_Auth so an AUTH is never sent on a connection
+     * that never negotiated enhanced authentication [MQTT-4.12.0-1]. */
+    byte   auth_method_set;
+#endif
+
+#if WOLFMQTT_MAX_QOS >= 2
+    /* Inbound QoS 2 packet ids delivered to the application and awaiting their
+     * PUBREL. A retransmitted PUBLISH with an id still listed here is answered
+     * with PUBREC but not delivered a second time [MQTT-4.3.3-10]. Slot value 0
+     * is empty; a QoS 2 packet id is never 0. */
+    word16 recv_qos2_pending[MQTT_MAX_RECV_QOS2];
 #endif
 } MqttClient;
 
@@ -453,14 +480,16 @@ WOLFMQTT_API int MqttClient_Publish_ex(
  *                          Note: MqttPublish and MqttMessage are same
                             structure.
  *  \param      pubCb       Function pointer to callback routine
- *  \note       Because this call only writes and another thread processes the
-                ACK, it never returns MQTT_CODE_ERROR_PUBLISH_REJECTED. On the
-                reading thread only a QoS 2 PUBREC rejection is surfaced (as
-                MQTT_CODE_ERROR_PUBLISH_REJECTED, returned in order to suppress
-                an illegal PUBREL per [MQTT-4.3.3]); a QoS 1 PUBACK or QoS 2
-                PUBCOMP reason code >= 0x80 is NOT detected on this path and the
-                publish appears successful. Use MqttClient_Publish/_ex when
-                reliable v5 broker-rejection detection for QoS>0 is required.
+ *  \note       Only one v5 broker rejection is surfaced on this path: a QoS 2
+                PUBREC with a reason code >= 0x80. The reading thread returns
+                MQTT_CODE_ERROR_PUBLISH_REJECTED for it (suppressing an illegal
+                PUBREL per [MQTT-4.3.3]) and completes this publish's pending
+                response with the same code, so a later poll of this function
+                returns MQTT_CODE_ERROR_PUBLISH_REJECTED instead of spinning on
+                MQTT_CODE_CONTINUE. A QoS 1 PUBACK or QoS 2 PUBCOMP reason code
+                >= 0x80 is NOT detected on this path and the publish appears
+                successful. Use MqttClient_Publish/_ex when reliable v5
+                broker-rejection detection for QoS>0 is required.
  *  \return     MQTT_CODE_SUCCESS, MQTT_CODE_CONTINUE (for non-blocking) or
                 MQTT_CODE_ERROR_* (see enum MqttPacketResponseCodes)
     \sa         MqttClient_Publish
