@@ -7376,6 +7376,460 @@ TEST(persist_put_rejects_existing_temp_symlink)
 /* Runner                                                                      */
 /* -------------------------------------------------------------------------- */
 
+
+/* -------------------------------------------------------------------------- */
+/* Retained-message persistence                                                */
+/* -------------------------------------------------------------------------- */
+/* A retained message carrying a v5 Message Expiry Interval must not outlive
+ * that interval in the persistence backend. These drive real PUBLISH packets
+ * through the mock net above against an in-RAM MqttBrokerPersistHooks, then
+ * assert on the record count the backend holds. They are the only tests here
+ * that move the clock - nothing can expire while it is pinned. */
+#if defined(WOLFMQTT_BROKER_PERSIST) && defined(WOLFMQTT_BROKER_RETAINED) && \
+    defined(WOLFMQTT_V5)
+
+/* Fixed-size so the backend behaves the same in both allocation profiles.
+ * Sized past 3 * BROKER_MAX_RETAINED for the backlog test. */
+#define KV_MAX_RECS   80
+#define KV_MAX_BLOB   512
+
+typedef struct KvRec {
+    byte   in_use;
+    byte   ns;
+    word16 key_len;
+    byte   key[BROKER_MAX_TOPIC_LEN];
+    word32 blob_len;
+    byte   blob[KV_MAX_BLOB];
+} KvRec;
+
+static KvRec g_kv[KV_MAX_RECS];
+
+static void kv_reset(void)
+{
+    XMEMSET(g_kv, 0, sizeof(g_kv));
+}
+
+static KvRec* kv_find(byte ns, const byte* key, word16 key_len)
+{
+    int i;
+    for (i = 0; i < KV_MAX_RECS; i++) {
+        if (g_kv[i].in_use && g_kv[i].ns == ns &&
+                g_kv[i].key_len == key_len &&
+                XMEMCMP(g_kv[i].key, key, key_len) == 0) {
+            return &g_kv[i];
+        }
+    }
+    return NULL;
+}
+
+static int kv_put(void* ctx, byte ns, const byte* key, word16 key_len,
+    const byte* blob, word32 blob_len)
+{
+    KvRec* r;
+    int i;
+    (void)ctx;
+    if (key_len > BROKER_MAX_TOPIC_LEN || blob_len > KV_MAX_BLOB) {
+        return MQTT_CODE_ERROR_OUT_OF_BUFFER;
+    }
+    r = kv_find(ns, key, key_len);
+    if (r == NULL) {
+        for (i = 0; i < KV_MAX_RECS; i++) {
+            if (!g_kv[i].in_use) {
+                r = &g_kv[i];
+                break;
+            }
+        }
+        if (r == NULL) {
+            return MQTT_CODE_ERROR_OUT_OF_BUFFER;
+        }
+        r->in_use = 1;
+        r->ns = ns;
+        r->key_len = key_len;
+        XMEMCPY(r->key, key, key_len);
+    }
+    XMEMCPY(r->blob, blob, blob_len);
+    r->blob_len = blob_len;
+    return 0;
+}
+
+static int kv_get(void* ctx, byte ns, const byte* key, word16 key_len,
+    byte* out, word32* inout_len)
+{
+    KvRec* r;
+    (void)ctx;
+    r = kv_find(ns, key, key_len);
+    if (r == NULL) {
+        return MQTT_CODE_ERROR_NOT_FOUND;
+    }
+    if (*inout_len < r->blob_len) {
+        return MQTT_CODE_ERROR_OUT_OF_BUFFER;
+    }
+    XMEMCPY(out, r->blob, r->blob_len);
+    *inout_len = r->blob_len;
+    return 0;
+}
+
+static int kv_del(void* ctx, byte ns, const byte* key, word16 key_len)
+{
+    KvRec* r;
+    (void)ctx;
+    r = kv_find(ns, key, key_len);
+    if (r != NULL) {
+        XMEMSET(r, 0, sizeof(*r));
+    }
+    return 0; /* absent key is not an error */
+}
+
+static int kv_iter(void* ctx, byte ns, MqttBrokerPersist_IterCb cb,
+    void* cb_ctx)
+{
+    int i;
+    (void)ctx;
+    for (i = 0; i < KV_MAX_RECS; i++) {
+        if (g_kv[i].in_use && g_kv[i].ns == ns) {
+            /* Hand the callback its own copy: a backend may invalidate the
+             * buffer once the callback returns, so the sweep must not depend
+             * on it staying live. */
+            byte   tmp_key[BROKER_MAX_TOPIC_LEN];
+            byte   tmp_blob[KV_MAX_BLOB];
+            word16 tmp_key_len = g_kv[i].key_len;
+            word32 tmp_blob_len = g_kv[i].blob_len;
+            XMEMCPY(tmp_key, g_kv[i].key, tmp_key_len);
+            XMEMCPY(tmp_blob, g_kv[i].blob, tmp_blob_len);
+            if (cb(tmp_key, tmp_key_len, tmp_blob, tmp_blob_len, cb_ctx) != 0) {
+                break;
+            }
+        }
+    }
+    return 0;
+}
+
+static int kv_sync(void* ctx)
+{
+    (void)ctx;
+    return 0;
+}
+
+static int retained_recs(void)
+{
+    int i, n = 0;
+    for (i = 0; i < KV_MAX_RECS; i++) {
+        if (g_kv[i].in_use && g_kv[i].ns == BROKER_PERSIST_NS_RETAINED) {
+            n++;
+        }
+    }
+    return n;
+}
+
+typedef struct PersistFixture {
+    MqttBroker broker;
+    MqttBrokerNet net;
+    MqttBrokerPersistHooks hooks;
+    int started;
+} PersistFixture;
+
+/* Live retained entries, in whichever allocation profile is built. */
+static int retained_live(PersistFixture* f)
+{
+#ifdef WOLFMQTT_STATIC_MEMORY
+    int i, n = 0;
+    for (i = 0; i < BROKER_MAX_RETAINED; i++) {
+        if (f->broker.retained[i].in_use) {
+            n++;
+        }
+    }
+    return n;
+#else
+    return f->broker.retained_count;
+#endif
+}
+
+/* v5 CONNECT, clean start, ClientId "pt". */
+static const byte g_persist_connect[] = {
+    0x10, 0x0F,
+    0x00, 0x04, 'M', 'Q', 'T', 'T',
+    0x05, 0x02, 0x00, 0x3C,
+    0x00,
+    0x00, 0x02, 'p', 't'
+};
+
+/* QoS 0 PUBLISH, RETAIN=1. expiry_sec > 0 adds a Message Expiry Interval;
+ * payload_len 0 makes it a retained-delete. */
+static size_t build_retained_publish(byte* out, size_t out_sz,
+    const char* topic, word32 expiry_sec, int payload_len)
+{
+    size_t tlen = XSTRLEN(topic);
+    size_t proplen = (expiry_sec > 0) ? 5 : 0;
+    size_t remain = 2 + tlen + 1 + proplen + (size_t)payload_len;
+    size_t i = 0;
+    int j;
+
+    if (remain > 127 || out_sz < remain + 2) {
+        return 0;
+    }
+    out[i++] = 0x31;                /* PUBLISH, QoS 0, RETAIN=1 */
+    out[i++] = (byte)remain;
+    out[i++] = (byte)(tlen >> 8);
+    out[i++] = (byte)(tlen & 0xFF);
+    XMEMCPY(&out[i], topic, tlen); i += tlen;
+    out[i++] = (byte)proplen;
+    if (expiry_sec > 0) {
+        out[i++] = MQTT_PROP_MSG_EXPIRY_INTERVAL;
+        out[i++] = (byte)(expiry_sec >> 24);
+        out[i++] = (byte)(expiry_sec >> 16);
+        out[i++] = (byte)(expiry_sec >> 8);
+        out[i++] = (byte)(expiry_sec);
+    }
+    for (j = 0; j < payload_len; j++) {
+        out[i++] = (byte)('a' + (j % 26));
+    }
+    return i;
+}
+
+static void persist_pump(PersistFixture* f, int steps)
+{
+    int i;
+    for (i = 0; i < steps; i++) {
+        MqttBroker_Step(&f->broker);
+    }
+}
+
+/* Bring a broker up over whatever the backend currently holds. */
+static int persist_up(PersistFixture* f)
+{
+    XMEMSET(&f->broker, 0, sizeof(f->broker));
+    install_mock_net(&f->net);
+    XMEMSET(&f->hooks, 0, sizeof(f->hooks));
+    f->hooks.kv_put  = kv_put;
+    f->hooks.kv_get  = kv_get;
+    f->hooks.kv_del  = kv_del;
+    f->hooks.kv_iter = kv_iter;
+    f->hooks.sync    = kv_sync;
+    reset_mock_clients(1);
+    if (MqttBroker_Init(&f->broker, &f->net) != MQTT_CODE_SUCCESS ||
+            MqttBroker_SetPersistHooks(&f->broker, &f->hooks) !=
+                MQTT_CODE_SUCCESS ||
+            MqttBroker_Start(&f->broker) != MQTT_CODE_SUCCESS) {
+        return 0;
+    }
+    f->started = 1;
+    return 1;
+}
+
+static void persist_down(PersistFixture* f)
+{
+    if (f->started) {
+        (void)MqttBroker_Stop(&f->broker);
+        (void)MqttBroker_Free(&f->broker);
+        f->started = 0;
+    }
+}
+
+static int persist_connect(PersistFixture* f)
+{
+    mock_client_input_append(0, g_persist_connect, sizeof(g_persist_connect));
+    persist_pump(f, 4);
+#ifdef WOLFMQTT_STATIC_MEMORY
+    return f->broker.clients[0].connected;
+#else
+    return f->broker.clients != NULL && f->broker.clients->connected;
+#endif
+}
+
+/* Publish n retained topics "<pfx>/NN", each with expiry_sec. */
+static int persist_fill(PersistFixture* f, const char* pfx, int n,
+    word32 expiry_sec)
+{
+    byte pkt[192];
+    char topic[64];
+    int i;
+    for (i = 0; i < n; i++) {
+        size_t len;
+        if (XSNPRINTF(topic, sizeof(topic), "%s/%02d", pfx, i) < 0) {
+            return 0;
+        }
+        len = build_retained_publish(pkt, sizeof(pkt), topic, expiry_sec, 8);
+        if (len == 0) {
+            return 0;
+        }
+        mock_client_input_append(0, pkt, len);
+    }
+    persist_pump(f, n + 4);
+    return 1;
+}
+
+/* Expiry while the broker is running must retire the stored record, not just
+ * the RAM entry. The reap runs off any retained publish. */
+TEST(broker_persist_retained_runtime_expiry_drops_record)
+{
+    PersistFixture f;
+    byte pkt[192];
+    size_t len;
+
+    kv_reset();
+    g_broker_time_s = 1000;
+    ASSERT_TRUE(persist_up(&f));
+    ASSERT_TRUE(persist_connect(&f));
+    ASSERT_TRUE(persist_fill(&f, "run", BROKER_MAX_RETAINED, 60));
+    ASSERT_EQ(BROKER_MAX_RETAINED, retained_live(&f));
+    ASSERT_EQ(BROKER_MAX_RETAINED, retained_recs());
+
+    g_broker_time_s += 61;
+    len = build_retained_publish(pkt, sizeof(pkt), "run/next", 0, 8);
+    ASSERT_TRUE(len > 0);
+    mock_client_input_append(0, pkt, len);
+    persist_pump(&f, 4);
+
+    ASSERT_EQ(1, retained_live(&f));
+    ASSERT_EQ(1, retained_recs());
+    persist_down(&f);
+}
+
+/* Records written live, then expiring while the broker is down, are the case
+ * a running broker can never reach again: nothing holds them in RAM, so only
+ * the restore sweep can retire them. One restart must clear the whole batch. */
+TEST(broker_persist_retained_offline_expiry_swept_on_restart)
+{
+    PersistFixture f;
+
+    kv_reset();
+    g_broker_time_s = 1000;
+    ASSERT_TRUE(persist_up(&f));
+    ASSERT_TRUE(persist_connect(&f));
+    ASSERT_TRUE(persist_fill(&f, "off", BROKER_MAX_RETAINED, 60));
+    ASSERT_EQ(BROKER_MAX_RETAINED, retained_recs());
+
+    /* Clean shutdown: retained records are meant to survive it. */
+    persist_down(&f);
+    ASSERT_EQ(BROKER_MAX_RETAINED, retained_recs());
+
+    g_broker_time_s += 61;
+    ASSERT_TRUE(persist_up(&f));
+    ASSERT_EQ(0, retained_live(&f));
+    ASSERT_EQ(0, retained_recs());
+    persist_down(&f);
+}
+
+/* A store carrying more stale records than the live cap - what an unpatched
+ * broker left behind - must drain inside a single BrokerPersist_Restore, not
+ * one record per restart. Built from real broker-written blobs so the sweep
+ * parses exactly what the writer produces. */
+TEST(broker_persist_retained_backlog_swept_in_one_restore)
+{
+    PersistFixture f;
+    KvRec saved[3 * BROKER_MAX_RETAINED];
+    int saved_n = 0;
+    int round, i;
+
+    g_broker_time_s = 1000;
+    for (round = 0; round < 3; round++) {
+        char pfx[16];
+        /* Keep the format string out of the assert: ASSERT_TRUE stringifies
+         * the expression into its own printf format. */
+        int n = XSNPRINTF(pfx, sizeof(pfx), "old%d", round);
+        ASSERT_TRUE(n > 0);
+        kv_reset();
+        ASSERT_TRUE(persist_up(&f));
+        ASSERT_TRUE(persist_connect(&f));
+        ASSERT_TRUE(persist_fill(&f, pfx, BROKER_MAX_RETAINED, 60));
+        ASSERT_EQ(BROKER_MAX_RETAINED, retained_recs());
+        persist_down(&f);
+        for (i = 0; i < KV_MAX_RECS; i++) {
+            if (g_kv[i].in_use &&
+                    g_kv[i].ns == BROKER_PERSIST_NS_RETAINED) {
+                saved[saved_n++] = g_kv[i];
+            }
+        }
+    }
+    ASSERT_EQ(3 * BROKER_MAX_RETAINED, saved_n);
+
+    /* Fold the earlier rounds into the last round's store, which still carries
+     * its META record - restore treats a store without one as a first run and
+     * returns before the sweep. */
+    for (i = 0; i < saved_n; i++) {
+        ASSERT_EQ(0, kv_put(NULL, saved[i].ns, saved[i].key, saved[i].key_len,
+            saved[i].blob, saved[i].blob_len));
+    }
+    ASSERT_EQ(3 * BROKER_MAX_RETAINED, retained_recs());
+
+    g_broker_time_s += 61;
+    ASSERT_TRUE(persist_up(&f));
+    ASSERT_EQ(0, retained_live(&f));
+    ASSERT_EQ(0, retained_recs());
+    persist_down(&f);
+}
+
+/* The sweep keys off the Message Expiry Interval, so a retained message
+ * without one has to survive it - including across a restart, which is the
+ * whole point of persisting retained messages. */
+TEST(broker_persist_retained_without_expiry_survives_sweep)
+{
+    PersistFixture f;
+
+    kv_reset();
+    g_broker_time_s = 1000;
+    ASSERT_TRUE(persist_up(&f));
+    ASSERT_TRUE(persist_connect(&f));
+    ASSERT_TRUE(persist_fill(&f, "keep", BROKER_MAX_RETAINED, 0));
+    ASSERT_EQ(BROKER_MAX_RETAINED, retained_recs());
+    persist_down(&f);
+
+    g_broker_time_s += 100000;
+    ASSERT_TRUE(persist_up(&f));
+    ASSERT_EQ(BROKER_MAX_RETAINED, retained_live(&f));
+    ASSERT_EQ(BROKER_MAX_RETAINED, retained_recs());
+    persist_down(&f);
+}
+
+/* A zero-payload retained PUBLISH removes exactly its own record. */
+TEST(broker_persist_retained_explicit_delete_drops_one_record)
+{
+    PersistFixture f;
+    byte pkt[192];
+    size_t len;
+
+    kv_reset();
+    g_broker_time_s = 1000;
+    ASSERT_TRUE(persist_up(&f));
+    ASSERT_TRUE(persist_connect(&f));
+    ASSERT_TRUE(persist_fill(&f, "del", 2, 0));
+    ASSERT_EQ(2, retained_recs());
+
+    len = build_retained_publish(pkt, sizeof(pkt), "del/00", 0, 0);
+    ASSERT_TRUE(len > 0);
+    mock_client_input_append(0, pkt, len);
+    persist_pump(&f, 4);
+
+    ASSERT_EQ(1, retained_live(&f));
+    ASSERT_EQ(1, retained_recs());
+    ASSERT_TRUE(kv_find(BROKER_PERSIST_NS_RETAINED,
+        (const byte*)"del/01", 6) != NULL);
+    persist_down(&f);
+}
+
+/* A backward clock step must not make live records look expired - the sweep
+ * deletes what it judges expired, so a wrong judgement destroys live data. */
+TEST(broker_persist_retained_clock_rollback_keeps_records)
+{
+    PersistFixture f;
+
+    kv_reset();
+    g_broker_time_s = 1000;
+    ASSERT_TRUE(persist_up(&f));
+    ASSERT_TRUE(persist_connect(&f));
+    ASSERT_TRUE(persist_fill(&f, "back", BROKER_MAX_RETAINED, 60));
+    ASSERT_EQ(BROKER_MAX_RETAINED, retained_recs());
+    persist_down(&f);
+
+    g_broker_time_s -= 500; /* records are now stamped in the future */
+    ASSERT_TRUE(persist_up(&f));
+    ASSERT_EQ(BROKER_MAX_RETAINED, retained_live(&f));
+    ASSERT_EQ(BROKER_MAX_RETAINED, retained_recs());
+    persist_down(&f);
+}
+
+#endif /* WOLFMQTT_BROKER_PERSIST && WOLFMQTT_BROKER_RETAINED && WOLFMQTT_V5 */
+
 int main(int argc, char** argv)
 {
     (void)argc; (void)argv;
@@ -7485,6 +7939,17 @@ int main(int argc, char** argv)
 #ifdef WOLFMQTT_NONBLOCK
     RUN_TEST(retained_short_write_preserves_following_delivery);
 #endif
+#endif
+/* Both allocation profiles: the retained store and its expiry paths have
+ * separate implementations, so each has to be swept correctly. */
+#if defined(WOLFMQTT_BROKER_PERSIST) && defined(WOLFMQTT_BROKER_RETAINED) && \
+    defined(WOLFMQTT_V5)
+    RUN_TEST(broker_persist_retained_runtime_expiry_drops_record);
+    RUN_TEST(broker_persist_retained_offline_expiry_swept_on_restart);
+    RUN_TEST(broker_persist_retained_backlog_swept_in_one_restore);
+    RUN_TEST(broker_persist_retained_without_expiry_survives_sweep);
+    RUN_TEST(broker_persist_retained_explicit_delete_drops_one_record);
+    RUN_TEST(broker_persist_retained_clock_rollback_keeps_records);
 #endif
 #ifndef WOLFMQTT_STATIC_MEMORY
     RUN_TEST(broker_subscription_client_id_alloc_failure_atomic);
