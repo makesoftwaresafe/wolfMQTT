@@ -1285,10 +1285,6 @@ struct wmqb_ended_session {
 };
 #endif
 
-/* wmqb_decode_and_insert_retained: record elapsed, distinct from the cap skip
- * (1) so only genuinely dead keys are dropped from the store. */
-#define WMQB_RETAINED_EXPIRED 2
-
 /* Restore iterator context. Used for retained-msg, subs, session,
  * and OUTQ callbacks. */
 struct wmqb_restore_ctx {
@@ -1300,13 +1296,6 @@ struct wmqb_restore_ctx {
     /* Session keys whose zero Session Expiry ended them before this restart */
     struct wmqb_ended_session* ended;
     int         ended_count;
-#endif
-    /* Retained keys whose Message Expiry Interval elapsed before this restart */
-#ifdef WOLFMQTT_STATIC_MEMORY
-    byte        expired_key[BROKER_MAX_TOPIC_LEN];
-    word16      expired_key_len;
-#else
-    struct wmqb_wipe_key* expired;
 #endif
 };
 
@@ -1528,6 +1517,36 @@ static BrokerOrphanSession* wmqb_restore_find_orphan(MqttBroker* broker,
 }
 #endif /* WOLFMQTT_STATIC_MEMORY */
 
+/* NS_RETAINED body prefix: qos(1) _reserved(1) store_time(8) expiry(4)
+ * topic_len(2). */
+#define WMQB_RETAINED_BODY_MIN (1 + 1 + 8 + 4 + 2)
+
+/* 1 once a record's v5 Message Expiry Interval has elapsed. now >= store_time
+ * guards the unsigned subtraction so a backward clock step reads as "not
+ * expired" instead of wrapping huge. */
+static int wmqb_retained_expired(const byte* blob, word32 blob_len)
+{
+    word32 body_len = 0;
+    word32 expiry;
+    word64 store_time;
+    WOLFMQTT_BROKER_TIME_T now;
+    const byte* p;
+
+    if (wmqb_read_header(blob, blob_len, BROKER_PERSIST_NS_RETAINED,
+            &body_len) != 0 || body_len < WMQB_RETAINED_BODY_MIN) {
+        return 0;
+    }
+    p = &blob[WMQB_HDR_LEN];
+    store_time = wmqb_r_u64(&p[2]);
+    expiry = wmqb_r_u32(&p[10]);
+    if (expiry == 0) {
+        return 0;
+    }
+    now = WOLFMQTT_BROKER_GET_TIME_S();
+    return (now >= (WOLFMQTT_BROKER_TIME_T)store_time &&
+        (now - (WOLFMQTT_BROKER_TIME_T)store_time) >= expiry);
+}
+
 /* Allocate and insert a retained-message node from a decoded NS_RETAINED
  * blob. Dynamic mode prepends a heap node onto broker->retained; static
  * mode copies into the first free slot of broker->retained[]. Mirrors
@@ -1545,7 +1564,6 @@ static int wmqb_decode_and_insert_retained(MqttBroker* broker,
     word64 store_time;
     word32 expiry;
     byte qos;
-    WOLFMQTT_BROKER_TIME_T now;
 
     rc = wmqb_read_header(blob, blob_len, BROKER_PERSIST_NS_RETAINED,
             &body_len);
@@ -1554,7 +1572,7 @@ static int wmqb_decode_and_insert_retained(MqttBroker* broker,
     }
     p = &blob[WMQB_HDR_LEN];
     end = p + body_len;
-    if ((word32)(end - p) < 1 + 1 + 8 + 4 + 2) {
+    if ((word32)(end - p) < WMQB_RETAINED_BODY_MIN) {
         return MQTT_CODE_ERROR_MALFORMED_DATA;
     }
     qos = *p++;
@@ -1567,14 +1585,11 @@ static int wmqb_decode_and_insert_retained(MqttBroker* broker,
     }
 
     /* Skip records whose expiry already elapsed so they do not consume a
-     * retained slot / the cap at restore. Counted as skipped, not loaded.
-     * now >= store_time guards the unsigned subtraction against a backward
-     * clock step (mirrors the orphan-session restore sweep below). */
-    now = WOLFMQTT_BROKER_GET_TIME_S();
-    if (expiry > 0 &&
-            now >= (WOLFMQTT_BROKER_TIME_T)store_time &&
-            (now - (WOLFMQTT_BROKER_TIME_T)store_time) >= expiry) {
-        return WMQB_RETAINED_EXPIRED;
+     * retained slot / the cap at restore. Counted as skipped, not loaded. The
+     * sweep below normally removed them first; this covers a backend that
+     * refused the delete. */
+    if (wmqb_retained_expired(blob, blob_len)) {
+        return 1;
     }
 
 #ifdef WOLFMQTT_STATIC_MEMORY
@@ -1671,75 +1686,134 @@ static int wmqb_iter_retained_cb(const byte* key, word16 key_len,
 {
     struct wmqb_restore_ctx* c = (struct wmqb_restore_ctx*)cb_ctx;
     int rc;
-#ifndef WOLFMQTT_STATIC_MEMORY
-    struct wmqb_wipe_key* node;
-#endif
-
+    (void)key; (void)key_len;
     rc = wmqb_decode_and_insert_retained(c->broker, blob, blob_len);
     if (rc == 0) {
         c->loaded++;
-        return 0;
     }
-    c->skipped++;
-    /* Elapsed while the broker was down: restore drops it from memory, so its
-     * record has to go too. Stash the key - the backend iterator must not be
-     * mutated while it runs. */
-    if (rc != WMQB_RETAINED_EXPIRED || key == NULL || key_len == 0) {
-        return 0;
+    else {
+        c->skipped++;
     }
-#ifdef WOLFMQTT_STATIC_MEMORY
-    /* No allocator: carry one key per restore, the rest drain on later ones. */
-    if (c->expired_key_len == 0 && key_len <= sizeof(c->expired_key)) {
-        XMEMCPY(c->expired_key, key, key_len);
-        c->expired_key_len = key_len;
-    }
-#else
-    node = (struct wmqb_wipe_key*)WOLFMQTT_MALLOC(sizeof(*node));
-    if (node != NULL) {
-        node->key = (byte*)WOLFMQTT_MALLOC(key_len);
-        if (node->key == NULL) {
-            WOLFMQTT_FREE(node);
-        }
-        else {
-            XMEMCPY(node->key, key, key_len);
-            node->key_len = key_len;
-            node->next = c->expired;
-            c->expired = node;
-        }
-    }
-#endif
     return 0; /* always continue */
 }
 
-/* Retire the keys wmqb_iter_retained_cb stashed. del==0 just releases them,
- * for the abort path where no on-disk state may change. */
-static void wmqb_restore_drop_expired_retained(MqttBroker* broker,
-    struct wmqb_restore_ctx* c, byte del)
-{
-#ifdef WOLFMQTT_STATIC_MEMORY
-    if (del && c->expired_key_len > 0 &&
-            wmqb_kv_del_commit(broker, BROKER_PERSIST_NS_RETAINED,
-                c->expired_key, c->expired_key_len) != 0) {
-        WMQB_LOG_ERR(broker, "broker: persist expired retained delete "
-            "failed - deferred to next restore");
-    }
-    c->expired_key_len = 0;
-#else
-    struct wmqb_wipe_key* cur = c->expired;
 
-    while (cur != NULL) {
-        struct wmqb_wipe_key* next = cur->next;
-        if (del && wmqb_kv_del_commit(broker, BROKER_PERSIST_NS_RETAINED,
-                cur->key, cur->key_len) != 0) {
-            WMQB_LOG_ERR(broker, "broker: persist expired retained delete "
-                "failed - deferred to next restore");
-        }
-        WOLFMQTT_FREE(cur->key);
-        WOLFMQTT_FREE(cur);
-        cur = next;
-    }
-    c->expired = NULL;
+/* Expired keys staged from one scan, packed as [len_be16][key]... so short
+ * topics pack densely. Fixed size in both memory modes: the sweep's footprint
+ * must not scale with a stale-record count a publisher can influence. */
+#ifndef WMQB_RETAINED_PURGE_BUF
+#define WMQB_RETAINED_PURGE_BUF 256
 #endif
+/* Scans per restore. Bounds worst-case startup work on a pathological store;
+ * anything still left drains on the next start. */
+#ifndef WMQB_RETAINED_PURGE_PASSES
+#define WMQB_RETAINED_PURGE_PASSES 32
+#endif
+
+struct wmqb_retained_purge_ctx {
+    byte   buf[WMQB_RETAINED_PURGE_BUF];
+    word16 used;
+    word16 count;
+    byte   more;      /* a key did not fit - another scan is needed */
+    byte   oversized; /* key too long to ever stage */
+};
+
+static int wmqb_purge_expired_retained_cb(const byte* key, word16 key_len,
+    const byte* blob, word32 blob_len, void* cb_ctx)
+{
+    struct wmqb_retained_purge_ctx* c =
+        (struct wmqb_retained_purge_ctx*)cb_ctx;
+
+    if (key == NULL || key_len == 0 ||
+            !wmqb_retained_expired(blob, blob_len)) {
+        return 0;
+    }
+    if ((word32)key_len + 2 > (word32)sizeof(c->buf)) {
+        /* Longer than any topic this build could have stored. Flagged so the
+         * sweep does not report itself complete. */
+        c->oversized = 1;
+        return 0;
+    }
+    if ((word32)c->used + 2 + key_len > (word32)sizeof(c->buf)) {
+        c->more = 1;
+        return 1; /* leave the iterator; delete this batch, then rescan */
+    }
+    c->buf[c->used]     = (byte)(key_len >> 8);
+    c->buf[c->used + 1] = (byte)(key_len & 0xFF);
+    XMEMCPY(&c->buf[c->used + 2], key, key_len);
+    c->used = (word16)(c->used + 2 + key_len);
+    c->count++;
+    return 0;
+}
+
+/* Drop NS_RETAINED records whose Message Expiry Interval elapsed while the
+ * broker was down - restore only skips them, so without this they outlive
+ * every live copy and nothing at runtime can reach them again. Stages a
+ * bounded batch, leaves the iterator, then deletes: a backend is not required
+ * to tolerate mutation under an active iterator. Repeats until a scan finds
+ * nothing, so one restore drains a whole backlog at fixed memory cost. */
+static void wmqb_restore_purge_expired_retained(MqttBroker* broker)
+{
+    const MqttBrokerPersistHooks* h = broker->persist;
+    struct wmqb_retained_purge_ctx c;
+    word16 off;
+    int deleted;
+    int failed = 0;
+    int oversized = 0;
+    int total = 0;
+    int pass;
+
+    if (h->kv_iter == NULL || h->kv_del == NULL) {
+        return;
+    }
+    for (pass = 0; pass < WMQB_RETAINED_PURGE_PASSES; pass++) {
+        XMEMSET(&c, 0, sizeof(c));
+        if (wmqb_kv_iter(broker, BROKER_PERSIST_NS_RETAINED,
+                wmqb_purge_expired_retained_cb, &c) != 0) {
+            break;
+        }
+        oversized |= c.oversized;
+        if (c.count == 0) {
+            break;
+        }
+        deleted = 0;
+        off = 0;
+        while ((word32)off + 2 <= (word32)c.used) {
+            word16 klen = (word16)(((word16)c.buf[off] << 8) | c.buf[off + 1]);
+            off = (word16)(off + 2);
+            if (h->kv_del(h->ctx, BROKER_PERSIST_NS_RETAINED,
+                    &c.buf[off], klen) == 0) {
+                deleted++;
+            }
+            else {
+                failed++;
+            }
+            off = (word16)(off + klen);
+        }
+        if (h->sync != NULL) {
+            (void)h->sync(h->ctx);
+        }
+        total += deleted;
+        /* Stop when the scan saw everything, or when a scan made no progress -
+         * rescanning a set that will not delete would spin. */
+        if (!c.more || deleted == 0) {
+            break;
+        }
+    }
+    if (total > 0) {
+        WMQB_LOG_INFO(broker,
+            "broker: persist purged %d expired retained record(s)", total);
+    }
+    if (failed > 0) {
+        WMQB_LOG_ERR(broker,
+            "broker: persist %d expired retained delete(s) failed - deferred "
+            "to next restore", failed);
+    }
+    if (oversized) {
+        WMQB_LOG_ERR(broker,
+            "broker: persist expired retained key too long to purge - record "
+            "left in store");
+    }
 }
 
 /* Allocate orphan subs from a decoded NS_SUBS blob. The blob key carries
@@ -2626,17 +2700,16 @@ int BrokerPersist_Restore(MqttBroker* broker)
         ctx.skipped = 0;
     }
 #ifdef WOLFMQTT_BROKER_RETAINED
+    wmqb_restore_purge_expired_retained(broker);
     if (h->kv_iter != NULL) {
         rc = wmqb_kv_iter(broker, BROKER_PERSIST_NS_RETAINED,
             wmqb_iter_retained_cb, &ctx);
         if (rc != 0) {
             WMQB_LOG_ERR(broker,
                 "broker: persist restore retained failed rc=%d", rc);
-            wmqb_restore_drop_expired_retained(broker, &ctx, 0);
             BrokerPersist_RestoreRollback(broker);
             return rc;
         }
-        wmqb_restore_drop_expired_retained(broker, &ctx, 1);
         WMQB_LOG_INFO(broker,
             "broker: persist restore retained loaded=%d skipped=%d",
             ctx.loaded, ctx.skipped);
