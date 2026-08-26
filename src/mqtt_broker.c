@@ -4574,6 +4574,23 @@ static int BrokerSubs_ReassociateClient(MqttBroker* broker,
 /* Retained message management                                                 */
 /* -------------------------------------------------------------------------- */
 #ifdef WOLFMQTT_BROKER_RETAINED
+#ifdef WOLFMQTT_BROKER_PERSIST
+/* Retire the stored record behind a retained message that expiry is about to
+ * drop from RAM. A backend refusal is reported rather than swallowed; the
+ * restore sweep retries it on the next start. */
+static void BrokerRetained_PersistExpired(MqttBroker* broker,
+    const char* topic)
+{
+    if (BrokerPersist_DelRetained(broker, topic) != 0) {
+        WBLOG_ERR(broker, "broker: retained expiry persist delete failed "
+            "topic=%s", BrokerLog_Sanitize(topic));
+    }
+}
+#else
+    #define BrokerRetained_PersistExpired(b, t) \
+        do { (void)(b); (void)(t); } while (0)
+#endif
+
 /* Free retained messages whose v5 Message Expiry Interval has elapsed so they
  * stop occupying a slot / the retained_count cap. Delivery also reaps expired
  * entries, but a publisher can hit the cap with only-expired entries before any
@@ -4592,6 +4609,7 @@ static void BrokerRetained_ReapExpired(MqttBroker* broker,
             (now - rm->store_time) >= rm->expiry_sec) {
             WBLOG_DBG(broker, "broker: retained expired topic=%s",
                 BrokerLog_Sanitize(rm->topic));
+            BrokerRetained_PersistExpired(broker, rm->topic);
             BROKER_FORCE_ZERO(rm, sizeof(BrokerRetainedMsg));
         }
     }
@@ -4611,6 +4629,7 @@ static void BrokerRetained_ReapExpired(MqttBroker* broker,
             (now - cur->store_time) >= cur->expiry_sec) {
             WBLOG_DBG(broker, "broker: retained expired topic=%s",
                 BrokerLog_Sanitize(cur->topic));
+            BrokerRetained_PersistExpired(broker, cur->topic);
             if (prev != NULL) {
                 prev->next = next;
             }
@@ -5321,6 +5340,7 @@ static int BrokerRetained_DeliverToClient(MqttBroker* broker,
             (now - rm->store_time) >= rm->expiry_sec) {
             WBLOG_DBG(broker, "broker: retained expired topic=%s",
                 BrokerLog_Sanitize(rm->topic));
+            BrokerRetained_PersistExpired(broker, rm->topic);
             BROKER_FORCE_ZERO(rm, sizeof(BrokerRetainedMsg));
             continue;
         }
@@ -5431,6 +5451,12 @@ static int BrokerRetained_DeliverToClient(MqttBroker* broker,
             (rm->expiry_sec > 0 &&
             now >= rm->store_time &&
             (now - rm->store_time) >= rm->expiry_sec)) {
+            /* A pending_delete node already had its record retired by
+             * BrokerRetained_Delete; expiry has to retire its own. Done ahead
+             * of the deferral below so the flag keeps that one meaning. */
+            if (!rm->pending_delete) {
+                BrokerRetained_PersistExpired(broker, rm->topic);
+            }
             if (broker->retained_delivering > 1) {
                 rm->pending_delete = 1;
                 rm_prev = rm;
@@ -9452,6 +9478,12 @@ int wolfmqtt_broker(int argc, char** argv)
         if (rc != 0) {
             PRINTF("broker: persist init failed dir=%s rc=%d",
                 persist_dir, rc);
+            /* The backend validates the store before use; a pre-created
+             * directory inheriting a relaxed umask is the usual cause. */
+            PRINTF("broker: hint - persist dir and its namespace "
+                "subdirectories must be owned by this user, must not be "
+                "group- or other-writable (mode 0700), and no path "
+                "component may be a symlink");
             BROKER_WIPE_AUTH_PASS();
             return rc;
         }
