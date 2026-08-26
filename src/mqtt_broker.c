@@ -9478,6 +9478,12 @@ int wolfmqtt_broker(int argc, char** argv)
         if (rc != 0) {
             PRINTF("broker: persist init failed dir=%s rc=%d",
                 persist_dir, rc);
+            /* The backend validates the store before use; a pre-created
+             * directory inheriting a relaxed umask is the usual cause. */
+            PRINTF("broker: hint - persist dir and its namespace "
+                "subdirectories must be owned by this user, must not be "
+                "group- or other-writable (mode 0700), and no path "
+                "component may be a symlink");
             BROKER_WIPE_AUTH_PASS();
             return rc;
         }

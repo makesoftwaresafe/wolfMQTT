@@ -140,6 +140,18 @@ backend stores records as files under the directory given with `-D` (default
 targets can supply their own storage backend
 through `MqttBroker_SetPersistHooks()`.
 
+The POSIX backend validates the store before using it and refuses to start
+otherwise. The directory given with `-D`, and each namespace directory beneath
+it, must be owned by the broker's effective user and must not be group- or
+other-writable; no component of the path may be a symlink. A directory the
+broker creates itself satisfies this (mode `0700`), but one pre-created by a
+script or installer inherits the ambient umask - under a relaxed umask such as
+`002` it comes out `0775` and is rejected. Create it explicitly:
+
+```sh
+mkdir -p /var/lib/wolfmqtt && chmod 0700 /var/lib/wolfmqtt
+```
+
 | Macro | Default | Description |
 |---|---|---|
 | `BROKER_MAX_PERSIST_SESSIONS` | 64 | Dynamic-memory persistent sessions retained across restarts |
